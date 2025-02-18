@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from . import tpexec
 from .helpers import (
 	AutoShardingRule,
 	CompositeShardingRule,
@@ -46,6 +47,7 @@ from .partition import (
 )
 
 __all__ = (
+	"tpexec",
 	"AutoShardingRule",
 	"CompositeShardingRule",
 	"MemoryConstrainedShardingRule",

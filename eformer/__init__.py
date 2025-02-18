@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
-from . import callib, jaximus, ops, optimizers, mpric
+from . import callib, escale, jaximus, mpric, ops, optimizers
 
-__all__ = ("callib", "jaximus", "ops", "optimizers", "mpric")
+__all__ = ("callib", "escale", "jaximus", "ops", "optimizers", "mpric")
