@@ -23,11 +23,13 @@ import jax
 import jax.extend
 import jax.numpy as jnp
 import numpy as np
-from easydel.utils.traversals import named_tree_map
+
 from jax import tree_util as tu
 from jax.interpreters import pxla
 from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+from ..tree_util import named_tree_map
 
 from ..mesh.validation import names_in_current_mesh
 
