@@ -13,10 +13,10 @@
 # limitations under the License.
 
 import functools
+import os
 import typing as tp
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
 from jax.sharding import Mesh
@@ -33,9 +33,9 @@ def calculate_host_mesh_shape(
 	total_devices = total_devices or jax.local_device_count()
 	num_processes = num_processes or jax.process_count()
 	total_mesh_size = np.prod(global_mesh_shape)
-	assert (
-		total_mesh_size == total_devices * num_processes
-	), f"Mesh size {total_mesh_size} doesn't match available devices {total_devices * num_processes}"
+	assert total_mesh_size == total_devices * num_processes, (
+		f"Mesh size {total_mesh_size} doesn't match available devices {total_devices * num_processes}"
+	)
 	host_mesh = list(global_mesh_shape)
 	remaining_process_split = num_processes
 	idx = 0
@@ -52,9 +52,9 @@ def calculate_host_mesh_shape(
 			remaining_process_split = remaining_process_split // factor
 		idx += 1
 	host_total = np.prod(host_mesh)
-	assert (
-		host_total == total_devices
-	), f"Host mesh shape {tuple(host_mesh)} uses {host_total} devices instead of {total_devices}"
+	assert host_total == total_devices, (
+		f"Host mesh shape {tuple(host_mesh)} uses {host_total} devices instead of {total_devices}"
+	)
 
 	return tuple(host_mesh)
 
@@ -65,16 +65,45 @@ def _cached_mesh(
 	axis_names: tp.Sequence[str],
 	backend: tp.Optional[str] = None,
 ):
-	mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
-	if jax.process_count() > 1 and hasattr(jax.devices()[0], "slice_index"):
-		dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
+	backend = backend or jax.default_backend()
+	num_devices = jax.device_count(backend)
+	num_slices = int(os.environ.get("MEGASCALE_NUM_SLICES", 1))
+	multi_slice_env = num_slices > 1
+
+	mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
+
+	if multi_slice_env:
+		first_axis = axis_dims[0]
+		assert first_axis % num_slices == 0, (
+			f"First dimension {first_axis} of mesh must be divisible by "
+			f"num_slices {num_slices}"
+		)
+		per_slice_mesh_shape = (first_axis // num_slices,) + axis_dims[1:]
+		dcn_mesh_shape = (num_slices,) + (1,) * (len(axis_dims) - 1)
+		total_per_slice = np.prod(per_slice_mesh_shape)
+		total_dcn = np.prod(dcn_mesh_shape)
+		assert total_per_slice * total_dcn == num_devices, (
+			f"Per-slice devices {total_per_slice} * DCN devices {total_dcn} "
+			f"!= total devices {num_devices}"
+		)
+		ndarray = create_hybrid_device_mesh(
+			mesh_shape=per_slice_mesh_shape,
+			dcn_mesh_shape=dcn_mesh_shape,
+			devices=jax.devices(backend),
+			allow_split_physical_axes=True,
+		)
+	elif jax.process_count() > 1 and hasattr(jax.devices()[0], "slice_index"):
+		dcn_mesh_shape = calculate_host_mesh_shape(
+			mesh_shape,
+			jax.device_count(),
+			jax.process_count(),
+		)
 		ndarray = create_hybrid_device_mesh(
 			mesh_shape=mesh_shape,
 			dcn_mesh_shape=dcn_mesh_shape,
 			devices=jax.devices(backend),
 			allow_split_physical_axes=True,
 		)
-
 	else:
 		ndarray = create_device_mesh(
 			mesh_shape=mesh_shape,
@@ -119,30 +148,20 @@ def parse_mesh_from_string(
 
 if __name__ == "__main__":
 	test_cases = [
-		# (global_mesh, total_devices, num_processes, expected_host_mesh)
 		((1, 1, 32), 4, 8, (1, 1, 4)),
-		((8, 4), 4, 8, (1, 4)),  # 32 = 4 * 8
-		((1, 1, 8, 4), 4, 8, (1, 1, 1, 4)),  # 32 = 4 * 8
-		((2, 4, 8), 8, 8, (1, 1, 8)),  # 64 = 8 * 8  <- Fixed this case
-		((16, 4), 4, 16, (1, 4)),  # 64 = 4 * 16
+		((8, 4), 4, 8, (1, 4)),
+		((1, 1, 8, 4), 4, 8, (1, 1, 1, 4)),
+		((2, 4, 8), 8, 8, (1, 1, 8)),
+		((16, 4), 4, 16, (1, 4)),
 	]
 
 	for global_mesh, devices, processes, expected in test_cases:
 		mesh_size = np.prod(global_mesh)
 		device_total = devices * processes
-		print("\nTesting case:")
-		print(f"Global mesh: {global_mesh} (total: {mesh_size})")
-		print(f"Devices: {devices}, Processes: {processes} (total: {device_total})")
-		assert (
-			mesh_size == device_total
-		), f"Mesh size {mesh_size} must equal total devices {device_total}"
-
-		result = calculate_host_mesh_shape(
-			global_mesh,
-			total_devices=devices,
-			num_processes=processes,
+		assert mesh_size == device_total, (
+			f"Mesh size {mesh_size} must equal total devices {device_total}"
 		)
-		print(f"Result: {result}")
-		assert (
-			result == expected
-		), f"Failed for {global_mesh}: expected {expected}, got {result}"
+		result = calculate_host_mesh_shape(global_mesh, devices, processes)
+		assert result == expected, (
+			f"Failed for {global_mesh}: expected {expected}, got {result}"
+		)
