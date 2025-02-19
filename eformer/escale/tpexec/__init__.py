@@ -1,30 +1,25 @@
-# Improved and updated from levanter ray calls.
-
-from .executors import (
-	TPUExecutor,
-	TPUFunctionDecorator,
-	TPUMultiSliceExecutor,
-	TPUProcessManager,
-)
+# updated from levanter ray calls.
 
 from ._statics import (
-	TPUFailed,
-	TPUInfo,
-	TPUPreempted,
-	TPURunError,
-	TPURunResult,
-	TPUSuccess,
+	TpuFailed,
+	TpuInfo,
+	TpuPreempted,
+	TpuRunError,
+	TpuRunResult,
+	TpuSuccess,
+)
+from .executors import (
+	TPUExecutor,
+	TPUMultiSliceExecutor,
 )
 
 __all__ = (
 	"TPUExecutor",
-	"TPUFunctionDecorator",
 	"TPUMultiSliceExecutor",
-	"TPUProcessManager",
-	"TPUFailed",
-	"TPUInfo",
-	"TPUPreempted",
-	"TPURunError",
-	"TPURunResult",
-	"TPUSuccess",
+	"TpuInfo",
+	"TpuFailed",
+	"TpuPreempted",
+	"TpuSuccess",
+	"TpuRunResult",
+	"TpuRunError",
 )

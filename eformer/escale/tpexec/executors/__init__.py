@@ -1,9 +1,3 @@
-from ._manager import TPUFunctionDecorator, TPUProcessManager
-from ._executors import TPUMultiSliceExecutor, TPUExecutor
+from ._executors import TPUExecutor, TPUMultiSliceExecutor
 
-__all__ = (
-	"TPUFunctionDecorator",
-	"TPUProcessManager",
-	"TPUMultiSliceExecutor",
-	"TPUExecutor",
-)
+__all__ = ("TPUExecutor", "TPUMultiSliceExecutor")

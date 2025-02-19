@@ -73,13 +73,13 @@ def _cached_mesh(
 	mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
 
 	if multi_slice_env:
-		first_axis = axis_dims[0]
+		first_axis = mesh_shape[0]
 		assert first_axis % num_slices == 0, (
 			f"First dimension {first_axis} of mesh must be divisible by "
 			f"num_slices {num_slices}"
 		)
-		per_slice_mesh_shape = (first_axis // num_slices,) + axis_dims[1:]
-		dcn_mesh_shape = (num_slices,) + (1,) * (len(axis_dims) - 1)
+		per_slice_mesh_shape = (first_axis // num_slices,) + mesh_shape[1:]
+		dcn_mesh_shape = (num_slices,) + (1,) * (len(mesh_shape) - 1)
 		total_per_slice = np.prod(per_slice_mesh_shape)
 		total_dcn = np.prod(dcn_mesh_shape)
 		assert total_per_slice * total_dcn == num_devices, (

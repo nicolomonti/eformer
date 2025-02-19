@@ -1,10 +1,9 @@
 from dataclasses import dataclass
-import typing as tp
 
 
 @dataclass
-class TPUInfo:
-	"""Information about a TPU pod."""
+class TpuInfo:
+	"""Internal class to hold information about a TPU pod."""
 
 	name: str
 	state: str
@@ -12,35 +11,27 @@ class TPUInfo:
 
 
 @dataclass
-class TPURunResult:
-	"""Base class for TPU job results."""
+class TpuRunResult:
+	"""Internal class to hold the result of a TPU job."""
 
-	info: TPUInfo
-
-
-@dataclass
-class TPUSuccess(TPURunResult):
-	"""Successful TPU job execution."""
-
-	result: tp.Any
+	info: TpuInfo
 
 
 @dataclass
-class TPUPreempted(TPURunResult):
-	"""TPU job was preempted."""
+class TpuSuccess(TpuRunResult):
+	result: object
 
+
+@dataclass
+class TpuPreempted(TpuRunResult):
 	error: Exception
 
 
 @dataclass
-class TPUFailed(TPURunResult):
-	"""TPU job failed due to an error."""
-
+class TpuFailed(TpuRunResult):
 	error: Exception
 
 
 @dataclass
-class TPURunError(TPURunResult):
-	"""TPU job encountered a runtime error."""
-
+class TpuRunError(TpuRunResult):
 	error: Exception
