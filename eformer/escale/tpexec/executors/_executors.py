@@ -25,6 +25,7 @@ logger = logging.getLogger("ray")
 RemoteFuncType = RemoteFunction | tp.Callable
 TPUType = str
 
+# fmt:off
 
 class TPUBaseExecutor(abc.ABC):
 	"""
@@ -35,20 +36,22 @@ class TPUBaseExecutor(abc.ABC):
 	    execute_resumable (classmethod): Resilient method to handle preemptions/failures.
 	"""
 
-	@abc.abstractmethod
 	@classmethod
+	@abc.abstractmethod
 	def execute(*arg, **kwargs):
 		"""
 		Submit a TPU job for execution.
 
 		Returns:
-		    ray.ObjectRef: Reference to the TPU job result.
+				ray.ObjectRef: Reference to the TPU job result.
 		"""
 
-	@abc.abstractmethod
 	@classmethod
+	@abc.abstractmethod
 	def execute_resumable(*arg, **kwargs):
 		"""Submit a TPU job with automatic retry on preemption/failure."""
+
+# fmt:on
 
 
 class TPUExecutor(TPUBaseExecutor):
