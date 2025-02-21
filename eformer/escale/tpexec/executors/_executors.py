@@ -28,28 +28,28 @@ TPUType = str
 # fmt:off
 
 class TPUBaseExecutor(abc.ABC):
-	"""
-	Base class for TPU executors with abstract execution methods.
+  """
+  Base class for TPU executors with abstract execution methods.
 
-	Attributes:
-	    execute (classmethod): Method to submit a job to the TPU.
-	    execute_resumable (classmethod): Resilient method to handle preemptions/failures.
-	"""
+  Attributes:
+      execute (classmethod): Method to submit a job to the TPU.
+      execute_resumable (classmethod): Resilient method to handle preemptions/failures.
+  """
 
-	@classmethod
-	@abc.abstractmethod
-	def execute(*arg, **kwargs):
-		"""
-		Submit a TPU job for execution.
+  @classmethod
+  @abc.abstractmethod
+  def execute(*arg, **kwargs):
+    """
+    Submit a TPU job for execution.
 
-		Returns:
-				ray.ObjectRef: Reference to the TPU job result.
-		"""
+    Returns:
+        ray.ObjectRef: Reference to the TPU job result.
+    """
 
-	@classmethod
-	@abc.abstractmethod
-	def execute_resumable(*arg, **kwargs):
-		"""Submit a TPU job with automatic retry on preemption/failure."""
+  @classmethod
+  @abc.abstractmethod
+  def execute_resumable(*arg, **kwargs):
+    """Submit a TPU job with automatic retry on preemption/failure."""
 
 # fmt:on
 
@@ -59,8 +59,8 @@ class TPUExecutor(TPUBaseExecutor):
 	Executor for single TPU pod with preemption/failure handling.
 
 	Methods:
-			execute: Submit a TPU job.
-			execute_resumable: Retry-based execution with fault-tolerance.
+	    execute: Submit a TPU job.
+	    execute_resumable: Retry-based execution with fault-tolerance.
 	"""
 
 	@classmethod
@@ -69,6 +69,10 @@ class TPUExecutor(TPUBaseExecutor):
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
 		runner_resources: tp.Optional[dict] = None,
+		num_hosts: tp.Optional[int] = None,
+		verbose: bool = True,
+		do_remotecall: bool = True,
+		num_slice_calls: int = 1,
 	) -> ray.ObjectRef:
 		"""
 		Submit a job to the TPU pod.
@@ -76,6 +80,11 @@ class TPUExecutor(TPUBaseExecutor):
 		Args:
 		    remote_fn (RemoteFuncType): Ray remote function or callable.
 		    tpu_type (str): TPU type (e.g., 'v4-8').
+				runner_resources (dict, optional): customized resources to pass to ray_fn.remote.
+				num_hosts (int, optional): number of hosts to execute each row call on.
+				verbose (bool): whenever to log some information which are not really usefull.
+				do_remotecall (bool): whenever to call remote fucntion automatically or not.
+				num_slice_calls (int): how many slices of code should be executed.
 
 		Returns:
 		    ray.ObjectRef: Reference to the TPU job's result.
@@ -86,23 +95,39 @@ class TPUExecutor(TPUBaseExecutor):
 		if runner_resources is None:
 			runner_resources = {f"TPU-{tpu_type}-head": 1}
 
-		def do_run(remote_fn) -> TpuRunResult:
-			"""Execute the remote function on the TPU.
-
-			Args:
-					remote_fn (RemoteFuncType): Function to execute.
+		def do_run(
+			remote_fn,
+			local_num_hosts,
+			local_verbose,
+			slice_idx,
+		) -> TpuRunResult:
+			"""
+			Execute the remote function on the TPU.
 
 			Returns:
-					TpuRunResult: Result of the TPU execution.
+			    TpuRunResult: Result of the TPU execution.
 			"""
 			logging.basicConfig(level=logging.INFO)
-			num_hosts = ray.util.accelerators.tpu.get_current_pod_worker_count()
-			remote_fn, tpu_name = redecorate_remote_fn_for_tpu(remote_fn, num_hosts)
+			num_hosts = (
+				local_num_hosts or ray.util.accelerators.tpu.get_current_pod_worker_count()
+			)
+			remote_fn, tpu_name = redecorate_remote_fn_for_tpu(
+				remote_fn=remote_fn,
+				num_hosts=num_hosts,
+				verbose=local_verbose,
+			)
 			info = TpuInfo(tpu_name, "ACTIVE", "TPU")
-			futures = [remote_fn.remote() for _ in range(num_hosts)]
+
+			try:
+				futures = [remote_fn.remote(slice_idx) for _ in range(num_hosts)]
+			except TypeError as e:
+				if str(e) != "too many positional arguments":
+					raise e
+				futures = [remote_fn.remote() for _ in range(num_hosts)]
 			try:
 				out = ray.get(futures)
-				logger.info("TPU job finished")
+				if local_verbose:
+					logger.info("TPU job finished")
 				return TpuSuccess(info, out)
 			except RayError as e:
 				cancel_all_futures(futures)
@@ -115,7 +140,14 @@ class TPUExecutor(TPUBaseExecutor):
 			do_run = ray.remote(do_run)
 		else:
 			do_run = ray.remote(resources=runner_resources)(do_run)
-		return do_run.remote(remote_fn)
+		if do_remotecall:
+			if num_slice_calls > 1:
+				return [
+					do_run.remote(remote_fn, num_hosts, verbose, slice_idx)
+					for slice_idx in range(num_slice_calls)
+				]
+			return do_run.remote(remote_fn, num_hosts, verbose, 0)
+		return do_run
 
 	@classmethod
 	def execute_resumable(
@@ -123,6 +155,9 @@ class TPUExecutor(TPUBaseExecutor):
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
 		runner_resources: tp.Optional[dict] = None,
+		num_hosts: tp.Optional[int] = None,
+		verbose: bool = True,
+		num_slice_calls: int = 1,
 		max_retries_preemption: int = int(1e6),
 		max_retries_failure: int = 10,
 	):
@@ -132,6 +167,10 @@ class TPUExecutor(TPUBaseExecutor):
 		Args:
 		    remote_fn (RemoteFuncType): Function to execute.
 		    tpu_type (str): TPU type (e.g., 'v4-8').
+				runner_resources (dict, optional): customized resources to pass to ray_fn.remote.
+				num_hosts (int, optional): number of hosts to execute each row call on.
+				verbose (bool): whenever to log some information which are not really usefull.
+				num_slice_calls (int): how many slices of code should be executed.
 		    max_retries_preemption (int): Maximum preemption retries.
 		    max_retries_failure (int): Maximum failure retries.
 
@@ -150,7 +189,17 @@ class TPUExecutor(TPUBaseExecutor):
 			attempt += 1
 			problem = None
 			try:
-				out = ray.get(cls.execute(remote_fn, tpu_type, runner_resources))
+				out = ray.get(
+					cls.execute(
+						remote_fn=remote_fn,
+						tpu_type=tpu_type,
+						runner_resources=runner_resources,
+						do_remotecall=True,
+						num_hosts=num_hosts,
+						num_slice_calls=num_slice_calls,
+						verbose=verbose,
+					)
+				)
 			except ray.exceptions.RayTaskError as e:
 				problem = e
 				if "preempted" in str(e).lower():
@@ -213,6 +262,8 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		tpu_type: TPUType,
 		num_slices: int,
 		runner_resources: tp.Optional[dict] = None,
+		num_hosts: tp.Optional[int] = None,
+		verbose: bool = True,
 	) -> list[ray.ObjectRef]:
 		"""
 		Submit jobs across multiple TPU slices.
@@ -221,6 +272,9 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		    remote_fn (RemoteFuncType): Function to execute on each slice.
 		    tpu_type (str): TPU type (e.g., 'v4-8').
 		    num_slices (int): Number of TPU slices.
+				runner_resources (dict, optional): customized resources to pass to ray_fn.remote.
+				num_hosts (int, optional): number of hosts to execute each row call on.
+				verbose (bool): whenever to log some information which are not really usefull.
 
 		Returns:
 		    list[ray.ObjectRef]: References to each slice's job result.
@@ -229,10 +283,13 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 			runner_resources = {f"TPU-{tpu_type}-head": 1}
 
 		class MultisliceActor:
-			def __init__(self):
+			def __init__(self, local_num_hosts, local_verbose):
 				self.pod_name = ray.util.accelerators.tpu.get_current_pod_name()
-				self.num_hosts = ray.util.accelerators.tpu.get_current_pod_worker_count()
+				self.num_hosts = (
+					local_num_hosts or ray.util.accelerators.tpu.get_current_pod_worker_count()
+				)
 				self.ip = socket.gethostbyname(socket.gethostname())
+				self.local_verbose = local_verbose
 
 			def get_slice_info(self):
 				"""Return pod name, host count, and IP address."""
@@ -261,7 +318,10 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 				}
 
 				remote_fn, tpu_name = redecorate_remote_fn_for_tpu(
-					remote_fn, self.num_hosts, env_vars=mxla_env
+					remote_fn,
+					self.num_hosts,
+					verbose=self.local_verbose,
+					env_vars=mxla_env,
 				)
 
 				info = TpuInfo(tpu_name, "ACTIVE", "TPU")
@@ -283,7 +343,13 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 			MultisliceActor = ray.remote(MultisliceActor)
 		else:
 			MultisliceActor = ray.remote(resources=runner_resources)(MultisliceActor)
-		actors = [MultisliceActor.remote() for _ in range(num_slices)]
+		actors = [
+			MultisliceActor.remote(
+				local_num_hosts=num_hosts,
+				local_verbose=verbose,
+			)
+			for _ in range(num_slices)
+		]
 		futures = [actor.get_slice_info.remote() for actor in actors]
 		try:
 			logger.info("Getting slice infos...")
@@ -299,15 +365,14 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 			return futures
 
 		coordinator_ip = slice_infos[0][2]
-
 		return [
 			actor.do_run.remote(
-				remote_fn,
-				coordinator_ip,
-				i,
-				num_slices,
+				remote_fn=remote_fn,
+				coordinator_ip=coordinator_ip,
+				slice_id=slice_id,
+				num_slices=num_slices,
 			)
-			for i, actor in enumerate(actors)
+			for slice_id, actor in enumerate(actors)
 		]
 
 	@classmethod
@@ -317,6 +382,8 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		tpu_type: TPUType,
 		num_slices: int,
 		runner_resources: tp.Optional[dict] = None,
+		num_hosts: tp.Optional[int] = None,
+		verbose: bool = True,
 		max_retries_preemption: int = int(1e6),
 		max_retries_failure: int = 10,
 	):
@@ -327,6 +394,9 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		    remote_fn (RemoteFuncType): Function to execute.
 		    tpu_type (str): TPU type (e.g., 'v4-8').
 		    num_slices (int): Number of TPU slices.
+				runner_resources (dict, optional): customized resources to pass to ray_fn.remote.
+				num_hosts (int, optional): number of hosts to execute each row call on.
+				verbose (bool): whenever to log some information which are not really usefull.
 		    max_retries_preemption (int): Preemption retry limit.
 		    max_retries_failure (int): Failure retry limit.
 
@@ -347,7 +417,14 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 			logger.info(f"Running on TPU {tpu_type}. Attempt {attempt}")
 			attempt += 1
 			problem = None
-			futures = cls.execute(remote_fn, tpu_type, num_slices, runner_resources)
+			futures = cls.execute(
+				remote_fn=remote_fn,
+				tpu_type=tpu_type,
+				num_slices=num_slices,
+				runner_resources=runner_resources,
+				verbose=verbose,
+				num_hosts=num_hosts,
+			)
 			try:
 				outs = ray.get(futures)
 			except ray.exceptions.ActorUnavailableError as e:
@@ -402,7 +479,8 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 				problem = out.error
 				num_preemptions += 1
 				logger.warning(
-					f"Preempted {num_preemptions} times. {problem}", exc_info=problem
+					f"Preempted {num_preemptions} times. {problem}",
+					exc_info=problem,
 				)
 			elif any(isinstance(out, TpuFailed) for out in outs):
 				num_preemptions += 1

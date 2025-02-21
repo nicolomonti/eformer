@@ -28,7 +28,12 @@ from .._statics import (
 logger = logging.getLogger("ray")
 
 
-def redecorate_remote_fn_for_tpu(remote_fn, num_hosts, **runtime_env):
+def redecorate_remote_fn_for_tpu(
+	remote_fn,
+	num_hosts,
+	verbose,
+	**runtime_env,
+):
 	remote_fn = forkify_remote_fn(remote_fn)
 	if not isinstance(remote_fn, RemoteFunction):
 		remote_fn = ray.remote(remote_fn)
@@ -42,11 +47,11 @@ def redecorate_remote_fn_for_tpu(remote_fn, num_hosts, **runtime_env):
 		runtime_env=runtime_env,
 		resources={tpu_name: 1, "TPU": num_tpus_per_host},
 	)
-
-	logger.info(
-		f"Running on TPU {tpu_name} with {num_hosts} hosts "
-		f"and {num_tpus_per_host} TPUs per host"
-	)
+	if verbose:
+		logger.info(
+			f"Running on TPU {tpu_name} with {num_hosts} hosts "
+			f"and {num_tpus_per_host} TPUs per host"
+		)
 	return remote_fn, tpu_name
 
 
