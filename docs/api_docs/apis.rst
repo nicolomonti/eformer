@@ -4,6 +4,7 @@ eformer APIs 🔮
 .. toctree::
    :maxdepth: 2
    
+   Aparser
    Callib
    Escale
    Init

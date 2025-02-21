@@ -68,6 +68,7 @@ class TPUExecutor(TPUBaseExecutor):
 		cls,
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
+		runner_resources: tp.Optional[dict] = None,
 	) -> ray.ObjectRef:
 		"""
 		Submit a job to the TPU pod.
@@ -82,8 +83,9 @@ class TPUExecutor(TPUBaseExecutor):
 		Raises:
 		    RayError: If job encounters an unrecoverable error.
 		"""
+		if runner_resources is None:
+			runner_resources = {f"TPU-{tpu_type}-head": 1}
 
-		@ray.remote(resources={f"TPU-{tpu_type}-head": 1})
 		def do_run(remote_fn) -> TpuRunResult:
 			"""Execute the remote function on the TPU.
 
@@ -109,6 +111,10 @@ class TPUExecutor(TPUBaseExecutor):
 				cancel_all_futures(futures)
 				return TpuFailed(info, e)
 
+		if runner_resources == Ellipsis:
+			do_run = ray.remote(do_run)
+		else:
+			do_run = ray.remote(resources=runner_resources)(do_run)
 		return do_run.remote(remote_fn)
 
 	@classmethod
@@ -116,6 +122,7 @@ class TPUExecutor(TPUBaseExecutor):
 		cls,
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
+		runner_resources: tp.Optional[dict] = None,
 		max_retries_preemption: int = int(1e6),
 		max_retries_failure: int = 10,
 	):
@@ -143,7 +150,7 @@ class TPUExecutor(TPUBaseExecutor):
 			attempt += 1
 			problem = None
 			try:
-				out = ray.get(cls.execute(remote_fn, tpu_type))
+				out = ray.get(cls.execute(remote_fn, tpu_type, runner_resources))
 			except ray.exceptions.RayTaskError as e:
 				problem = e
 				if "preempted" in str(e).lower():
@@ -205,6 +212,7 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
 		num_slices: int,
+		runner_resources: tp.Optional[dict] = None,
 	) -> list[ray.ObjectRef]:
 		"""
 		Submit jobs across multiple TPU slices.
@@ -217,8 +225,9 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		Returns:
 		    list[ray.ObjectRef]: References to each slice's job result.
 		"""
+		if runner_resources is None:
+			runner_resources = {f"TPU-{tpu_type}-head": 1}
 
-		@ray.remote(resources={f"TPU-{tpu_type}-head": 1})
 		class MultisliceActor:
 			def __init__(self):
 				self.pod_name = ray.util.accelerators.tpu.get_current_pod_name()
@@ -270,6 +279,10 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 					cancel_all_futures(futures)
 					return TpuFailed(info, e)
 
+		if runner_resources == Ellipsis:
+			MultisliceActor = ray.remote(MultisliceActor)
+		else:
+			MultisliceActor = ray.remote(resources=runner_resources)(MultisliceActor)
 		actors = [MultisliceActor.remote() for _ in range(num_slices)]
 		futures = [actor.get_slice_info.remote() for actor in actors]
 		try:
@@ -303,6 +316,7 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 		remote_fn: RemoteFuncType,
 		tpu_type: TPUType,
 		num_slices: int,
+		runner_resources: tp.Optional[dict] = None,
 		max_retries_preemption: int = int(1e6),
 		max_retries_failure: int = 10,
 	):
@@ -333,7 +347,7 @@ class TPUMultiSliceExecutor(TPUBaseExecutor):
 			logger.info(f"Running on TPU {tpu_type}. Attempt {attempt}")
 			attempt += 1
 			problem = None
-			futures = cls.execute(remote_fn, tpu_type, num_slices)
+			futures = cls.execute(remote_fn, tpu_type, num_slices, runner_resources)
 			try:
 				outs = ray.get(futures)
 			except ray.exceptions.ActorUnavailableError as e:
