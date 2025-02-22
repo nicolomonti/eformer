@@ -63,46 +63,60 @@ def calculate_host_mesh_shape(
 def _cached_mesh(
 	axis_dims: tp.Sequence[int],
 	axis_names: tp.Sequence[str],
+	dcn_mesh_dims: tp.Optional[tp.Sequence[int]] = None,
+	process_is_granule: bool = False,
+	should_sort_granules_by_key: bool = True,
+	allow_split_physical_axes: bool = True,
 	backend: tp.Optional[str] = None,
 ):
 	backend = backend or jax.default_backend()
 	num_devices = jax.device_count(backend)
+	mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
+
 	num_slices = int(os.environ.get("MEGASCALE_NUM_SLICES", 1))
 	multi_slice_env = num_slices > 1
 
-	mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
-
 	if multi_slice_env:
-		first_axis = mesh_shape[0]
-		assert first_axis % num_slices == 0, (
-			f"First dimension {first_axis} of mesh must be divisible by "
-			f"num_slices {num_slices}"
-		)
-		per_slice_mesh_shape = (first_axis // num_slices,) + mesh_shape[1:]
-		dcn_mesh_shape = (num_slices,) + (1,) * (len(mesh_shape) - 1)
-		total_per_slice = np.prod(per_slice_mesh_shape)
-		total_dcn = np.prod(dcn_mesh_shape)
-		assert total_per_slice * total_dcn == num_devices, (
-			f"Per-slice devices {total_per_slice} * DCN devices {total_dcn} "
-			f"!= total devices {num_devices}"
-		)
+		if dcn_mesh_dims is None:
+			dynamic_axis = None
+			for i, dim in enumerate(mesh_shape):
+				if dim % num_slices == 0:
+					dynamic_axis = i
+					break
+			if dynamic_axis is None:
+				raise ValueError("No axis in the mesh shape is divisible by num_slices")
+
+			per_slice_mesh_shape = list(mesh_shape)
+			per_slice_mesh_shape[dynamic_axis] //= num_slices
+			per_slice_mesh_shape = tuple(per_slice_mesh_shape)
+
+			dcn_mesh_dims = tuple(
+				num_slices if i == dynamic_axis else 1 for i in range(len(mesh_shape))
+			)
+
 		ndarray = create_hybrid_device_mesh(
 			mesh_shape=per_slice_mesh_shape,
-			dcn_mesh_shape=dcn_mesh_shape,
+			dcn_mesh_shape=dcn_mesh_dims,
 			devices=jax.devices(backend),
-			allow_split_physical_axes=True,
+			allow_split_physical_axes=allow_split_physical_axes,
+			process_is_granule=process_is_granule,
+			should_sort_granules_by_key=should_sort_granules_by_key,
 		)
+
 	elif jax.process_count() > 1 and hasattr(jax.devices()[0], "slice_index"):
-		dcn_mesh_shape = calculate_host_mesh_shape(
-			mesh_shape,
-			jax.device_count(),
-			jax.process_count(),
-		)
+		if dcn_mesh_dims is None:
+			dcn_mesh_dims = calculate_host_mesh_shape(
+				mesh_shape,
+				jax.device_count(),
+				jax.process_count(),
+			)
 		ndarray = create_hybrid_device_mesh(
 			mesh_shape=mesh_shape,
-			dcn_mesh_shape=dcn_mesh_shape,
+			dcn_mesh_shape=dcn_mesh_dims,
 			devices=jax.devices(backend),
-			allow_split_physical_axes=True,
+			allow_split_physical_axes=allow_split_physical_axes,
+			process_is_granule=process_is_granule,
+			should_sort_granules_by_key=should_sort_granules_by_key,
 		)
 	else:
 		ndarray = create_device_mesh(
@@ -115,11 +129,19 @@ def _cached_mesh(
 def create_mesh(
 	axis_dims: tp.Sequence[int] = DEFAULT_SHARDING_STG,
 	axis_names: tp.Sequence[str] = DEFAULT_NAMED_SHARDING_STG,
+	dcn_mesh_dims: tp.Optional[tp.Sequence[int]] = None,
+	process_is_granule: bool = False,
+	should_sort_granules_by_key: bool = True,
+	allow_split_physical_axes: bool = True,
 	backend: tp.Optional[str] = None,
 ) -> Mesh:
 	return _cached_mesh(
 		axis_dims=axis_dims,
 		axis_names=axis_names,
+		dcn_mesh_dims=dcn_mesh_dims,
+		process_is_granule=process_is_granule,
+		should_sort_granules_by_key=should_sort_granules_by_key,
+		allow_split_physical_axes=allow_split_physical_axes,
 		backend=backend,
 	)
 
