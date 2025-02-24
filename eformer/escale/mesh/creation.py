@@ -71,8 +71,11 @@ def _cached_mesh(
 ):
 	backend = backend or jax.default_backend()
 	num_devices = jax.device_count(backend)
-	mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
-
+	num_local_devices = jax.local_device_count(backend)
+	if dcn_mesh_dims is None:
+		mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
+	else:
+		mesh_shape = np.arange(num_local_devices).reshape(axis_dims).shape
 	num_slices = int(os.environ.get("MEGASCALE_NUM_SLICES", 1))
 	multi_slice_env = num_slices > 1
 
@@ -93,7 +96,8 @@ def _cached_mesh(
 			dcn_mesh_dims = tuple(
 				num_slices if i == dynamic_axis else 1 for i in range(len(mesh_shape))
 			)
-
+		else:
+			per_slice_mesh_shape = mesh_shape
 		ndarray = create_hybrid_device_mesh(
 			mesh_shape=per_slice_mesh_shape,
 			dcn_mesh_shape=dcn_mesh_dims,
