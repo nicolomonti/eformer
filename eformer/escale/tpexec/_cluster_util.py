@@ -54,7 +54,7 @@ class TpexecSlurmCluster(clusters.SlurmCluster):
 		return next((os.environ[o] for o in _NODE_LIST_CHOICES if o in os.environ), None)
 
 	@classmethod
-	def get_local_device_ids_for_process(cls) -> tp.Optional[tp.UnionList[int]]:
+	def get_local_device_ids_for_process(cls) -> tp.Optional[tp.List[int]]:
 		local_process_id = cls.get_local_process_id()
 
 		if local_process_id is None:
@@ -322,7 +322,7 @@ class DistributedConfig:
 	coordinator_address: tp.Optional[str] = None
 	num_processes: tp.Optional[int] = None
 	process_id: tp.Optional[int] = None
-	local_device_ids: tp.Optional[tp.Union[int, tp.UnionList[int]]] = None
+	local_device_ids: tp.Optional[tp.Union[int, tp.List[int]]] = None
 
 	def _is_distributed(self):
 		if (
