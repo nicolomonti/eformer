@@ -73,29 +73,51 @@ def run_ssh_command(target_ip, command, use_sudo=False):
 
 def run_local_command(command, use_sudo=False, check=True, capture_output=False):
 	"""Run a command locally with optional output capture."""
-	print(f"Running local command: {command}")
+	if isinstance(command, list):
+		cmd_str = " ".join(command)
+	else:
+		cmd_str = command
 
-	if use_sudo:
+	print(f"Running local command: {cmd_str}")
+
+	if use_sudo and not isinstance(command, list):
 		full_command = f"sudo {command}"
+	elif use_sudo and isinstance(command, list):
+		full_command = ["sudo"] + command
 	else:
 		full_command = command
 
 	try:
 		if capture_output:
-			result = subprocess.run(
-				full_command,
-				shell=True,
-				check=check,
-				stdout=subprocess.PIPE,
-				stderr=subprocess.PIPE,
-				universal_newlines=True,
-			)
+			if isinstance(full_command, list):
+				result = subprocess.run(
+					full_command,
+					check=check,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.PIPE,
+					universal_newlines=True,
+				)
+			else:
+				result = subprocess.run(
+					full_command,
+					shell=True,
+					check=check,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.PIPE,
+					universal_newlines=True,
+				)
 			return result.stdout
 		else:
-			subprocess.run(full_command, shell=True, check=check)
+			if isinstance(full_command, list):
+				subprocess.run(full_command, check=check)
+			else:
+				subprocess.run(full_command, shell=True, check=check)
 			return True
 	except subprocess.CalledProcessError:
-		print(f"Local command failed: {command}")
+		print(f"Local command failed: {cmd_str}")
+		return False if not capture_output else ""
+	except FileNotFoundError:
+		print(f"Command not found: {cmd_str}")
 		return False if not capture_output else ""
 
 
@@ -169,13 +191,13 @@ def start_ray_head(head_ip, use_external):
 	print(f"Starting Ray head node on {head_ip}")
 	local_ip = get_local_ip()
 
-	# Check if Ray is already running
+	ray_cmd = get_ray_cmd()
 	if check_ray_running(head_ip):
 		print(f"Ray is already running on head node {head_ip}. Stopping it first...")
 		if local_ip == head_ip:
-			run_local_command("ray stop", False)
+			run_local_command([ray_cmd, "stop"], False)
 		else:
-			run_ssh_command(head_ip, "~/.local/bin/ray stop", False)
+			run_ssh_command(head_ip, f"{ray_cmd} stop", False)
 		time.sleep(3)
 
 	# Prepare the resources JSON string
@@ -184,11 +206,19 @@ def start_ray_head(head_ip, use_external):
 	# Run locally or via SSH
 	if local_ip == head_ip:
 		print("Starting Ray head node locally")
-		cmd = f"ray start --head --port=6379 --resources='{resources}' --node-ip-address={head_ip} --dashboard-host=0.0.0.0"
+		cmd = (
+			ray_cmd,
+			"start",
+			"--head",
+			"--port=6379",
+			f"--resources='{resources}'",
+			f"--node-ip-address={head_ip}",
+			"--dashboard-host=0.0.0.0",
+		)
 		success = run_local_command(cmd, False)
 	else:
 		print("Starting Ray head node remotely")
-		cmd = f"~/.local/bin/ray start --head --port=6379 --resources='{resources}' --node-ip-address={head_ip} --dashboard-host=0.0.0.0"
+		cmd = f"{ray_cmd} start --head --port=6379 --resources='{resources}' --node-ip-address={head_ip} --dashboard-host=0.0.0.0"
 		success = run_ssh_command(head_ip, cmd, False)
 
 	if not success:
@@ -209,13 +239,13 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
 
 	print(f"Starting Ray worker on {worker_ip} (index {i})")
 	local_ip = get_local_ip()
-
+	ray_cmd = get_ray_cmd()
 	if check_ray_running(worker_ip):
 		print(f"Ray is already running on worker node {worker_ip}. Stopping it first...")
 		if local_ip == worker_ip:
-			run_local_command("ray stop", False)
+			run_local_command([ray_cmd, "stop"], False)
 		else:
-			run_ssh_command(worker_ip, "~/.local/bin/ray stop", False)
+			run_ssh_command(worker_ip, f"{ray_cmd} stop", False)
 		time.sleep(3)
 
 	# Prepare the resources JSON string
@@ -224,7 +254,7 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
 	# Run locally or via SSH
 	if local_ip == worker_ip:
 		print("Starting Ray worker locally")
-		cmd = f"ray start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
+		cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
 		success = run_local_command(cmd, False)
 	else:
 		print("Starting Ray worker remotely")
@@ -412,6 +442,20 @@ def read_ips_from_yaml(yaml_file):
 		return False
 
 
+def get_ray_cmd():
+	ray_in_path = run_local_command("which ray > /dev/null 2>&1", False, check=False)
+	if ray_in_path:
+		return "ray"
+	local_ray = run_local_command(
+		"test -f ~/.local/bin/ray && echo 'exists'",
+		False,
+		capture_output=True,
+	)
+	if local_ray and "exists" in local_ray:
+		return "~/.local/bin/ray"
+	return "~/.local/bin/ray"
+
+
 def main():
 	global TPU_VERSION, TPU_SLICE_SIZE, SSH_USER, INTERNAL_IPS, EXTERNAL_IPS
 
@@ -551,32 +595,30 @@ def main():
 	print(f"Total TPU Cores: {total_tpu_cores}")
 	print("====================\n")
 
-	# Function to get the correct ray command path
-	def get_ray_cmd():
-		# Check if ray is in PATH
-		ray_in_path = run_local_command("which ray > /dev/null 2>&1", False, check=False)
-		if ray_in_path:
-			return "ray"
-		# Check if ray is in ~/.local/bin
-		local_ray = run_local_command(
-			"test -f ~/.local/bin/ray && echo 'exists'", False, capture_output=True
-		)
-		if local_ray and "exists" in local_ray:
-			return "~/.local/bin/ray"
-		# Otherwise assume ray is in ~/.local/bin but it might not exist
-		return "~/.local/bin/ray"
-
-	# Handle self-job mode
 	if args.self_job:
 		local_ip = get_local_ip()
 		print(f"Running in self-job mode on {local_ip}")
-
-		# First stop any existing Ray processes
 		ray_cmd = get_ray_cmd()
 		print(f"Using Ray command: {ray_cmd}")
+		try:
+			subprocess.run(
+				[ray_cmd, "--version"],
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				check=True,
+			)
+		except (subprocess.CalledProcessError, FileNotFoundError):
+			print("ERROR: Ray command not found or not working.")
+			print("Please install Ray with: pip install -U ray")
+			print("Make sure ray is in your PATH or in ~/.local/bin/")
+			return 1
 
 		print("Stopping any existing Ray processes...")
-		run_local_command(f"{ray_cmd} stop 2>/dev/null || true", False)
+		try:
+			subprocess.run([ray_cmd, "stop"], stderr=subprocess.DEVNULL)
+		except Exception:
+			print("No Ray process was running or could not stop Ray")
+
 		time.sleep(3)  # Wait for processes to fully stop
 
 		# Find which slice this machine belongs to
@@ -620,7 +662,15 @@ def main():
 			}
 
 			resources_str = str(resources).replace("'", '"')
-			cmd = f"{ray_cmd} start --head --port=6379 --resources='{resources_str}' --node-ip-address={local_ip} --dashboard-host=0.0.0.0"
+			cmd = [
+				ray_cmd,
+				"start",
+				"--head",
+				"--port=6379",
+				f"--resources='{resources_str}'",
+				f"--node-ip-address={local_ip}",
+				"--dashboard-host=0.0.0.0",
+			]
 			run_local_command(cmd, False)
 
 		elif local_ip == slice_head_ip and local_ip != head_ip:
@@ -639,7 +689,14 @@ def main():
 			}
 
 			resources_str = str(resources).replace("'", '"')
-			cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
+			cmd = [
+				ray_cmd,
+				"start",
+				"--address",
+				f"{head_ip}:6379",
+				f"--resources={resources_str}",
+				f"--node-ip-address={local_ip}",
+			]
 			run_local_command(cmd, False)
 
 		else:
