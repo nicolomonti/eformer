@@ -258,7 +258,7 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
 		success = run_local_command(cmd, False)
 	else:
 		print("Starting Ray worker remotely")
-		cmd = f"~/.local/bin/ray start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
+		cmd = f"ray start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
 		success = run_ssh_command(worker_ip, cmd, False)
 
 	if success:
@@ -307,7 +307,7 @@ def stop_cluster(use_external):
 			print("Stopping Ray locally")
 			run_local_command("ray stop", False)
 		else:
-			run_ssh_command(ip, "~/.local/bin/ray stop", False)
+			run_ssh_command(ip, "ray stop", False)
 
 	print("Ray cluster stopped on all nodes.")
 
@@ -453,7 +453,7 @@ def get_ray_cmd():
 	# )
 	# if local_ray and "exists" in local_ray:
 	# 	return "~/.local/bin/ray"
-	return "~/.local/bin/ray"
+	return "ray"
 
 
 def main():
