@@ -71,8 +71,8 @@ def run_ssh_command(target_ip, command, use_sudo=False):
 		return False
 
 
-def run_local_command(command, use_sudo=False):
-	"""Run a command locally."""
+def run_local_command(command, use_sudo=False, check=True, capture_output=False):
+	"""Run a command locally with optional output capture."""
 	print(f"Running local command: {command}")
 
 	if use_sudo:
@@ -81,11 +81,22 @@ def run_local_command(command, use_sudo=False):
 		full_command = command
 
 	try:
-		subprocess.run(full_command, shell=True, check=True)
-		return True
+		if capture_output:
+			result = subprocess.run(
+				full_command,
+				shell=True,
+				check=check,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				universal_newlines=True,
+			)
+			return result.stdout
+		else:
+			subprocess.run(full_command, shell=True, check=check)
+			return True
 	except subprocess.CalledProcessError:
 		print(f"Local command failed: {command}")
-		return False
+		return False if not capture_output else ""
 
 
 def create_verification_script():
@@ -410,9 +421,15 @@ def main():
 		action="store_true",
 		help="Use external IPs instead of internal IPs",
 	)
-	parser.add_argument("--stop", action="store_true", help="Stop the Ray cluster")
 	parser.add_argument(
-		"--verify", action="store_true", help="Verify the Ray cluster setup"
+		"--stop",
+		action="store_true",
+		help="Stop the Ray cluster",
+	)
+	parser.add_argument(
+		"--verify",
+		action="store_true",
+		help="Verify the Ray cluster setup",
 	)
 	parser.add_argument(
 		"--tpu-version",
@@ -436,9 +453,14 @@ def main():
 		default=SSH_USER,
 		help=f"SSH username to use (default: {SSH_USER})",
 	)
-	parser.add_argument("--config", help="Path to YAML config file with IP addresses")
 	parser.add_argument(
-		"--test-ssh", action="store_true", help="Test SSH connectivity to all nodes"
+		"--config",
+		help="Path to YAML config file with IP addresses",
+	)
+	parser.add_argument(
+		"--test-ssh",
+		action="store_true",
+		help="Test SSH connectivity to all nodes",
 	)
 	# New arguments
 	parser.add_argument(
@@ -455,7 +477,8 @@ def main():
 		help="Run only on the current machine (no SSH to other machines)",
 	)
 	parser.add_argument(
-		"--slice-config", help="Path to YAML config file with slice configurations"
+		"--slice-config",
+		help="Path to YAML config file with slice configurations",
 	)
 
 	args = parser.parse_args()
@@ -528,10 +551,33 @@ def main():
 	print(f"Total TPU Cores: {total_tpu_cores}")
 	print("====================\n")
 
+	# Function to get the correct ray command path
+	def get_ray_cmd():
+		# Check if ray is in PATH
+		ray_in_path = run_local_command("which ray > /dev/null 2>&1", False, check=False)
+		if ray_in_path:
+			return "ray"
+		# Check if ray is in ~/.local/bin
+		local_ray = run_local_command(
+			"test -f ~/.local/bin/ray && echo 'exists'", False, capture_output=True
+		)
+		if local_ray and "exists" in local_ray:
+			return "~/.local/bin/ray"
+		# Otherwise assume ray is in ~/.local/bin but it might not exist
+		return "~/.local/bin/ray"
+
 	# Handle self-job mode
 	if args.self_job:
 		local_ip = get_local_ip()
 		print(f"Running in self-job mode on {local_ip}")
+
+		# First stop any existing Ray processes
+		ray_cmd = get_ray_cmd()
+		print(f"Using Ray command: {ray_cmd}")
+
+		print("Stopping any existing Ray processes...")
+		run_local_command(f"{ray_cmd} stop 2>/dev/null || true", False)
+		time.sleep(3)  # Wait for processes to fully stop
 
 		# Find which slice this machine belongs to
 		slice_idx = -1
@@ -557,23 +603,24 @@ def main():
 		tpu_cores_per_host = slice_tpu_cores // hosts_in_slice
 
 		if args.stop:
-			run_local_command("ray stop", False)
+			run_local_command(f"{ray_cmd} stop", False)
 			return 0
 
 		# Determine if this is the global head, a slice head, or a worker
 		if local_ip == head_ip:
 			print("This machine is the global head node")
-			# Start head node
+			# Start head node with specific resources
 			resources = {
 				"TPU": tpu_cores_per_host,
-				f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,
+				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,  # Standard head marker
+				f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,  # Global head marker
 				f"slice-{slice_idx}": 1,
 				f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
 				f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
 			}
 
 			resources_str = str(resources).replace("'", '"')
-			cmd = f"ray start --head --port=6379 --resources='{resources_str}' --node-ip-address={local_ip} --dashboard-host=0.0.0.0"
+			cmd = f"{ray_cmd} start --head --port=6379 --resources='{resources_str}' --node-ip-address={local_ip} --dashboard-host=0.0.0.0"
 			run_local_command(cmd, False)
 
 		elif local_ip == slice_head_ip and local_ip != head_ip:
@@ -581,8 +628,10 @@ def main():
 				f"This machine is a slice head node for slice {slice_idx + 1}, connecting to global head at {head_ip}"
 			)
 			# Start slice head as a worker connecting to global head
+			# Include the standard head marker for this slice
 			resources = {
 				"TPU": tpu_cores_per_host,
+				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,  # Standard head marker for this slice
 				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-slice-{slice_idx}-head": 1,
 				f"slice-{slice_idx}": 1,
 				f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
@@ -590,7 +639,7 @@ def main():
 			}
 
 			resources_str = str(resources).replace("'", '"')
-			cmd = f"ray start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
+			cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
 			run_local_command(cmd, False)
 
 		else:
@@ -607,11 +656,12 @@ def main():
 			}
 
 			resources_str = str(resources).replace("'", '"')
-			cmd = f"ray start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
+			cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
 			run_local_command(cmd, False)
 
 		return 0
 
+	# Test SSH connectivity if requested
 	if args.test_ssh:
 		if not test_ssh_connectivity(args.external):
 			return 1
