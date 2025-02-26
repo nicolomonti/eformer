@@ -443,16 +443,6 @@ def read_ips_from_yaml(yaml_file):
 
 
 def get_ray_cmd():
-	# ray_in_path = run_local_command("which ray > /dev/null 2>&1", False, check=False)
-	# if ray_in_path:
-	# 	return "ray"
-	# local_ray = run_local_command(
-	# 	"test -f ~/.local/bin/ray && echo 'exists'",
-	# 	False,
-	# 	capture_output=True,
-	# )
-	# if local_ray and "exists" in local_ray:
-	# 	return "~/.local/bin/ray"
 	return ".local/bin/ray"
 
 
