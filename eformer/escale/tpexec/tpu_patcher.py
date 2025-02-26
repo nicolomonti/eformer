@@ -700,7 +700,7 @@ def main():
 				"start",
 				"--address",
 				f"{head_ip}:6379",
-				f"--resources='{resources}",
+				f"--resources='{resources}'",
 				f"--node-ip-address={local_ip}",
 			]
 			run_local_command(cmd, False)
