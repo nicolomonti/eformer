@@ -22,7 +22,7 @@ import os
 import subprocess
 import sys
 import time
-
+import pathlib
 import yaml
 
 TPU_VERSION = os.getenv("TPU_VERSION", "v4")
@@ -32,6 +32,7 @@ SSH_USER = os.getenv("PATCHER_USER")
 INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
 
+RAY_PATH = f"{pathlib.Path.home()}/.local/bin/ray"
 
 def get_local_ip():
 	"""Get the local IP address of the machine."""
@@ -199,14 +200,13 @@ def start_ray_head(head_ip, use_external):
 
 	print(f"Starting Ray head node on {head_ip}")
 	local_ip = get_local_ip()
-
-	ray_cmd = get_ray_cmd()
+ 
 	if check_ray_running(head_ip):
 		print(f"Ray is already running on head node {head_ip}. Stopping it first...")
 		if local_ip == head_ip:
-			run_local_command([ray_cmd, "stop"], False)
+			run_local_command([RAY_PATH, "stop"], False)
 		else:
-			run_ssh_command(head_ip, f"{ray_cmd} stop", False)
+			run_ssh_command(head_ip, f"{RAY_PATH} stop", False)
 		time.sleep(3)
 
 	# Prepare the resources JSON string
@@ -222,7 +222,7 @@ def start_ray_head(head_ip, use_external):
 	if local_ip == head_ip:
 		print("Starting Ray head node locally")
 		cmd = (
-			ray_cmd,
+			RAY_PATH,
 			"start",
 			"--head",
 			"--port=6379",
@@ -233,7 +233,7 @@ def start_ray_head(head_ip, use_external):
 		success = run_local_command(cmd, False)
 	else:
 		print("Starting Ray head node remotely")
-		cmd = f"{ray_cmd} start --head --port=6379 --resources='{resources}' --node-ip-address={head_ip} --dashboard-host=0.0.0.0"
+		cmd = f"{RAY_PATH} start --head --port=6379 --resources='{resources}' --node-ip-address={head_ip} --dashboard-host=0.0.0.0"
 		success = run_ssh_command(head_ip, cmd, False)
 
 	if not success:
@@ -254,13 +254,12 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
 
 	print(f"Starting Ray worker on {worker_ip} (index {i})")
 	local_ip = get_local_ip()
-	ray_cmd = get_ray_cmd()
 	if check_ray_running(worker_ip):
 		print(f"Ray is already running on worker node {worker_ip}. Stopping it first...")
 		if local_ip == worker_ip:
-			run_local_command([ray_cmd, "stop"], False)
+			run_local_command([RAY_PATH, "stop"], False)
 		else:
-			run_ssh_command(worker_ip, f"{ray_cmd} stop", False)
+			run_ssh_command(worker_ip, f"{RAY_PATH} stop", False)
 		time.sleep(3)
 
 	# Prepare the resources JSON string
@@ -269,11 +268,11 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
 	# Run locally or via SSH
 	if local_ip == worker_ip:
 		print("Starting Ray worker locally")
-		cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
+		cmd = f"{RAY_PATH} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
 		success = run_local_command(cmd, False)
 	else:
 		print("Starting Ray worker remotely")
-		cmd = f".local/bin/ray start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
+		cmd = f"{RAY_PATH} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={worker_ip}"
 		success = run_ssh_command(worker_ip, cmd, False)
 
 	if success:
@@ -320,9 +319,9 @@ def stop_cluster(use_external):
 
 		if local_ip == ip:
 			print("Stopping Ray locally")
-			run_local_command(".local/bin/ray stop", False)
+			run_local_command(f"{RAY_PATH} stop", False)
 		else:
-			run_ssh_command(ip, ".local/bin/ray stop", False)
+			run_ssh_command(ip, f"{RAY_PATH} stop", False)
 
 	print("Ray cluster stopped on all nodes.")
 
@@ -457,8 +456,6 @@ def read_ips_from_yaml(yaml_file):
 		return False
 
 
-def get_ray_cmd():
-	return ".local/bin/ray"
 
 
 def main():
@@ -607,11 +604,10 @@ def main():
 	if args.self_job:
 		local_ip = get_local_ip()
 		print(f"Running in self-job mode on {local_ip}")
-		ray_cmd = get_ray_cmd()
-		print(f"Using Ray command: {ray_cmd}")
+		print(f"Using Ray command: {RAY_PATH}")
 		try:
 			subprocess.run(
-				[ray_cmd, "--version"],
+				[RAY_PATH, "--version"],
 				stdout=subprocess.PIPE,
 				stderr=subprocess.PIPE,
 				check=True,
@@ -625,7 +621,7 @@ def main():
 
 		print("Stopping any existing Ray processes...")
 		try:
-			subprocess.run([ray_cmd, "stop"], stderr=subprocess.DEVNULL)
+			subprocess.run([RAY_PATH, "stop"], stderr=subprocess.DEVNULL)
 		except Exception:
 			print("No Ray process was running or could not stop Ray")
 
@@ -655,7 +651,7 @@ def main():
 		tpu_cores_per_host = slice_tpu_cores // hosts_in_slice
 
 		if args.stop:
-			run_local_command(f"{ray_cmd} stop", False)
+			run_local_command(f"{RAY_PATH} stop", False)
 			return 0
 
 		# Determine if this is the global head, a slice head, or a worker
@@ -673,7 +669,7 @@ def main():
 
 			resources_str = str(resources).replace("'", '"')
 			cmd = [
-				ray_cmd,
+				RAY_PATH,
 				"start",
 				"--head",
 				"--port=6379",
@@ -689,22 +685,22 @@ def main():
 			)
 			# Start slice head as a worker connecting to global head
 			# Include the standard head marker for this slice
-			resources = {
-				"TPU": tpu_cores_per_host,
-				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,  # Standard head marker for this slice
-				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-slice-{slice_idx}-head": 1,
-				f"slice-{slice_idx}": 1,
-				f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
-				f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
-			}
-
-			resources_str = str(resources).replace("'", '"')
+			resources = json.dumps(
+				{
+					"TPU": tpu_cores_per_host,
+					f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,
+					f"TPU-{TPU_VERSION}-{slice_tpu_cores}-slice-{slice_idx}-head": 1,
+					f"slice-{slice_idx}": 1,
+					f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
+					f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
+				}
+			)
 			cmd = [
-				ray_cmd,
+				RAY_PATH,
 				"start",
 				"--address",
 				f"{head_ip}:6379",
-				f"--resources={resources_str}",
+				f"--resources='{resources}",
 				f"--node-ip-address={local_ip}",
 			]
 			run_local_command(cmd, False)
@@ -714,16 +710,17 @@ def main():
 				f"This machine is a worker node in slice {slice_idx + 1}, connecting to global head at {head_ip}"
 			)
 			# Start worker node
-			resources = {
-				"TPU": tpu_cores_per_host,
-				f"TPU-{TPU_VERSION}-worker": 1,
-				f"slice-{slice_idx}": 1,
-				f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
-				f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
-			}
+			resources = json.dumps(
+				{
+					"TPU": tpu_cores_per_host,
+					f"TPU-{TPU_VERSION}-worker": 1,
+					f"slice-{slice_idx}": 1,
+					f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
+					f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
+				}
+			)
 
-			resources_str = str(resources).replace("'", '"')
-			cmd = f"{ray_cmd} start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
+			cmd = f"{RAY_PATH} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={local_ip}"
 			run_local_command(cmd, False)
 
 		return 0
