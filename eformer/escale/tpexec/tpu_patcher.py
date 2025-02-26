@@ -17,6 +17,7 @@
 
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -44,7 +45,11 @@ def get_local_ip():
 		return "127.0.0.1"
 
 
-def run_ssh_command(target_ip, command, use_sudo=False):
+def run_ssh_command(
+	target_ip,
+	command,
+	use_sudo=False,
+):
 	"""Run a command on a remote host via SSH."""
 	print(f"Running SSH command on {target_ip}: {command}")
 
@@ -71,7 +76,12 @@ def run_ssh_command(target_ip, command, use_sudo=False):
 		return False
 
 
-def run_local_command(command, use_sudo=False, check=True, capture_output=False):
+def run_local_command(
+	command,
+	use_sudo=False,
+	check=True,
+	capture_output=False,
+):
 	"""Run a command locally with optional output capture."""
 	if isinstance(command, list):
 		cmd_str = " ".join(command)
@@ -84,32 +94,31 @@ def run_local_command(command, use_sudo=False, check=True, capture_output=False)
 		full_command = f"sudo {command}"
 	elif use_sudo and isinstance(command, list):
 		full_command = ["sudo"] + command
+		full_command = " ".join(full_command)
 	else:
 		full_command = command
-
+		if isinstance(full_command, list):
+			full_command = " ".join(full_command)
 	try:
 		if capture_output:
 			if isinstance(full_command, list):
 				result = subprocess.run(
-					full_command,
-					check=check,
+					[full_command],
+					shell=True,
 					stdout=subprocess.PIPE,
 					stderr=subprocess.PIPE,
-					universal_newlines=True,
 				)
 			else:
 				result = subprocess.run(
-					full_command,
+					[full_command],
 					shell=True,
-					check=check,
 					stdout=subprocess.PIPE,
 					stderr=subprocess.PIPE,
-					universal_newlines=True,
 				)
 			return result.stdout
 		else:
 			if isinstance(full_command, list):
-				subprocess.run(full_command, check=check)
+				subprocess.run(full_command, shell=True, check=check)
 			else:
 				subprocess.run(full_command, shell=True, check=check)
 			return True
@@ -201,7 +210,13 @@ def start_ray_head(head_ip, use_external):
 		time.sleep(3)
 
 	# Prepare the resources JSON string
-	resources = f'{{"TPU":{TPU_CORES_PER_HOST},"TPU-{TPU_VERSION}-{TPU_SLICE_SIZE}-head":1,"accelerator_type:TPU-{TPU_VERSION.upper()}":1}}'
+	resources = json.dumps(
+		{
+			"TPU": TPU_CORES_PER_HOST,
+			f"TPU-{TPU_VERSION}-{TPU_SLICE_SIZE}-head": 1,
+			f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
+		}
+	)
 
 	# Run locally or via SSH
 	if local_ip == head_ip:
@@ -572,7 +587,11 @@ def main():
 			slice_ips = ips_to_use[start_idx:end_idx]
 
 			slice_configs.append(
-				{"name": f"slice-{i + 1}", "ips": slice_ips, "tpu_cores": TPU_SLICE_SIZE}
+				{
+					"name": f"slice-{i + 1}",
+					"ips": slice_ips,
+					"tpu_cores": TPU_SLICE_SIZE,
+				}
 			)
 
 	# Print slice configuration
