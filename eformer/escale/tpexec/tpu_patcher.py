@@ -607,10 +607,11 @@ def main():
 				stderr=subprocess.PIPE,
 				check=True,
 			)
-		except (subprocess.CalledProcessError, FileNotFoundError):
+		except (subprocess.CalledProcessError, FileNotFoundError) as e:
 			print("ERROR: Ray command not found or not working.")
 			print("Please install Ray with: pip install -U ray")
 			print("Make sure ray is in your PATH or in ~/.local/bin/")
+			print("Exec", str(e))
 			return 1
 
 		print("Stopping any existing Ray processes...")
