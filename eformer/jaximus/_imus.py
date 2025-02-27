@@ -548,6 +548,22 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 			out = _CustomTracer(self, out)
 		return out
 
+	def process_shard_map(self, primitive, fun, tracers, **params):
+		in_values = [self.to_value(t) for t in tracers]
+		arrays: list[chex.Array] = []
+		for x in in_values:
+			if _is_value(x):
+				arrays.append(x.materialize())
+			elif is_array(x):
+				arrays.append(tp.cast(chex.Array, x))
+			else:
+				arrays.append(x)
+		out = primitive.bind_with_trace(self.parent_trace, (fun, *arrays), params)
+		if primitive.multiple_results:
+			return [_CustomTracer(self, x) for x in out]
+		else:
+			return _CustomTracer(self, out)
+
 	def process_custom_jvp_call(self, primitive, fun, jvp, tracers, *, symbolic_zeros):
 		in_values = [self.to_value(t) for t in tracers]
 		in_leaves, in_treedef = tu.tree_flatten(in_values)
@@ -562,7 +578,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 		out_values = tu.tree_unflatten(out_treedef, out_leaves)
 		return [_CustomTracer(self, x) for x in out_values]
 
-	def process_map(self, map_primitive, f, tracers, params):
+	def process_map(self, map_primitive, f, tracers, **params):
 		in_values = [self.to_value(t) for t in tracers]
 		with core.set_current_trace(self.parent_trace):
 			out = _default_process(map_primitive, in_values, params)
