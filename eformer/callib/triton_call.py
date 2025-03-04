@@ -153,7 +153,7 @@ def get_triton_type(obj: Any) -> str:
 		else:
 			raise ValueError(f"integer overflow representing {obj}")
 	if isinstance(obj, float):
-		return "fp64"
+		return "fp32"
 	if isinstance(obj, np.float32):
 		return "fp32"
 	if isinstance(obj, bool):
@@ -390,10 +390,11 @@ def get_or_create_triton_kernel(
 	backend = backend_init_func(device, compute_capability)
 	for i, _, v in scalar_args:
 		args_for_specialization_attr[i] = v
-
+ 
 	specialization_attr = backend.get_attrs_descriptor(
 		fn.params[: len(args_for_specialization_attr)], args_for_specialization_attr
-	)  # pylint: disable=protected-access
+	)
+	# pylint: disable=protected-access
 	constants = dict(metaparams)
 	constants.update({k: None for _, k, v in scalar_args if v is None})
 	constants.update({fn.arg_names[i]: 1 for i in specialization_attr.equal_to_1})
