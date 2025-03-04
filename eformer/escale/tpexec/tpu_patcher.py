@@ -34,6 +34,7 @@ EXTERNAL_IPS = ["0.0.0.0"]
 
 RAY_PATH = f"{pathlib.Path.home()}/.local/bin/ray"
 
+
 def get_local_ip():
 	"""Get the local IP address of the machine."""
 	try:
@@ -200,7 +201,7 @@ def start_ray_head(head_ip, use_external):
 
 	print(f"Starting Ray head node on {head_ip}")
 	local_ip = get_local_ip()
- 
+
 	if check_ray_running(head_ip):
 		print(f"Ray is already running on head node {head_ip}. Stopping it first...")
 		if local_ip == head_ip:
@@ -456,8 +457,6 @@ def read_ips_from_yaml(yaml_file):
 		return False
 
 
-
-
 def main():
 	global TPU_VERSION, TPU_SLICE_SIZE, SSH_USER, INTERNAL_IPS, EXTERNAL_IPS
 
@@ -627,22 +626,61 @@ def main():
 
 		time.sleep(3)  # Wait for processes to fully stop
 
+		# Always use internal IPs for self-job mode
+		ips_to_use = INTERNAL_IPS
+
+		# If internal IPs are empty but external IPs are provided, try to convert external to internal
+		if not ips_to_use and EXTERNAL_IPS:
+			print("Warning: No internal IPs provided but external IPs exist.")
+			print("For self-job mode, internal IPs are required.")
+			print("Attempting to use local IP as internal IP...")
+			ips_to_use = [local_ip]  # Use local IP as fallback
+
 		# Find which slice this machine belongs to
 		slice_idx = -1
 		host_idx_in_slice = -1
 
 		for i, slice_config in enumerate(slice_configs):
-			if local_ip in slice_config["ips"]:
-				slice_idx = i
-				host_idx_in_slice = slice_config["ips"].index(local_ip)
-				break
+			# Update slice_config IPs to use internal IPs if available
+			if args.self_job:
+				# If slice config has external IPs but we need internal, try to match by position
+				if local_ip in slice_config["ips"]:
+					slice_idx = i
+					host_idx_in_slice = slice_config["ips"].index(local_ip)
+					break
 
+		# If not found in slice configs, try to find in global IP list
 		if slice_idx == -1:
-			print(f"Error: Local IP {local_ip} not found in any slice configuration")
-			return 1
+			if local_ip in ips_to_use:
+				# Find which slice this would belong to based on distribution
+				host_idx = ips_to_use.index(local_ip)
+				hosts_per_slice = len(ips_to_use) // num_slices
+				slice_idx = host_idx // hosts_per_slice
+				host_idx_in_slice = host_idx % hosts_per_slice
+			else:
+				print(
+					f"Error: Local IP {local_ip} not found in any slice configuration or IP list"
+				)
+				return 1
 
-		slice_config = slice_configs[slice_idx]
-		head_ip = slice_configs[0]["ips"][0]  # Global head is first IP of first slice
+		# If we still have slice configs from earlier, use them
+		# Otherwise reconstruct the slice config for this node
+		if slice_configs:
+			slice_config = slice_configs[slice_idx]
+		else:
+			# Create a basic slice config based on position
+			hosts_per_slice = len(ips_to_use) // num_slices
+			start_idx = slice_idx * hosts_per_slice
+			end_idx = start_idx + hosts_per_slice
+			slice_ips = ips_to_use[start_idx:end_idx]
+			slice_config = {
+				"name": f"slice-{slice_idx + 1}",
+				"ips": slice_ips,
+				"tpu_cores": TPU_SLICE_SIZE,
+			}
+
+		# Always use internal IPs for head nodes in self-job mode
+		head_ip = ips_to_use[0]  # Global head is first IP of internal IPs
 		slice_head_ip = slice_config["ips"][0]  # Slice head is first IP of this slice
 
 		# Determine TPU cores per host for this slice
