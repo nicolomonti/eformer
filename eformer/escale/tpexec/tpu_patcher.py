@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import pathlib
+import requests
 import yaml
 
 TPU_VERSION = os.getenv("TPU_VERSION", "v4")
@@ -33,6 +34,32 @@ INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
 
 RAY_PATH = f"{pathlib.Path.home()}/.local/bin/ray"
+
+
+def get_external_ip():
+	"""Get the external IP address of the machine."""
+	try:
+    
+    # Note
+		# this method may fail if users using vpn, but why should someone use vpn on TPUs
+		
+		# Using a reliable service that returns just the IP
+		response = requests.get("https://api.ipify.org", timeout=5)
+		if response.status_code == 200:
+			return response.text
+
+		# Fallback services if the first one fails
+		response = requests.get("https://ipinfo.io/ip", timeout=5)
+		if response.status_code == 200:
+			return response.text
+
+		response = requests.get("https://checkip.amazonaws.com", timeout=5)
+		if response.status_code == 200:
+			return response.text.strip()
+
+		return "Could not determine external IP"
+	except Exception as e:
+		return f"Error getting external IP: {e}"
 
 
 def get_local_ip():
@@ -601,7 +628,7 @@ def main():
 	print("====================\n")
 
 	if args.self_job:
-		local_ip = get_local_ip()
+		local_ip = get_external_ip() if args.external else get_local_ip()
 		print(f"Running in self-job mode on {local_ip}")
 		print(f"Using Ray command: {RAY_PATH}")
 		try:
