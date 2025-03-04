@@ -39,10 +39,9 @@ RAY_PATH = f"{pathlib.Path.home()}/.local/bin/ray"
 def get_external_ip():
 	"""Get the external IP address of the machine."""
 	try:
-    
-    # Note
+		# Note
 		# this method may fail if users using vpn, but why should someone use vpn on TPUs
-		
+
 		# Using a reliable service that returns just the IP
 		response = requests.get("https://api.ipify.org", timeout=5)
 		if response.status_code == 200:
@@ -554,7 +553,7 @@ def main():
 	)
 
 	args = parser.parse_args()
-
+	using_external = args.external or args.internal_ips is None
 	# Update global variables based on arguments
 	TPU_VERSION = args.tpu_version
 	TPU_SLICE_SIZE = args.tpu_slice
@@ -592,7 +591,7 @@ def main():
 			return 1
 	else:
 		# Create default slice config based on IPs and num_slices
-		ips_to_use = EXTERNAL_IPS if args.external else INTERNAL_IPS
+		ips_to_use = EXTERNAL_IPS if using_external else INTERNAL_IPS
 
 		# Calculate hosts per slice
 		total_hosts = len(ips_to_use)
@@ -628,7 +627,7 @@ def main():
 	print("====================\n")
 
 	if args.self_job:
-		local_ip = get_external_ip() if args.external else get_local_ip()
+		local_ip = get_external_ip() if using_external else get_local_ip()
 		print(f"Running in self-job mode on {local_ip}")
 		print(f"Using Ray command: {RAY_PATH}")
 		try:
@@ -651,12 +650,7 @@ def main():
 		except Exception:
 			print("No Ray process was running or could not stop Ray")
 
-		time.sleep(3)  # Wait for processes to fully stop
-
-		# Always use internal IPs for self-job mode
-		ips_to_use = INTERNAL_IPS
-
-		# If internal IPs are empty but external IPs are provided, try to convert external to internal
+		time.sleep(3)
 		if not ips_to_use and EXTERNAL_IPS:
 			print("Warning: No internal IPs provided but external IPs exist.")
 			print("For self-job mode, internal IPs are required.")
@@ -792,21 +786,21 @@ def main():
 
 	# Test SSH connectivity if requested
 	if args.test_ssh:
-		if not test_ssh_connectivity(args.external):
+		if not test_ssh_connectivity(using_external):
 			return 1
 		return 0
 
 	if args.stop:
-		stop_cluster(args.external)
+		stop_cluster(using_external)
 		return 0
 	elif args.verify:
-		head_ip = EXTERNAL_IPS[0] if args.external else INTERNAL_IPS[0]
+		head_ip = EXTERNAL_IPS[0] if using_external else INTERNAL_IPS[0]
 		if verify_ray_cluster(head_ip, total_tpu_cores):
 			return 0
 		else:
 			return 1
 	else:
-		if setup_cluster(args.external):
+		if setup_cluster(using_external):
 			return 0
 		else:
 			return 1
