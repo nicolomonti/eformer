@@ -18,30 +18,28 @@ import jax
 from jax import numpy as jnp
 
 
-def quantize_row_q8_0(x: jax.Array):
+def quantize_int8(x: jax.Array, axis: int | tuple = -1):
 	"""
-	Quantize a row of float32 values to 8-bit integers with blockwise scaling.
+	Quantize values to 8-bit integers.
 
 	Args:
-	    x (jax.Array): Input array of float32 values.
+	    x (jax.Array): Input array.
 
 	Returns:
 	    tuple: A tuple containing:
 	        - quantized_values (jax.Array): int8 array of shape (k,) containing quantized values.
 	        - scales (jax.Array): Array of shape (nb,) containing scaling factors.
 	"""
-	n_bit = 8
-	eps = 1e-5
-	max_int = 2 ** (n_bit - 1) - 1
-	min_int = -(2 ** (n_bit - 1))
-	max_val = jnp.amax(jnp.abs(x), axis=-1, keepdims=True)
-	max_val = jnp.clip(max_val, min=eps)
-	qscale = max_val / max_int
-	qweight = jnp.clip(jnp.round(x * (1.0 / qscale)), min_int, max_int).astype(jnp.int8)
-	return qweight, qscale
+	if not isinstance(axis, tuple):
+		axis = (axis,)
+	axis = tuple(z % x.ndim for z in axis)
+	amax = jnp.max(jnp.abs(x), axis=axis, keepdims=True)
+	scale = (amax / 127.0 + jnp.finfo(x.dtype).tiny).astype(x.dtype)
+	quant = jnp.round(x / scale).astype(jnp.int8)
+	return quant, scale
 
 
-def dequantize_row_q8_0(quants, scales):
+def dequantize_int8(quants, scales):
 	"""
 	Dequantize 8-bit integers back to float32 values using blockwise scaling.
 
@@ -52,8 +50,8 @@ def dequantize_row_q8_0(quants, scales):
 	Returns:
 	    jax.Array: Array of shape (k,) containing dequantized float32 values.
 	"""
-	dequantized = quants * scales
-	return dequantized
+
+	return quants * scales
 
 
 @functools.partial(jax.jit, static_argnames=["block_size"])
@@ -146,8 +144,7 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
 		dtype=jnp.float32,
 	)[unpacked]
 
-	num_blocks = len(absmax)
-	dequantized = dequantized.reshape(num_blocks, block_size)
+	dequantized = dequantized.reshape(-1, block_size)
 	scaled = dequantized * absmax[:, None]
 	return scaled
 
@@ -187,7 +184,9 @@ def dequantize_nf4(packed_values, absmax, block_size):
 	    jax.Array: Dequantized array of float32 values.
 	"""
 	if packed_values.ndim > 2:
-		return jax.vmap(dequantize_nf4, in_axes=(0, 0, None), out_axes=(0,))(
-			packed_values, absmax, block_size
-		)
+		return jax.vmap(
+			dequantize_nf4,
+			in_axes=(0, 0, None),
+			out_axes=(0,),
+		)(packed_values, absmax, block_size)
 	return single_dequantize_nf4(packed_values, absmax, block_size)

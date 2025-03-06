@@ -454,6 +454,7 @@ def _default_process(
 			arrays.append(tp.cast(chex.Array, x))
 		else:
 			arrays.append(x)
+	
 	subfuns, bind_params = primitive.get_bind_params(params)
 	return primitive.bind(*subfuns, *arrays, **bind_params)
 
@@ -511,6 +512,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 		implicit_name = None
 		if implicit_idx is not None:
 			implicit_name = values[implicit_idx].__class__.__name__
+
 		try:
 			rule = _rules[primitive]
 		except KeyError:

@@ -20,7 +20,7 @@ from jax import lax
 from jax import numpy as jnp
 
 from eformer.jaximus import ImplicitArray, aux_field, register
-
+from jax.extend.core import Primitive
 from .quantization_functions import (
 	dequantize_nf4,
 	quantize_and_pack_nf4,
@@ -53,7 +53,7 @@ class ArrayNF4(ImplicitArray):
 	block_size: int = aux_field()
 
 	@classmethod
-	def quantize(cls, array: Array, block_size: int = 64):
+	def quantize(cls, array: Array, block_size: int = 64, verbose=False):
 		"""
 		Initializes the `ArrayNF4` object by quantizing the input array.
 
@@ -61,8 +61,9 @@ class ArrayNF4(ImplicitArray):
 		    array (jax.Array): The input array to be quantized.
 		    block_size (int): The size of each quantization block. Defaults to 64.
 		"""
-		block_size = min(block_size, array.size)
-		packed, absmax = quantize_and_pack_nf4(array, block_size)
+		block_size = min(block_size, array.shape[-1], array.size)
+
+		packed, absmax = quantize_and_pack_nf4(array.reshape(-1, block_size), block_size)
 		return cls(
 			packed=packed,
 			absmax=absmax,
@@ -88,12 +89,16 @@ class ArrayNF4(ImplicitArray):
 			.astype(self.dtype)
 		)
 
+	def delete(self):
+		self.packed.delete()
+		self.absmax.delete()
+
 
 ArrayType = Union[Array, ArrayNF4]
 
 
 @register("convert_element_type")
-def _(operand: ArrayType, new_dtype: Any) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayType, new_dtype: Any) -> ArrayType:
 	if isinstance(operand, ArrayNF4):
 		operand.dtype = new_dtype
 		return operand
@@ -102,7 +107,7 @@ def _(operand: ArrayType, new_dtype: Any) -> ArrayType:
 
 
 @register("lt")
-def _(x: ArrayType, y: ArrayType, **kwargs):
+def _(primitive: Primitive, x: ArrayType, y: ArrayType, **kwargs):
 	if isinstance(x, ArrayNF4):
 		x = x.materialize()
 	if isinstance(y, ArrayNF4):
@@ -111,7 +116,7 @@ def _(x: ArrayType, y: ArrayType, **kwargs):
 
 
 @register("convert_element_type")
-def _(operand: ArrayType, **kwargs) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayType, **kwargs) -> ArrayType:
 	new_dtype = kwargs.get("new_dtype", jnp.bfloat16)
 	if isinstance(operand, ArrayNF4):
 		operand.dtype = new_dtype
@@ -121,7 +126,7 @@ def _(operand: ArrayType, **kwargs) -> ArrayType:
 
 
 @register("integer_pow")
-def _(x: Any, y: Any) -> Any:
+def _(primitive: Primitive, x: Any, y: Any) -> Any:
 	if isinstance(x, ArrayNF4):
 		x = x.materialize()
 	if isinstance(y, ArrayNF4):
@@ -130,7 +135,7 @@ def _(x: Any, y: Any) -> Any:
 
 
 @register("integer_pow")
-def _(x: Any, **kwargs) -> Any:
+def _(primitive: Primitive, x: Any, **kwargs) -> Any:
 	y = kwargs.get("y", 2)
 	if isinstance(x, ArrayNF4):
 		x = x.materialize()
@@ -138,7 +143,7 @@ def _(x: Any, **kwargs) -> Any:
 
 
 @register("div")
-def _(x: Any, y: Any) -> Any:
+def _(primitive: Primitive, x: Any, y: Any) -> Any:
 	if isinstance(x, ArrayNF4):
 		x = x.materialize()
 	if isinstance(y, ArrayNF4):
@@ -147,9 +152,8 @@ def _(x: Any, y: Any) -> Any:
 
 
 @register("sqrt")
-def _(x: Any) -> Any:
-	if isinstance(x, ArrayNF4):
-		x = x.materialize()
+def _(primitive: Primitive, x: ArrayNF4) -> Any:
+	x = x.materialize()
 	return lax.sqrt(x)
 
 
@@ -168,7 +172,8 @@ def safe_delete(arr: ArrayType, materialized: bool) -> None:
 
 
 @register("dot_general")
-def handle_dot_general(
+def _(
+	primitive: Primitive,
 	lhs: ArrayType,
 	rhs: ArrayType,
 	*args: Any,
@@ -201,7 +206,7 @@ def handle_dot_general(
 
 
 @register("add")
-def handle_add(x: ArrayType, y: ArrayType) -> ArrayType:
+def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	"""
 	Custom handler for JAX's add operation.
 
@@ -228,7 +233,8 @@ def handle_add(x: ArrayType, y: ArrayType) -> ArrayType:
 
 
 @register("reduce")
-def handle_reduce(
+def _(
+	primitive: Primitive,
 	operand: ArrayType,
 	init_value: ArrayType,
 	*args: Any,
@@ -262,7 +268,7 @@ def handle_reduce(
 
 
 @register("mul")
-def handle_mul(x: ArrayType, y: ArrayType) -> ArrayType:
+def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	"""
 	Custom handler for JAX's mul operation.
 
@@ -289,11 +295,7 @@ def handle_mul(x: ArrayType, y: ArrayType) -> ArrayType:
 
 
 @register("transpose")
-def handle_transpose(
-	operand: ArrayType,
-	*args: Any,
-	**kwargs: Any,
-) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
 	"""
 	Custom handler for JAX's transpose operation.
 
@@ -320,7 +322,8 @@ def handle_transpose(
 
 
 @register("conv_general_dilated")
-def handle_conv(
+def _(
+	primitive: Primitive,
 	lhs: ArrayType,
 	rhs: ArrayType,
 	*args: Any,
@@ -354,11 +357,8 @@ def handle_conv(
 
 
 @register("max")
-def handle_max(
-	x: ArrayType,
-	y: ArrayType,
-	*args: Any,
-	**kwargs: Any,
+def _(
+	primitive: Primitive, x: ArrayType, y: ArrayType, *args: Any, **kwargs: Any
 ) -> ArrayType:
 	"""
 	Custom handler for JAX's max operation.
@@ -388,11 +388,7 @@ def handle_max(
 
 
 @register("exp")
-def handle_exp(
-	x: ArrayType,
-	*args: Any,
-	**kwargs: Any,
-) -> ArrayType:
+def _(primitive: Primitive, x: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
 	"""
 	Custom handler for JAX's exp operation.
 
@@ -418,10 +414,7 @@ def handle_exp(
 
 
 @register("log")
-def handle_log(
-	x: ArrayType,
-	**kwargs: Any,
-) -> jnp.ndarray:
+def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 	"""
 	Custom handler for JAX's log operation.
 
@@ -452,10 +445,7 @@ def handle_log(
 
 
 @register("reshape")
-def handle_reshape(
-	operand: ArrayType,
-	**kwargs: Any,
-) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayNF4, **kwargs: Any) -> ArrayType:
 	"""
 	Custom handler for JAX's reshape operation.
 
@@ -489,10 +479,8 @@ def handle_reshape(
 
 
 @register("concatenate")
-def handle_concatenate(
-	operands: Sequence[ArrayType],
-	*args: Any,
-	**kwargs: Any,
+def _(
+	primitive: Primitive, operands: Sequence[ArrayType], *args: Any, **kwargs: Any
 ) -> ArrayType:
 	"""
 	Custom handler for JAX's concatenate operation.
@@ -500,13 +488,13 @@ def handle_concatenate(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	                primitive: The JAX primitive being handled.
-	                operands: Sequence of arrays to concatenate.
-	                *args: Variable length argument list.
-	                **kwargs: Arbitrary keyword arguments.
+	        primitive: The JAX primitive being handled.
+	        operands: Sequence of arrays to concatenate.
+	        *args: Variable length argument list.
+	        **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	                The result of lax.concatenate operation.
+	        The result of lax.concatenate operation.
 	"""
 	materialized_operands = []
 	materialized_flags = []
@@ -526,28 +514,17 @@ def handle_concatenate(
 
 
 @register("broadcast_in_dim")
-def handle_broadcast_in_dim(
-	operand: ArrayType,
-	*args: Any,
-	**kwargs: Any,
-) -> ArrayType:
-	"""Handle broadcast_in_dim for ArrayNF4."""
-	operand, operand_materialized = safe_materialize(operand)
-
-	try:
-		result = jax.lax.broadcast_in_dim(operand, *args, **kwargs)
-	finally:
-		safe_delete(operand, operand_materialized)
-
+def _(primitive: Primitive, operand: ArrayNF4, *args, **params) -> ArrayType:
+	"""Handle broadcast_in_dim for Array8B."""
+	array = operand.materialize()
+	subfuns, bind_params = primitive.get_bind_params(params)
+	result = primitive.bind(*subfuns, array, *args, **bind_params)
+	result = ArrayNF4.quantize(result, block_size=operand.block_size)
 	return result
 
 
 @register("gather")
-def handle_gather(
-	operand: ArrayType,
-	*args: Any,
-	**kwargs: Any,
-) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
 	"""Handle gather for ArrayNF4."""
 	operand, operand_materialized = safe_materialize(operand)
 
