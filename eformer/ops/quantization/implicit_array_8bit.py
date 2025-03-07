@@ -398,7 +398,7 @@ def _(primitive: Primitive, x: Array8B, *args, **kwargs):
 
 
 @register("reshape")
-def _(primitive: Primitive, operand: Array8B, **kwargs: tp.Any):
+def _(primitive: Primitive, operand: Array8B, *args, **params):
 	"""
 	Custom handler for JAX's reshape operation.
 
@@ -418,16 +418,12 @@ def _(primitive: Primitive, operand: Array8B, **kwargs: tp.Any):
 	Raises:
 	  ValueError: If the new shape is not compatible with the original array's size.
 	"""
-	operand = operand.materialize()
-	try:
-		reshaped = lax.reshape(operand, **kwargs)
-	except ValueError as e:
-		raise ValueError(
-			f"Reshape operation failed: {str(e)}. "
-			f"Ensure the new shape {kwargs} is compatible with the original array size."
-		) from e
-	reshaped = Array8B.quantize(reshaped, dtype=reshaped.dtype)
-	return reshaped
+
+	array = operand.materialize()
+	subfuns, bind_params = primitive.get_bind_params(params)
+	result = primitive.bind(*subfuns, array, *args, **bind_params)
+	result = Array8B.quantize(result, dtype=operand.dtype)
+	return result
 
 
 @register("concatenate")

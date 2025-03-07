@@ -185,14 +185,14 @@ def _(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        lhs: Left-hand side array.
-	        rhs: Right-hand side array.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  lhs: Left-hand side array.
+	  rhs: Right-hand side array.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.dot_general operation.
+	  The result of lax.dot_general operation.
 	"""
 	lhs, lhs_materialized = safe_materialize(lhs)
 	rhs, rhs_materialized = safe_materialize(rhs)
@@ -213,12 +213,12 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        x: First array to add.
-	        y: Second array to add.
+	  primitive: The JAX primitive being handled.
+	  x: First array to add.
+	  y: Second array to add.
 
 	Returns:
-	        The result of lax.add operation.
+	  The result of lax.add operation.
 	"""
 	x, x_materialized = safe_materialize(x)
 	y, y_materialized = safe_materialize(y)
@@ -246,14 +246,14 @@ def _(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        operand: The array to be reduced.
-	        init_value: The initial value for the reduction.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  operand: The array to be reduced.
+	  init_value: The initial value for the reduction.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.reduce operation.
+	  The result of lax.reduce operation.
 	"""
 	operand, operand_materialized = safe_materialize(operand)
 	init_value, init_value_materialized = safe_materialize(init_value)
@@ -275,12 +275,12 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        x: First array to multiply.
-	        y: Second array to multiply.
+	  primitive: The JAX primitive being handled.
+	  x: First array to multiply.
+	  y: Second array to multiply.
 
 	Returns:
-	        The result of lax.mul operation.
+	  The result of lax.mul operation.
 	"""
 	x, x_materialized = safe_materialize(x)
 	y, y_materialized = safe_materialize(y)
@@ -303,13 +303,13 @@ def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> Arr
 	Re-quantizes the result if the input was ArrayNF4.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        operand: The array to be transposed.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  operand: The array to be transposed.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.transpose operation, potentially re-quantized.
+	  The result of lax.transpose operation, potentially re-quantized.
 	"""
 	operand, operand_materialized = safe_materialize(operand)
 
@@ -335,14 +335,14 @@ def _(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        lhs: Left-hand side array (input).
-	        rhs: Right-hand side array (kernel).
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  lhs: Left-hand side array (input).
+	  rhs: Right-hand side array (kernel).
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.conv_general_dilated operation.
+	  The result of lax.conv_general_dilated operation.
 	"""
 	lhs, lhs_materialized = safe_materialize(lhs)
 	rhs, rhs_materialized = safe_materialize(rhs)
@@ -366,14 +366,14 @@ def _(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        x: First array for max comparison.
-	        y: Second array for max comparison.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  x: First array for max comparison.
+	  y: Second array for max comparison.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.max operation.
+	  The result of lax.max operation.
 	"""
 	x, x_materialized = safe_materialize(x)
 	y, y_materialized = safe_materialize(y)
@@ -395,13 +395,13 @@ def _(primitive: Primitive, x: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType
 	Materializes ArrayNF4 input before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        x: The array to apply exponential to.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  x: The array to apply exponential to.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.exp operation.
+	  The result of lax.exp operation.
 	"""
 	x, x_materialized = safe_materialize(x)
 
@@ -422,15 +422,15 @@ def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 	regular arrays and ArrayNF4 quantized arrays.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        x: The array to apply logarithm to.
-	        **kwargs: Additional keyword arguments for the log operation.
+	  primitive: The JAX primitive being handled.
+	  x: The array to apply logarithm to.
+	  **kwargs: Additional keyword arguments for the log operation.
 
 	Returns:
-	        The result of the natural logarithm operation.
+	  The result of the natural logarithm operation.
 
 	Raises:
-	        RuntimeError: If the log operation fails.
+	  RuntimeError: If the log operation fails.
 	"""
 	x, x_materialized = safe_materialize(x)
 
@@ -445,7 +445,7 @@ def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 
 
 @register("reshape")
-def _(primitive: Primitive, operand: ArrayNF4, **kwargs: Any) -> ArrayType:
+def _(primitive: Primitive, operand: ArrayNF4, *args, **params) -> ArrayType:
 	"""
 	Custom handler for JAX's reshape operation.
 
@@ -453,29 +453,22 @@ def _(primitive: Primitive, operand: ArrayNF4, **kwargs: Any) -> ArrayType:
 	It materializes ArrayNF4 input before reshaping and re-quantizes the result if the input was ArrayNF4.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        operand: The array to be reshaped.
-	        **kwargs: Additional keyword arguments for the reshape operation.
+	  primitive: The JAX primitive being handled.
+	  operand: The array to be reshaped.
+	  **kwargs: Additional keyword arguments for the reshape operation.
 
 	Returns:
-	        The reshaped array, potentially re-quantized if the input was ArrayNF4.
+	  The reshaped array, potentially re-quantized if the input was ArrayNF4.
 
 	Raises:
-	        ValueError: If the new shape is not compatible with the original array's size.
+	  ValueError: If the new shape is not compatible with the original array's size.
 	"""
-	operand, operand_materialized = safe_materialize(operand)
+	array = operand.materialize()
 
-	try:
-		reshaped = lax.reshape(operand, **kwargs)
-	except ValueError as e:
-		raise ValueError(
-			f"Reshape operation failed: {str(e)}. "
-			f"Ensure the new shape {kwargs} is compatible with the original array size."
-		) from e
-	finally:
-		safe_delete(operand, operand_materialized)
-
-	return reshaped
+	subfuns, bind_params = primitive.get_bind_params(params)
+	result = primitive.bind(*subfuns, array, *args, **bind_params)
+	result = ArrayNF4.quantize(result, block_size=operand.block_size)
+	return result
 
 
 @register("concatenate")
@@ -488,13 +481,13 @@ def _(
 	Materializes ArrayNF4 inputs before performing the operation.
 
 	Args:
-	        primitive: The JAX primitive being handled.
-	        operands: Sequence of arrays to concatenate.
-	        *args: Variable length argument list.
-	        **kwargs: Arbitrary keyword arguments.
+	  primitive: The JAX primitive being handled.
+	  operands: Sequence of arrays to concatenate.
+	  *args: Variable length argument list.
+	  **kwargs: Arbitrary keyword arguments.
 
 	Returns:
-	        The result of lax.concatenate operation.
+	  The result of lax.concatenate operation.
 	"""
 	materialized_operands = []
 	materialized_flags = []
