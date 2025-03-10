@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
+
 import abc
 import dataclasses
 import functools as ft
@@ -454,7 +455,7 @@ def _default_process(
 			arrays.append(tp.cast(chex.Array, x))
 		else:
 			arrays.append(x)
-	
+
 	subfuns, bind_params = primitive.get_bind_params(params)
 	return primitive.bind(*subfuns, *arrays, **bind_params)
 
@@ -507,78 +508,63 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 		values = [self.to_value(t) for t in tracers]
 		values = tuple(values)
 		implicit_idx = next(
-			(i for i, v in enumerate(values) if isinstance(v, ImplicitArray)), None
+			(i for i, v in enumerate(values) if isinstance(v, ImplicitArray)),
+			None,
 		)
 		implicit_name = None
 		if implicit_idx is not None:
 			implicit_name = values[implicit_idx].__class__.__name__
-
-		try:
-			rule = _rules[primitive]
-		except KeyError:
-			with core.set_current_trace(self.parent_trace):
-				if WARN_ON_MATTER and implicit_name is not None:
-					warnings.warn(
-						f"No Custom Primitive been found for {primitive} (materializing {implicit_name})",
-						stacklevel=1,
-					)
-				out = _default_process(primitive, values, params)
-		else:
-			include_prim = False
-			with core.set_current_trace(self.parent_trace):
-				try:
-					try:
-						method, _ = rule.resolve_method(values)
-					except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
-						inhint = (primitive,) + tuple(values)
-						include_prim = True
-						method, _ = rule.resolve_method(inhint)
-				except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
+			try:
+				rule = _rules[primitive]
+			except KeyError:
+				with core.set_current_trace(self.parent_trace):
 					if WARN_ON_MATTER and implicit_name is not None:
 						warnings.warn(
-							f"No Custom Primitive could match for {primitive} (materializing {implicit_name})",
+							f"No Custom Primitive been found for {primitive} (materializing {implicit_name})",
 							stacklevel=1,
 						)
 					out = _default_process(primitive, values, params)
-				else:
-					if include_prim:
-						values = (primitive,) + tuple(values)
-					out = method(*values, **params)
+			else:
+				include_prim = False
+				with core.set_current_trace(self.parent_trace):
+					try:
+						try:
+							method, _ = rule.resolve_method(values)
+						except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
+							inhint = (primitive,) + tuple(values)
+							include_prim = True
+							method, _ = rule.resolve_method(inhint)
+					except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
+						if WARN_ON_MATTER and implicit_name is not None:
+							warnings.warn(
+								f"No Custom Primitive could match for {primitive} (materializing {implicit_name})",
+								stacklevel=1,
+							)
+						out = _default_process(primitive, values, params)
+					else:
+						if include_prim:
+							values = (primitive,) + tuple(values)
+						out = method(*values, **params)
+		else:
+			with core.set_current_trace(self.parent_trace):
+				subfuns, bind_params = primitive.get_bind_params(params)
+				out = primitive.bind(*subfuns, *values, **bind_params)
 		if primitive.multiple_results:
 			out = [_CustomTracer(self, x) for x in out]
 		else:
 			out = _CustomTracer(self, out)
 		return out
 
-	def process_shard_map(self, primitive, fun, tracers, **params):
-		in_values = [self.to_value(t) for t in tracers]
-		arrays: list[chex.Array] = []
-		for x in in_values:
-			if _is_value(x):
-				arrays.append(x.materialize())
-			elif is_array(x):
-				arrays.append(tp.cast(chex.Array, x))
-			else:
-				arrays.append(x)
-		out = primitive.bind_with_trace(self.parent_trace, (fun, *arrays), params)
+	def process_shard_map(self: _CustomTrace, primitive, fun, tracers, **params):
+		tracers = [
+			(arr.materialize() if _is_value(arr) else arr)
+			for arr in [self.to_value(t) for t in tracers]
+		]
+		out = primitive.bind_with_trace(self.parent_trace, (fun, *tracers), params)
 		if primitive.multiple_results:
 			return [_CustomTracer(self, x) for x in out]
 		else:
 			return _CustomTracer(self, out)
-
-	def process_custom_jvp_call(self, primitive, fun, jvp, tracers, *, symbolic_zeros):
-		in_values = [self.to_value(t) for t in tracers]
-		in_leaves, in_treedef = tu.tree_flatten(in_values)
-		fun, out_treedef1 = _custom_jvp_fun_wrap(fun, self.tag, in_treedef)
-		jvp, out_treedef2 = _custom_jvp_jvp_wrap(jvp, self.tag, in_treedef)
-		out_leaves = primitive.bind_with_trace(
-			self.parent_trace,
-			(fun, jvp, *in_leaves),
-			dict(symbolic_zeros=symbolic_zeros),
-		)
-		_, out_treedef = lu.merge_linear_aux(out_treedef1, out_treedef2)
-		out_values = tu.tree_unflatten(out_treedef, out_leaves)
-		return [_CustomTracer(self, x) for x in out_values]
 
 	def process_map(self, map_primitive, f, tracers, **params):
 		in_values = [self.to_value(t) for t in tracers]
@@ -607,6 +593,33 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 		else:
 			return _CustomTracer(self, out)
 
+	def process_custom_jvp_call(
+		self,
+		primitive,
+		fun,
+		fwd,
+		bwd,
+		tracers,
+		out_trees,
+		symbolic_zeros,
+	):
+		del fwd, bwd, out_trees, symbolic_zeros
+		in_values = [self.to_value(t) for t in tracers]
+		arrays: list[chex.Array] = []
+		for x in in_values:
+			if _is_value(x):
+				arrays.append(x.materialize())
+			elif is_array(x):
+				arrays.append(tp.cast(chex.Array, x))
+			else:
+				arrays.append(x)
+		with jax.core.set_current_trace(self.parent_trace):
+			out_leaves = fun.call_wrapped(*arrays)
+		if primitive.multiple_results:
+			return [_CustomTracer(self, x) for x in out_leaves]
+		else:
+			return _CustomTracer(self, out_leaves)
+
 	def process_custom_vjp_call(
 		self,
 		primitive,
@@ -617,15 +630,18 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 		out_trees,
 		symbolic_zeros,
 	):
+		del fwd, bwd, out_trees, symbolic_zeros
 		in_values = [self.to_value(t) for t in tracers]
-		in_leaves, in_treedef = tu.tree_flatten(in_values)
-		fwd_wrapped = _custom_vjp_fwd_wrap(fwd, self.tag, in_treedef)
-		bwd_wrapped = _custom_vjp_bwd_wrap(bwd, self.tag, in_treedef)
-		out_leaves = primitive.bind_with_trace(
-			self.parent_trace,
-			(fun, fwd_wrapped, bwd_wrapped, *in_leaves),
-			dict(out_trees=out_trees, symbolic_zeros=symbolic_zeros),
-		)
+		arrays: list[chex.Array] = []
+		for x in in_values:
+			if _is_value(x):
+				arrays.append(x.materialize())
+			elif is_array(x):
+				arrays.append(tp.cast(chex.Array, x))
+			else:
+				arrays.append(x)
+		with jax.core.set_current_trace(self.parent_trace):
+			out_leaves = fun.call_wrapped(*arrays)
 		if primitive.multiple_results:
 			return [_CustomTracer(self, x) for x in out_leaves]
 		else:
