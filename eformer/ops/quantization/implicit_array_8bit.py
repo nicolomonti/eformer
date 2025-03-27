@@ -134,7 +134,7 @@ ArrayType = tp.Union[Array, Array8B]
 
 
 @register("lt")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType, **kwargs):
+def lt_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType, **kwargs):
 	if isinstance(x, Array8B):
 		x = x.materialize()
 	if isinstance(y, Array8B):
@@ -142,8 +142,11 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType, **kwargs):
 	return jax.lax.lt(x, y, **kwargs)
 
 
+# Renaming the first convert_element_type function
 @register("convert_element_type")
-def _(primitive: Primitive, operand: ArrayType, new_dtype: tp.Any) -> ArrayType:
+def convert_element_type_8bit_operand_pos(
+	primitive: Primitive, operand: Array8B, new_dtype: tp.Any
+) -> ArrayType:
 	if isinstance(operand, Array8B):
 		operand.dtype = new_dtype
 		return operand
@@ -151,8 +154,11 @@ def _(primitive: Primitive, operand: ArrayType, new_dtype: tp.Any) -> ArrayType:
 		return jax.lax.convert_element_type(operand=operand, new_dtype=new_dtype)
 
 
+# Renaming the second convert_element_type function (handling kwargs)
 @register("convert_element_type")
-def _(primitive: Primitive, operand: ArrayType, **kwargs) -> ArrayType:
+def convert_element_type_8bit_operand_kw(
+	primitive: Primitive, operand: Array8B, **kwargs
+) -> ArrayType:
 	new_dtype = kwargs.get("new_dtype", jnp.bfloat16)
 	if isinstance(operand, Array8B):
 		operand.dtype = new_dtype
@@ -162,7 +168,7 @@ def _(primitive: Primitive, operand: ArrayType, **kwargs) -> ArrayType:
 
 
 @register("integer_pow")
-def _(primitive: Primitive, x: tp.Any, y: tp.Any) -> tp.Any:
+def integer_pow_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	if isinstance(x, Array8B):
 		x = x.materialize()
 	if isinstance(y, Array8B):
@@ -171,7 +177,7 @@ def _(primitive: Primitive, x: tp.Any, y: tp.Any) -> tp.Any:
 
 
 @register("integer_pow")
-def _(primitive: Primitive, x: tp.Any, **kwargs) -> tp.Any:
+def integer_pow_8bit_x(primitive: Primitive, x: ArrayType, **kwargs) -> ArrayType:
 	y = kwargs.get("y", 2)
 	if isinstance(x, Array8B):
 		x = x.materialize()
@@ -179,7 +185,7 @@ def _(primitive: Primitive, x: tp.Any, **kwargs) -> tp.Any:
 
 
 @register("div")
-def _(primitive: Primitive, x: tp.Any, y: tp.Any) -> tp.Any:
+def div_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	if isinstance(x, Array8B):
 		x = x.materialize()
 	if isinstance(y, Array8B):
@@ -188,13 +194,15 @@ def _(primitive: Primitive, x: tp.Any, y: tp.Any) -> tp.Any:
 
 
 @register("sqrt")
-def _(primitive: Primitive, x: Array8B) -> tp.Any:
+def sqrt_8bit_x(primitive: Primitive, x: Array8B) -> ArrayType:
 	x = x.materialize()
 	return lax.sqrt(x)
 
 
 @register("dot_general")
-def _(primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs):
+def dot_general_8bit_lhs_rhs(
+	primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs
+):
 	"""
 	Custom handler for JAX's dot_general operation.
 
@@ -218,7 +226,7 @@ def _(primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs):
 
 
 @register("add")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType):
+def add_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType):
 	"""
 	Custom handler for JAX's add operation.
 
@@ -240,7 +248,9 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType):
 
 
 @register("reduce")
-def _(primitive: Primitive, operand: ArrayType, init_value: ArrayType, *args, **kwargs):
+def reduce_8bit_operand_init_value(
+	primitive: Primitive, operand: ArrayType, init_value: ArrayType, *args, **kwargs
+):
 	"""
 	Custom handler for JAX's reduce operation.
 
@@ -264,7 +274,7 @@ def _(primitive: Primitive, operand: ArrayType, init_value: ArrayType, *args, **
 
 
 @register("mul")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType):
+def mul_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType):
 	"""
 	Custom handler for JAX's mul operation.
 
@@ -285,7 +295,7 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType):
 
 
 @register("transpose")
-def _(primitive: Primitive, operand: Array8B, *args, **kwargs):
+def transpose_8bit_operand(primitive: Primitive, operand: Array8B, *args, **kwargs):
 	"""
 	Custom handler for JAX's transpose operation.
 
@@ -308,7 +318,9 @@ def _(primitive: Primitive, operand: Array8B, *args, **kwargs):
 
 
 @register("conv_general_dilated")
-def _(primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs):
+def conv_general_dilated_8bit_lhs_rhs(
+	primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs
+):
 	"""
 	Custom handler for JAX's conv_general_dilated operation.
 
@@ -332,7 +344,7 @@ def _(primitive: Primitive, lhs: ArrayType, rhs: ArrayType, *args, **kwargs):
 
 
 @register("max")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType, *args, **kwargs):
+def max_8bit_xy(primitive: Primitive, x: ArrayType, y: ArrayType, *args, **kwargs):
 	"""
 	Custom handler for JAX's max operation.
 
@@ -356,7 +368,7 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType, *args, **kwargs):
 
 
 @register("exp")
-def _(primitive: Primitive, x: Array8B, *args, **kwargs):
+def exp_8bit_x(primitive: Primitive, x: Array8B, *args, **kwargs):
 	"""
 	Custom handler for JAX's exp operation.
 
@@ -377,7 +389,7 @@ def _(primitive: Primitive, x: Array8B, *args, **kwargs):
 
 
 @register("log")
-def _(primitive: Primitive, x: Array8B, *args, **kwargs):
+def log_8bit_x(primitive: Primitive, x: Array8B, *args, **kwargs):
 	"""
 	Custom handler for JAX's log operation.
 
@@ -398,7 +410,7 @@ def _(primitive: Primitive, x: Array8B, *args, **kwargs):
 
 
 @register("reshape")
-def _(primitive: Primitive, operand: Array8B, *args, **params):
+def reshape_8bit_operand(primitive: Primitive, operand: Array8B, *args, **params):
 	"""
 	Custom handler for JAX's reshape operation.
 
@@ -427,7 +439,9 @@ def _(primitive: Primitive, operand: Array8B, *args, **params):
 
 
 @register("concatenate")
-def _(primitive: Primitive, operands: tp.Sequence[ArrayType], *args, **kwargs):
+def concatenate_8bit_operands(
+	primitive: Primitive, operands: tp.Sequence[ArrayType], *args, **kwargs
+):
 	"""
 	Custom handler for JAX's concatenate operation.
 
@@ -448,7 +462,9 @@ def _(primitive: Primitive, operands: tp.Sequence[ArrayType], *args, **kwargs):
 
 
 @register("broadcast_in_dim")
-def _(primitive: Primitive, operand: Array8B, *args, **params) -> ArrayType:
+def broadcast_in_dim_8bit_operand(
+	primitive: Primitive, operand: Array8B, *args, **params
+) -> ArrayType:
 	"""Handle broadcast_in_dim for Array8B."""
 	array = operand.materialize()
 	subfuns, bind_params = primitive.get_bind_params(params)
@@ -458,7 +474,9 @@ def _(primitive: Primitive, operand: Array8B, *args, **params) -> ArrayType:
 
 
 @register("gather")
-def _(primitive: Primitive, operand: Array8B, *args, **kwargs) -> ArrayType:
+def gather_8bit_operand(
+	primitive: Primitive, operand: Array8B, *args, **kwargs
+) -> ArrayType:
 	"""Handle gather for Array8B."""
 	array = operand.materialize()
 	result = jax.lax.gather(array, *args, **kwargs)

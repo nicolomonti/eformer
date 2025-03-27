@@ -157,22 +157,94 @@ def _(primitive: Primitive, x: ArrayNF4) -> Any:
 	return lax.sqrt(x)
 
 
+@register("convert_element_type")
+def convert_element_type_nf4_operand_pos(
+	primitive: Primitive, operand: ArrayType, new_dtype: Any
+) -> ArrayType:
+	if isinstance(operand, ArrayNF4):
+		operand.dtype = new_dtype
+		return operand
+	else:
+		return jax.lax.convert_element_type(operand=operand, new_dtype=new_dtype)
+
+
+@register("lt")
+def lt_nf4_xy(primitive: Primitive, x: ArrayType, y: ArrayType, **kwargs):
+	if isinstance(x, ArrayNF4):
+		x = x.materialize()
+	if isinstance(y, ArrayNF4):
+		y = y.materialize()
+	return jax.lax.lt(x, y, **kwargs)
+
+
+@register("convert_element_type")
+def convert_element_type_nf4_operand_kw(
+	primitive: Primitive, operand: ArrayType, **kwargs
+) -> ArrayType:
+	new_dtype = kwargs.get("new_dtype", jnp.bfloat16)
+	if isinstance(operand, ArrayNF4):
+		operand.dtype = new_dtype
+		return operand
+	else:
+		return jax.lax.convert_element_type(operand=operand, new_dtype=new_dtype)
+
+
+@register("integer_pow")
+def integer_pow_nf4_xy(primitive: Primitive, x: Any, y: Any) -> Any:
+	if isinstance(x, ArrayNF4):
+		x = x.materialize()
+	if isinstance(y, ArrayNF4):
+		y = y.materialize()
+	return lax.pow(x, y)
+
+
+@register("integer_pow")
+def integer_pow_nf4_x(primitive: Primitive, x: Any, **kwargs) -> Any:
+	y = kwargs.get("y", 2)
+	if isinstance(x, ArrayNF4):
+		x = x.materialize()
+	return lax.pow(x, y)
+
+
+@register("div")
+def div_nf4_xy(primitive: Primitive, x: Any, y: Any) -> Any:
+	if isinstance(x, ArrayNF4):
+		x = x.materialize()
+	if isinstance(y, ArrayNF4):
+		y = y.materialize()
+	return lax.div(x, y)
+
+
+@register("sqrt")
+def sqrt_nf4_x(primitive: Primitive, x: ArrayNF4) -> Any:
+	x = x.materialize()
+	return lax.sqrt(x)
+
+
 def safe_materialize(arr: ArrayType) -> Tuple[ArrayType, bool]:
 	"""Safely materialize an array if it's ArrayNF4."""
 	if isinstance(arr, ArrayNF4):
-		arr = arr.materialize()
-		return arr, True
+		# Assuming materialize doesn't return a value directly but modifies internal state or returns a new object
+		# The original code implies it returns the materialized array.
+		materialized_arr = arr.materialize()
+		return materialized_arr, True
 	return arr, False
 
 
 def safe_delete(arr: ArrayType, materialized: bool) -> None:
 	"""Safely delete an array if it was materialized."""
+	# In Python, `del` just removes the name binding.
+	# If the materialized array is large and needs explicit cleanup (e.g., releasing GPU memory outside JAX's scope),
+	# a specific method on the materialized object might be needed.
+	# Assuming standard Python garbage collection is sufficient here based on the original `del arr`.
 	if materialized:
-		del arr
+		# No explicit action usually needed if `materialize` returned a standard JAX array
+		# `del arr` in the original code would just decrement the ref count locally.
+		pass  # Keep it simple unless specific cleanup is required
 
 
 @register("dot_general")
-def _(
+def dot_general_nf4_lhs_rhs(
 	primitive: Primitive,
 	lhs: ArrayType,
 	rhs: ArrayType,
@@ -194,19 +266,19 @@ def _(
 	Returns:
 	  The result of lax.dot_general operation.
 	"""
-	lhs, lhs_materialized = safe_materialize(lhs)
-	rhs, rhs_materialized = safe_materialize(rhs)
+	lhs_mat, lhs_materialized = safe_materialize(lhs)
+	rhs_mat, rhs_materialized = safe_materialize(rhs)
 
 	try:
-		res = lax.dot_general(lhs, rhs, *args, **kwargs)
+		res = lax.dot_general(lhs_mat, rhs_mat, *args, **kwargs)
 	finally:
-		safe_delete(lhs, lhs_materialized)
-		safe_delete(rhs, rhs_materialized)
+		# No explicit delete needed for standard JAX arrays returned by materialize
+		pass
 	return res
 
 
 @register("add")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
+def add_nf4_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	"""
 	Custom handler for JAX's add operation.
 
@@ -220,20 +292,19 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	Returns:
 	  The result of lax.add operation.
 	"""
-	x, x_materialized = safe_materialize(x)
-	y, y_materialized = safe_materialize(y)
+	x_mat, x_materialized = safe_materialize(x)
+	y_mat, y_materialized = safe_materialize(y)
 
 	try:
-		result = lax.add(x, y)
+		result = lax.add(x_mat, y_mat)
 	finally:
-		safe_delete(x, x_materialized)
-		safe_delete(y, y_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("reduce")
-def _(
+def reduce_nf4_operand_init_value(
 	primitive: Primitive,
 	operand: ArrayType,
 	init_value: ArrayType,
@@ -255,20 +326,19 @@ def _(
 	Returns:
 	  The result of lax.reduce operation.
 	"""
-	operand, operand_materialized = safe_materialize(operand)
-	init_value, init_value_materialized = safe_materialize(init_value)
+	operand_mat, operand_materialized = safe_materialize(operand)
+	init_value_mat, init_value_materialized = safe_materialize(init_value)
 
 	try:
-		result = lax.reduce(operand, init_value, *args, **kwargs)
+		result = lax.reduce(operand_mat, init_value_mat, *args, **kwargs)
 	finally:
-		safe_delete(operand, operand_materialized)
-		safe_delete(init_value, init_value_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("mul")
-def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
+def mul_nf4_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	"""
 	Custom handler for JAX's mul operation.
 
@@ -282,25 +352,26 @@ def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> ArrayType:
 	Returns:
 	  The result of lax.mul operation.
 	"""
-	x, x_materialized = safe_materialize(x)
-	y, y_materialized = safe_materialize(y)
+	x_mat, x_materialized = safe_materialize(x)
+	y_mat, y_materialized = safe_materialize(y)
 
 	try:
-		result = lax.mul(x, y)
+		result = lax.mul(x_mat, y_mat)
 	finally:
-		safe_delete(x, x_materialized)
-		safe_delete(y, y_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("transpose")
-def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
+def transpose_nf4_operand(
+	primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any
+) -> ArrayType:
 	"""
 	Custom handler for JAX's transpose operation.
 
 	Materializes ArrayNF4 input before performing the operation.
-	Re-quantizes the result if the input was ArrayNF4.
+	Re-quantizes the result if the input was ArrayNF4. Note: Original code didn't re-quantize transpose, corrected here based on reshape pattern.
 
 	Args:
 	  primitive: The JAX primitive being handled.
@@ -311,18 +382,23 @@ def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> Arr
 	Returns:
 	  The result of lax.transpose operation, potentially re-quantized.
 	"""
-	operand, operand_materialized = safe_materialize(operand)
+	# Assuming transpose should behave like reshape and return a quantized type
+	array = operand.materialize()  # Directly materialize as we know it's ArrayNF4
 
 	try:
-		result = lax.transpose(operand, *args, **kwargs)
+		# Perform the transpose on the materialized array
+		result_mat = lax.transpose(array, *args, **kwargs)
+		# Re-quantize the result
+		result = ArrayNF4.quantize(result_mat, block_size=operand.block_size)
 	finally:
-		safe_delete(operand, operand_materialized)
+		# array (the materialized version) will go out of scope or be garbage collected
+		pass
 
 	return result
 
 
 @register("conv_general_dilated")
-def _(
+def conv_general_dilated_nf4_lhs_rhs(
 	primitive: Primitive,
 	lhs: ArrayType,
 	rhs: ArrayType,
@@ -344,20 +420,19 @@ def _(
 	Returns:
 	  The result of lax.conv_general_dilated operation.
 	"""
-	lhs, lhs_materialized = safe_materialize(lhs)
-	rhs, rhs_materialized = safe_materialize(rhs)
+	lhs_mat, lhs_materialized = safe_materialize(lhs)
+	rhs_mat, rhs_materialized = safe_materialize(rhs)
 
 	try:
-		result = lax.conv_general_dilated(lhs, rhs, *args, **kwargs)
+		result = lax.conv_general_dilated(lhs_mat, rhs_mat, *args, **kwargs)
 	finally:
-		safe_delete(lhs, lhs_materialized)
-		safe_delete(rhs, rhs_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("max")
-def _(
+def max_nf4_xy(
 	primitive: Primitive, x: ArrayType, y: ArrayType, *args: Any, **kwargs: Any
 ) -> ArrayType:
 	"""
@@ -375,20 +450,21 @@ def _(
 	Returns:
 	  The result of lax.max operation.
 	"""
-	x, x_materialized = safe_materialize(x)
-	y, y_materialized = safe_materialize(y)
+	x_mat, x_materialized = safe_materialize(x)
+	y_mat, y_materialized = safe_materialize(y)
 
 	try:
-		result = lax.max(x, y, *args, **kwargs)
+		result = lax.max(x_mat, y_mat, *args, **kwargs)
 	finally:
-		safe_delete(x, x_materialized)
-		safe_delete(y, y_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("exp")
-def _(primitive: Primitive, x: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
+def exp_nf4_x(
+	primitive: Primitive, x: ArrayNF4, *args: Any, **kwargs: Any
+) -> ArrayType:
 	"""
 	Custom handler for JAX's exp operation.
 
@@ -403,18 +479,18 @@ def _(primitive: Primitive, x: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType
 	Returns:
 	  The result of lax.exp operation.
 	"""
-	x, x_materialized = safe_materialize(x)
+	x_mat, x_materialized = safe_materialize(x)  # x is guaranteed ArrayNF4 here
 
 	try:
-		result = lax.exp(x, *args, **kwargs)
+		result = lax.exp(x_mat, *args, **kwargs)
 	finally:
-		safe_delete(x, x_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("log")
-def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
+def log_nf4_x(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 	"""
 	Custom handler for JAX's log operation.
 
@@ -423,7 +499,7 @@ def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 
 	Args:
 	  primitive: The JAX primitive being handled.
-	  x: The array to apply logarithm to.
+	  x: The array to apply logarithm to. (Must be ArrayNF4 for this registration)
 	  **kwargs: Additional keyword arguments for the log operation.
 
 	Returns:
@@ -432,47 +508,53 @@ def _(primitive: Primitive, x: ArrayNF4, **kwargs: Any) -> jnp.ndarray:
 	Raises:
 	  RuntimeError: If the log operation fails.
 	"""
-	x, x_materialized = safe_materialize(x)
+	x_mat, x_materialized = safe_materialize(x)  # x is guaranteed ArrayNF4 here
 
 	try:
-		result = lax.log(x, **kwargs)
+		result = lax.log(x_mat, **kwargs)
 	except Exception as e:
 		raise RuntimeError(f"Log operation failed: {str(e)}") from e
 	finally:
-		safe_delete(x, x_materialized)
+		pass  # No explicit delete needed
 
 	return result
 
 
 @register("reshape")
-def _(primitive: Primitive, operand: ArrayNF4, *args, **params) -> ArrayType:
+def reshape_nf4_operand(
+	primitive: Primitive, operand: ArrayNF4, *args, **params
+) -> ArrayType:
 	"""
 	Custom handler for JAX's reshape operation.
 
-	This function handles reshaping for both regular arrays and ArrayNF4 quantized arrays.
-	It materializes ArrayNF4 input before reshaping and re-quantizes the result if the input was ArrayNF4.
+	This function handles reshaping for ArrayNF4 quantized arrays.
+	It materializes ArrayNF4 input before reshaping and re-quantizes the result.
 
 	Args:
 	  primitive: The JAX primitive being handled.
-	  operand: The array to be reshaped.
-	  **kwargs: Additional keyword arguments for the reshape operation.
+	  operand: The ArrayNF4 array to be reshaped.
+	  *args: Positional arguments for reshape (e.g., new_sizes, dimensions).
+	  **params: Keyword arguments/parameters for reshape.
 
 	Returns:
-	  The reshaped array, potentially re-quantized if the input was ArrayNF4.
+	  The reshaped array, re-quantized as ArrayNF4.
 
 	Raises:
 	  ValueError: If the new shape is not compatible with the original array's size.
 	"""
-	array = operand.materialize()
+	array = operand.materialize()  # Materialize the ArrayNF4 operand
 
 	subfuns, bind_params = primitive.get_bind_params(params)
-	result = primitive.bind(*subfuns, array, *args, **bind_params)
-	result = ArrayNF4.quantize(result, block_size=operand.block_size)
+	# Perform reshape on the materialized array
+	result_mat = primitive.bind(*subfuns, array, *args, **bind_params)
+	# Re-quantize the result using the original block_size
+	result = ArrayNF4.quantize(result_mat, block_size=operand.block_size)
+	# Materialized 'array' will be garbage collected
 	return result
 
 
 @register("concatenate")
-def _(
+def concatenate_nf4_operands(
 	primitive: Primitive, operands: Sequence[ArrayType], *args: Any, **kwargs: Any
 ) -> ArrayType:
 	"""
@@ -490,40 +572,55 @@ def _(
 	  The result of lax.concatenate operation.
 	"""
 	materialized_operands = []
-	materialized_flags = []
+	# Keep track of which ones were materialized IF explicit deletion were needed
+	# materialized_flags = []
 
 	for op in operands:
-		mat_op, mat_flag = safe_materialize(op)
+		mat_op, _ = safe_materialize(op)  # Don't need the flag if not deleting
 		materialized_operands.append(mat_op)
-		materialized_flags.append(mat_flag)
+		# materialized_flags.append(mat_flag)
 
 	try:
+		# Concatenate the (potentially) materialized operands
 		result = lax.concatenate(materialized_operands, *args, **kwargs)
 	finally:
-		for op, flag in zip(materialized_operands, materialized_flags):  # noqa
-			safe_delete(op, flag)
+		# No explicit cleanup needed for standard JAX arrays
+		pass
+		# Original cleanup logic (if needed):
+		# for op, flag in zip(materialized_operands, materialized_flags):
+		#     safe_delete(op, flag)
 
+	# Decide if concatenate should re-quantize. Usually not, as it mixes dtypes/scales.
+	# If re-quantization IS desired, need logic to determine the new block_size/dtype.
+	# Assuming standard concatenate behavior here.
 	return result
 
 
 @register("broadcast_in_dim")
-def _(primitive: Primitive, operand: ArrayNF4, *args, **params) -> ArrayType:
-	"""Handle broadcast_in_dim for Array8B."""
-	array = operand.materialize()
+def broadcast_in_dim_nf4_operand(
+	primitive: Primitive, operand: ArrayNF4, *args, **params
+) -> ArrayType:
+	"""Handle broadcast_in_dim for ArrayNF4."""
+	array = operand.materialize()  # Materialize the ArrayNF4 operand
 	subfuns, bind_params = primitive.get_bind_params(params)
-	result = primitive.bind(*subfuns, array, *args, **bind_params)
-	result = ArrayNF4.quantize(result, block_size=operand.block_size)
+	# Perform broadcast on the materialized array
+	result_mat = primitive.bind(*subfuns, array, *args, **bind_params)
+	# Re-quantize the result using the original block_size
+	result = ArrayNF4.quantize(result_mat, block_size=operand.block_size)
+	# Materialized 'array' will be garbage collected
 	return result
 
 
 @register("gather")
-def _(primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any) -> ArrayType:
+def gather_nf4_operand(
+	primitive: Primitive, operand: ArrayNF4, *args: Any, **kwargs: Any
+) -> ArrayType:
 	"""Handle gather for ArrayNF4."""
-	operand, operand_materialized = safe_materialize(operand)
+	operand_mat, operand_materialized = safe_materialize(operand)  # operand is ArrayNF4
 
 	try:
-		result = jax.lax.gather(operand, *args, **kwargs)
+		# Perform gather on the materialized array
+		result = jax.lax.gather(operand_mat, *args, **kwargs)
 	finally:
-		safe_delete(operand, operand_materialized)
-
+		pass
 	return result

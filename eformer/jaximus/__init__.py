@@ -20,10 +20,11 @@ from ._core import PyTree, dataclass, field
 from ._imus import (
 	ImplicitArray,
 	OrginArray,
-	implicit,
-	use_implicit,
 	aux_field,
+	implicit,
 	register,
+	ste,
+	use_implicit,
 )
 
 __all__ = (
@@ -35,6 +36,7 @@ __all__ = (
 	"ImplicitArray",
 	"OrginArray",
 	"implicit",
-	"use_implicit",
 	"register",
+	"ste",
+	"use_implicit",
 )

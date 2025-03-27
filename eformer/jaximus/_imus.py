@@ -59,6 +59,14 @@ class OrginArray(ABC): ...  # noqa
 OrginArray.register(jax.Array)
 
 
+def ste(func):
+	def _call(x: jax.Array | OrginArray, *args, **kwargs):
+		zero = x - jax.lax.stop_gradient(x)
+		y = jax.lax.stop_gradient(func(x, *args, **kwargs))
+		return zero + y
+	return _call
+
+
 def default_handler(primitive, *args, **params):
 	subfuns, bind_params = primitive.get_bind_params(params)
 	return primitive.bind(*subfuns, *args, **bind_params)
@@ -496,6 +504,7 @@ class _CustomTracer(core.Tracer):
 
 class _CustomTrace(core.Trace[_CustomTracer]):
 	def __init__(self, parent_trace, tag):
+		super().__init__()
 		self.tag = tag
 		self.parent_trace = parent_trace
 
@@ -532,7 +541,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 							method, _ = rule.resolve_method(values)
 						except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
 							inhint = (primitive,) + tuple(values)
-							include_prim = True
+							include_prim = True 
 							method, _ = rule.resolve_method(inhint)
 					except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
 						if WARN_ON_MATTER and implicit_name is not None:
@@ -543,7 +552,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 						out = _default_process(primitive, values, params)
 					else:
 						if include_prim:
-							values = (primitive,) + tuple(values)
+							values = (primitive,) + tuple(values) 
 						out = method(*values, **params)
 		else:
 			with core.set_current_trace(self.parent_trace):
