@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+from dataclasses import dataclass
+import dataclasses
 import os
 import re
 import typing as tp
@@ -39,8 +41,7 @@ LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
 	"on",
 ]
 
-AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str]]
-_EllipsisType = tp.Type[Ellipsis]  # For type hinting Ellipsis
+AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str, tp.Any]]
 
 
 def names_in_current_mesh(*names: str) -> bool:
@@ -367,7 +368,7 @@ def get_incontext_mesh() -> Mesh:
 	                    (i.e., mesh.empty() is True).
 	"""
 	mesh = pxla.thread_resources.env.physical_mesh
-	if mesh.empty():
+	if mesh.empty() if callable(mesh.empty) else mesh.empty:
 		raise AssertionError("No mesh found under this context manager.")
 	# It might be better practice to raise a more specific exception type
 	# e.g., class NoActiveMeshError(RuntimeError): pass
@@ -535,7 +536,8 @@ def get_submesh_device_index(axis_names: AxisType) -> int:
 		)
 
 
-class PartitionAxis(tp.NamedTuple):
+@dataclass(frozen=True)
+class PartitionAxis:
 	"""
 	Configuration for partitioning model axes across a device mesh.
 
@@ -562,10 +564,8 @@ class PartitionAxis(tp.NamedTuple):
 	fully_sharded_data_parallel_axis: str = "fsdp"
 	tensor_parallel_axis: str = "tp"
 	sequence_parallel_axis: str = "sp"
-	expert_parallel_axis: str = "ep"  # Added for MoE
+	expert_parallel_axis: str = "ep"
 
-	# --- Logical Axis Partitioning ---
-	# Defaults using Ellipsis will be resolved in __new__ based on mesh dim names
 	batch_axis: AxisType = ...
 	sequence_axis: AxisType = ...
 	query_sequence_axis: AxisType = ...
@@ -574,7 +574,7 @@ class PartitionAxis(tp.NamedTuple):
 	hidden_state_axis: AxisType = ...
 	mlp_intermediate_axis: AxisType = ...
 	vocab_axis: AxisType = ...
-	expert_axis: AxisType = ...  # Added for MoE
+	expert_axis: AxisType = ...
 
 	attention_dim_axis: AxisType = None  # Usually not partitioned
 	bias_head_sequence_axis: AxisType = None
@@ -587,95 +587,61 @@ class PartitionAxis(tp.NamedTuple):
 	generation_key_sequence_axis: AxisType = ...
 	generation_attention_dim_axis: AxisType = None
 
-	def __new__(
-		cls,
-		*,
-		# Mesh dimension names (allow override)
-		data_parallel_axis: str = "dp",
-		fully_sharded_data_parallel_axis: str = "fsdp",
-		tensor_parallel_axis: str = "tp",
-		sequence_parallel_axis: str = "sp",
-		expert_parallel_axis: str = "ep",
-		# Logical axes (allow override, use Ellipsis for default derivation)
-		batch_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		query_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		head_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		key_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		hidden_state_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		mlp_intermediate_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		vocab_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		expert_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		attention_dim_axis: AxisType = None,
-		bias_head_sequence_axis: AxisType = None,
-		bias_key_sequence_axis: AxisType = None,
-		# Generation specific
-		generation_batch_axis: AxisType = None,
-		generation_query_sequence_axis: AxisType = None,
-		generation_head_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		generation_key_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
-		generation_attention_dim_axis: AxisType = None,
-	):
+	def __post_init__(self):
 		"""
-		Creates a PartitionAxis instance, resolving default partitioning strategies.
+		Resolve default partitioning strategies after initialization.
 
-		Checks arguments set to Ellipsis and replaces them with defaults derived
-		from the mesh dimension name arguments (dp, fsdp, tp, sp, ep).
+		Since the dataclass is frozen, we need to use object.__setattr__ to modify fields.
 		"""
-		# Resolve Ellipsis defaults based on mesh dimension names
-		if batch_axis is Ellipsis:
+
+		# Helper to set attribute on frozen dataclass
+		def set_attr(obj, name, value):
+			object.__setattr__(obj, name, value)
+
+		# Resolve fields that need defaults
+		if self.batch_axis is Ellipsis:
 			# Default batch sharding uses both FSDP and DP dimensions
-			batch_axis = (fully_sharded_data_parallel_axis, data_parallel_axis)
-		if sequence_axis is Ellipsis:
-			sequence_axis = sequence_parallel_axis
-		if query_sequence_axis is Ellipsis:
-			query_sequence_axis = sequence_parallel_axis
-		if head_axis is Ellipsis:
-			head_axis = tensor_parallel_axis
-		if key_sequence_axis is Ellipsis:
-			key_sequence_axis = sequence_parallel_axis
-		if hidden_state_axis is Ellipsis:
-			hidden_state_axis = tensor_parallel_axis
-		if mlp_intermediate_axis is Ellipsis:
-			mlp_intermediate_axis = tensor_parallel_axis
-		if vocab_axis is Ellipsis:
-			vocab_axis = tensor_parallel_axis
-		if expert_axis is Ellipsis:  # Added
-			expert_axis = expert_parallel_axis
-			# Default logical expert axis to expert parallel dim name
+			set_attr(
+				self,
+				"batch_axis",
+				(self.fully_sharded_data_parallel_axis, self.data_parallel_axis),
+			)
 
-		if generation_head_axis is Ellipsis:
-			generation_head_axis = tensor_parallel_axis
-		if generation_key_sequence_axis is Ellipsis:
-			generation_key_sequence_axis = sequence_parallel_axis
+		if self.sequence_axis is Ellipsis:
+			set_attr(self, "sequence_axis", self.sequence_parallel_axis)
 
-		# Call the original NamedTuple constructor with resolved values
-		# Ensure the order matches the field definition order!
-		return super().__new__(
-			cls,
-			# Mesh dims first
-			data_parallel_axis,
-			fully_sharded_data_parallel_axis,
-			tensor_parallel_axis,
-			sequence_parallel_axis,
-			expert_parallel_axis,  # Added order
-			# Logical axes next
-			batch_axis,
-			sequence_axis,
-			query_sequence_axis,
-			head_axis,
-			key_sequence_axis,
-			hidden_state_axis,
-			mlp_intermediate_axis,
-			vocab_axis,
-			expert_axis,  # Added order
-			attention_dim_axis,
-			bias_head_sequence_axis,
-			bias_key_sequence_axis,
-			# Generation axes
-			generation_batch_axis,
-			generation_query_sequence_axis,
-			generation_head_axis,
-			generation_key_sequence_axis,
-			generation_attention_dim_axis,
-		)
+		if self.query_sequence_axis is Ellipsis:
+			set_attr(self, "query_sequence_axis", self.sequence_parallel_axis)
+
+		if self.head_axis is Ellipsis:
+			set_attr(self, "head_axis", self.tensor_parallel_axis)
+
+		if self.key_sequence_axis is Ellipsis:
+			set_attr(self, "key_sequence_axis", self.sequence_parallel_axis)
+
+		if self.hidden_state_axis is Ellipsis:
+			set_attr(self, "hidden_state_axis", self.tensor_parallel_axis)
+
+		if self.mlp_intermediate_axis is Ellipsis:
+			set_attr(self, "mlp_intermediate_axis", self.tensor_parallel_axis)
+
+		if self.vocab_axis is Ellipsis:
+			set_attr(self, "vocab_axis", self.tensor_parallel_axis)
+
+		if self.expert_axis is Ellipsis:
+			set_attr(self, "expert_axis", self.expert_parallel_axis)
+
+		if self.generation_head_axis is Ellipsis:
+			set_attr(self, "generation_head_axis", self.tensor_parallel_axis)
+
+		if self.generation_key_sequence_axis is Ellipsis:
+			set_attr(self, "generation_key_sequence_axis", self.sequence_parallel_axis)
+
+		self._safety_check()
+
+	def _safety_check(self):
+		"""Ensures no essential attributes are left uninitialized (as Ellipsis)."""
+		for field in dataclasses.fields(self):
+			val = getattr(self, field.name)
+			if val == Ellipsis:
+				raise ValueError(f"`{field.name}` shouldn't be ellipsis")
