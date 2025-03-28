@@ -2,7 +2,7 @@
 name = "eformer"
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 readme = "README.md"
-version = "0.0.18.2"
+version = "0.0.19"
 
 classifiers = [
 	"Development Status :: 3 - Alpha",
@@ -17,7 +17,14 @@ classifiers = [
 description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
 
 license = "Apache-2.0"
-keywords = ["JAX", "Deep Learning", "Machine Learning", "Flax", "XLA"]
+keywords = [
+	"JAX",
+	"Deep Learning",
+	"Machine Learning",
+	"Flax",
+	"XLA",
+	"EasyDeL",
+]
 
 homepage = "https://github.com/erfanzar/eformer"
 repository = "https://github.com/erfanzar/eformer"

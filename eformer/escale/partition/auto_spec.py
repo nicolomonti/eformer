@@ -16,10 +16,9 @@ import typing as tp
 import chex
 import jax
 import numpy as np
-from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from .constraints import with_sharding_constraint
+from .constraints import get_incontext_mesh, with_sharding_constraint
 
 
 def auto_partition_spec(
@@ -52,11 +51,7 @@ def auto_partition_spec(
 
 	# Get or validate mesh
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-		if mesh.empty:
-			raise ValueError(
-				"No mesh available. Provide a mesh or use within a mesh context."
-			)
+		mesh = get_incontext_mesh()
 
 	# Calculate minimum sharding size
 	min_sharding_size = min_sharding_size or np.prod(mesh.devices.shape)
@@ -140,11 +135,7 @@ def vrn_auto_partition_spec(
 
 	# Get mesh
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-		if mesh.empty:
-			raise ValueError(
-				"No mesh available. Provide a mesh or use within a mesh context manager."
-			)
+		mesh = get_incontext_mesh()
 
 	# Calculate minimum sharding size
 	min_sharding_size = min_sharding_size or int(np.prod(mesh.devices.shape))
@@ -215,12 +206,7 @@ def auto_shard_array(
 		The sharded array.
 	"""
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-		if mesh.empty:
-			raise ValueError(
-				"`auto_shard_array` needs to be used with a mesh. Pass a mesh as an argument "
-				"or use this function under a mesh context manager."
-			)
+		mesh = get_incontext_mesh()
 	partition_spec = auto_partition_spec(
 		x=x,
 		mesh=mesh,
@@ -276,8 +262,7 @@ def optimize_sharding_for_memory(
 	Optimizes sharding strategy to fit within memory constraints.
 	"""
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-
+		mesh = get_incontext_mesh()
 	if names is None:
 		names = list(mesh.axis_names)
 
@@ -300,8 +285,7 @@ def validate_sharding_config(
 	Validates sharding configuration and returns list of warnings/errors.
 	"""
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-
+		mesh = get_incontext_mesh()
 	issues = []
 
 	def validate_leaf(path: str, array: np.ndarray, spec: PartitionSpec):

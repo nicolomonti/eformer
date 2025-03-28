@@ -64,6 +64,7 @@ def ste(func):
 		zero = x - jax.lax.stop_gradient(x)
 		y = jax.lax.stop_gradient(func(x, *args, **kwargs))
 		return zero + y
+
 	return _call
 
 
@@ -270,7 +271,7 @@ class ImplicitArray(_ArrayBase):
 			if is_aux:
 				aux_data.append(value)
 			else:
-				children.append((jax.tree_util.GetAttrKey(name), value))
+				children.append((tu.GetAttrKey(name), value))
 
 		return children, aux_data
 
@@ -326,27 +327,27 @@ def leaf_predicate(x):
 
 
 tree_map_with_implicit = combine_leaf_predicate(
-	jax.tree_map,
+	tu.tree_map,
 	leaf_predicate,
 )
 tree_map_with_path_with_implicit = combine_leaf_predicate(
-	jax.tree_util.tree_map_with_path,
+	tu.tree_map_with_path,
 	leaf_predicate,
 )
 tree_flatten_with_implicit = combine_leaf_predicate(
-	jax.tree_util.tree_flatten,
+	tu.tree_flatten,
 	leaf_predicate,
 )
 tree_flatten_with_path_with_implicit = combine_leaf_predicate(
-	jax.tree_util.tree_flatten_with_path,
+	tu.tree_flatten_with_path,
 	leaf_predicate,
 )
 tree_leaves_with_implicit = combine_leaf_predicate(
-	jax.tree_util.tree_leaves,
+	tu.tree_leaves,
 	leaf_predicate,
 )
 tree_structure_with_implicit = combine_leaf_predicate(
-	jax.tree_util.tree_structure,
+	tu.tree_structure,
 	leaf_predicate,
 )
 
@@ -356,20 +357,20 @@ def flatten_one_implicit_layer(tree):
 		return isinstance(x, ImplicitArray) and x is not node
 
 	def replace_subtree_implicits(node):
-		return jax.tree_util.tree_map(
+		return tu.tree_map(
 			lambda _: 1,
 			node,
 			is_leaf=ft.partial(is_leaf_below_node, node),
 		)
 
 	prototype = tree_map_with_implicit(replace_subtree_implicits, tree)
-	struct = jax.tree_util.tree_structure(prototype)
+	struct = tu.tree_structure(prototype)
 
 	leaves = tree_leaves_with_implicit(tree)
 	leaves = list(
 		it.chain.from_iterable(
 			(
-				jax.tree_util.tree_leaves(leaf, is_leaf=ft.partial(is_leaf_below_node, leaf))
+				tu.tree_leaves(leaf, is_leaf=ft.partial(is_leaf_below_node, leaf))
 				if isinstance(leaf, ImplicitArray)
 				else [leaf]
 			)
@@ -413,7 +414,7 @@ def _map_leaves_with_implicit_path(f, leaves, is_leaf, path_prefix=()):
 			is_leaf=is_leaf,
 			path_prefix=path,
 		)
-		mapped_leaves.append(jax.tree_util.tree_unflatten(substruct, mapped_subtree))
+		mapped_leaves.append(tu.tree_unflatten(substruct, mapped_subtree))
 	return mapped_leaves
 
 
@@ -541,7 +542,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 							method, _ = rule.resolve_method(values)
 						except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
 							inhint = (primitive,) + tuple(values)
-							include_prim = True 
+							include_prim = True
 							method, _ = rule.resolve_method(inhint)
 					except (plum.NotFoundLookupError, plum.AmbiguousLookupError):
 						if WARN_ON_MATTER and implicit_name is not None:
@@ -552,7 +553,7 @@ class _CustomTrace(core.Trace[_CustomTracer]):
 						out = _default_process(primitive, values, params)
 					else:
 						if include_prim:
-							values = (primitive,) + tuple(values) 
+							values = (primitive,) + tuple(values)
 						out = method(*values, **params)
 		else:
 			with core.set_current_trace(self.parent_trace):

@@ -20,8 +20,8 @@ import warnings
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.interpreters import pxla
 from jax.sharding import Mesh, PartitionSpec
+from ..partition import get_incontext_mesh
 
 
 class ShardingRule(abc.ABC):
@@ -42,7 +42,7 @@ class AutoShardingRule(ShardingRule):
 		min_shard_size: tp.Optional[int] = None,
 		reverse: bool = False,
 	):
-		self.mesh = mesh or pxla.thread_resources.env.physical_mesh
+		self.mesh = mesh or get_incontext_mesh()
 		self.axis_names = axis_names or list(self.mesh.axis_names)
 		self.min_shard_size = min_shard_size or np.prod(self.mesh.shape)
 		self.reverse = reverse
@@ -113,7 +113,7 @@ class MemoryConstrainedShardingRule(ShardingRule):
 		axis_names: tp.Optional[tp.List[str]] = None,
 	):
 		self.max_memory_per_device = max_memory_per_device
-		self.mesh = mesh or pxla.thread_resources.env.physical_mesh
+		self.mesh = mesh or get_incontext_mesh()
 		self.axis_names = axis_names or list(self.mesh.axis_names)
 
 	def _calculate_partition_spec(self, array: jnp.ndarray) -> PartitionSpec:
@@ -203,7 +203,7 @@ class ShardingAnalyzer:
 	"""
 
 	def __init__(self, mesh: tp.Optional[Mesh] = None):
-		self.mesh = mesh or pxla.thread_resources.env.physical_mesh
+		self.mesh = mesh or get_incontext_mesh()
 
 	def validate_partition_specs(
 		self, pytree: tp.Any, partition_specs: tp.Any

@@ -18,11 +18,14 @@ import typing as tp
 
 import jax
 import numpy as np
-from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
+from jax.experimental.mesh_utils import (
+	create_device_mesh,
+	create_hybrid_device_mesh,
+)
 from jax.sharding import Mesh
 
-DEFAULT_SHARDING_STG = (1, -1, 1, 1)
-DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
+DEFAULT_SHARDING_STG = (1, -1, 1, 1, 1)
+DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp", "ep")
 
 
 def calculate_host_mesh_shape(

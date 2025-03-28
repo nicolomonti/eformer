@@ -23,15 +23,13 @@ import jax
 import jax.extend
 import jax.numpy as jnp
 import numpy as np
-
+from jax import lax
 from jax import tree_util as tu
 from jax.interpreters import pxla
 from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from ..tree_util import named_tree_map
-
-from ..mesh.validation import names_in_current_mesh
 
 MIN_SHARDING_SIZE = int(os.environ.get("MIN_SHARDING_SIZE", "16384"))
 LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
@@ -40,6 +38,23 @@ LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
 	"1",
 	"on",
 ]
+
+AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str]]
+_EllipsisType = tp.Type[Ellipsis]  # For type hinting Ellipsis
+
+
+def names_in_current_mesh(*names: str) -> bool:
+	"""
+	Check if the given names are present in the current JAX mesh.
+
+	Args:
+	    *names: Variable number of axis names to check.
+
+	Returns:
+	    True if all given names are present in the current mesh, False otherwise.
+	"""
+	mesh_axis_names = pxla.thread_resources.env.physical_mesh.axis_names
+	return set(names) <= set(mesh_axis_names)
 
 
 def make_shard_and_gather_fns(
@@ -54,20 +69,16 @@ def make_shard_and_gather_fns(
 	designed for use with Flax's `tu.tree_map`.
 
 	Args:
-		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
-		mesh: The JAX mesh to use for sharding. If None, the current mesh is used.
+	        partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+	        mesh: The JAX mesh to use for sharding. If None, the current mesh is used.
 
 	Returns:
-		A tuple containing two dictionaries:
-			- `shard_fns`: A dictionary mapping parameter names to their corresponding shard functions.
-			- `gather_fns`: A dictionary mapping parameter names to their corresponding gather functions.
+	        A tuple containing two dictionaries:
+	                - `shard_fns`: A dictionary mapping parameter names to their corresponding shard functions.
+	                - `gather_fns`: A dictionary mapping parameter names to their corresponding gather functions.
 	"""
 	if mesh is None:
-		mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-		assert not mesh.empty, (
-			"You should pass 'mesh' to `make_shard_and_gather_fns` or "
-			"at least call that under mesh context manager"
-		)
+		mesh = get_incontext_mesh()
 
 	named_shardings = tu.tree_map(
 		lambda p: NamedSharding(mesh=mesh, spec=p),
@@ -129,10 +140,10 @@ def get_names_from_partition_spec(
 	dictionary and extracts all unique axis names used in the sharding specifications.
 
 	Args:
-		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+	        partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
 
 	Returns:
-		A list of unique axis names used in the partition specs.
+	        A list of unique axis names used in the partition specs.
 	"""
 	names = set()
 	if isinstance(partition_specs, dict):
@@ -159,11 +170,11 @@ def with_sharding_constraint(
 	present in the current JAX mesh.
 
 	Args:
-		arr: The JAX array to apply sharding constraints to.
-		sharding: A dictionary mapping parameter names to their respective `PartitionSpec`.
+	        arr: The JAX array to apply sharding constraints to.
+	        sharding: A dictionary mapping parameter names to their respective `PartitionSpec`.
 
 	Returns:
-		The JAX array with sharding constraints applied (if applicable).
+	        The JAX array with sharding constraints applied (if applicable).
 	"""
 	if isinstance(arr, (jax.Array, jnp.ndarray)):
 		if isinstance(sharding, NamedSharding):
@@ -172,7 +183,7 @@ def with_sharding_constraint(
 		else:
 			mesh = None
 		if mesh is None:
-			mesh = pxla.thread_resources.env.physical_mesh
+			mesh = get_incontext_mesh()
 		axis_names = get_names_from_partition_spec(sharding)
 		if names_in_current_mesh(*axis_names):
 			with mesh or contextlib.nullcontext():
@@ -192,14 +203,14 @@ def match_partition_rules(
 	based on their names. It's useful for automatically defining sharding strategies.
 
 	Args:
-		rules: A list of tuples, where each tuple contains:
-				 - A regular expression to match parameter names.
-				 - A `PartitionSpec` to apply if the name matches.
-		tree: A dictionary of parameters, where keys are parameter names.
+	        rules: A list of tuples, where each tuple contains:
+	                         - A regular expression to match parameter names.
+	                         - A `PartitionSpec` to apply if the name matches.
+	        tree: A dictionary of parameters, where keys are parameter names.
 
 	Returns:
-		A dictionary with the same keys as `tree`, but values are replaced
-		with the corresponding `PartitionSpec` based on matching rules.
+	        A dictionary with the same keys as `tree`, but values are replaced
+	        with the corresponding `PartitionSpec` based on matching rules.
 	"""
 
 	def get_partition_spec(name: str, leaf: jnp.ndarray) -> PartitionSpec:
@@ -250,7 +261,7 @@ def analyze_sharding_strategy(
 	- Communication costs
 	"""
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
+		mesh = get_incontext_mesh()
 
 	analysis = {
 		"total_parameters": 0,
@@ -290,14 +301,14 @@ def create_pattern_based_partition_spec(
 	Creates a function that returns PartitionSpec based on parameter name patterns.
 
 	Example:
-		pattern_fn = create_pattern_based_partition_spec(
-			"attention|mlp->data,hidden->model"
-		)
+	        pattern_fn = create_pattern_based_partition_spec(
+	                "attention|mlp->data,hidden->model"
+	        )
 	"""
 	if default_spec is None:
 		default_spec = PartitionSpec()
 	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
+		mesh = get_incontext_mesh()
 
 	rules = []
 	for rule in pattern.split(","):
@@ -342,52 +353,329 @@ def get_shardings_with_structure(pytree: tp.Any) -> tp.Any:
 	return extract_sharding_structure(pytree)
 
 
-AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str]]
+def get_incontext_mesh() -> Mesh:
+	"""Retrieves the mesh object active in the current execution context.
+
+	This function accesses the physical mesh defined within the thread's
+	resource environment (pxla.thread_resources.env.physical_mesh).
+
+	Returns:
+	    MeshType: The active mesh object for the current context.
+
+	Raises:
+	    AssertionError: If no mesh is found in the current context
+	                    (i.e., mesh.empty() is True).
+	"""
+	mesh = pxla.thread_resources.env.physical_mesh
+	if mesh.empty():
+		raise AssertionError("No mesh found under this context manager.")
+	# It might be better practice to raise a more specific exception type
+	# e.g., class NoActiveMeshError(RuntimeError): pass
+	# raise NoActiveMeshError("No mesh found under this context manager.")
+	return mesh
+
+
+def get_axes_size_in_mesh(axis_names: AxisType, mesh: tp.Optional[Mesh] = None) -> int:
+	"""
+	Calculates the total size of the specified mesh axes.
+
+	If a single axis name (string) is provided, it returns the size of that
+	dimension in the mesh. If a sequence (list or tuple) of axis names is
+	provided, it returns the product of the sizes of all specified axes.
+
+	If no mesh is explicitly provided, it uses the mesh active in the
+	current context obtained via `get_current_mesh()`.
+
+	Args:
+	    axis_names: The name of a single mesh axis (str) or a sequence
+	                (list/tuple) of axis names whose sizes should be multiplied.
+	    mesh: The mesh object to query. If None, the current context's mesh
+	          is used. Defaults to None.
+
+	Returns:
+	    int: The size of the single specified axis, or the product of the sizes
+	         of the sequence of specified axes.
+
+	Raises:
+	    KeyError: If any of the specified `axis_names` are not found in the
+	              mesh's dimensions.
+	    AssertionError: If `mesh` is None and no mesh is found in the current
+	                   context (raised by `get_current_mesh()`).
+	"""
+	if mesh is None:
+		mesh = get_incontext_mesh()
+
+	# Assuming mesh.shape behaves like a dictionary {axis_name: size}
+	mesh_shape: tp.Dict[str, int] = mesh.shape
+
+	if isinstance(axis_names, str):
+		# Raises KeyError if axis_names is not a valid key
+		return mesh_shape[axis_names]
+	elif isinstance(axis_names, (list, tuple)):
+		product = 1
+		# Iterate in the provided order, though order doesn't matter for product
+		for axis in axis_names:
+			# Raises KeyError if axis is not a valid key
+			product *= mesh_shape[axis]
+		return product
+	else:
+		# Handle unexpected type for axis_names
+		raise TypeError(f"axis_names must be str or Sequence[str], got {type(axis_names)}")
+
+
+def get_mesh_axis_names(mesh: tp.Optional[Mesh] = None) -> tp.List[str]:
+	"""Retrieves the names of all axes defined in the mesh.
+
+	These names typically correspond to the dimensions used for sharding or
+	parallelism.
+
+	If no mesh is explicitly provided, it uses the mesh active in the
+	current context obtained via `get_current_mesh()`.
+
+	Args:
+	    mesh: The mesh object to query. If None, the current context's mesh
+	          is used. Defaults to None.
+
+	Returns:
+	    List[str]: A list containing the names of all axes in the mesh.
+
+	Raises:
+	    AssertionError: If `mesh` is None and no mesh is found in the current
+	                   context (raised by `get_current_mesh()`).
+	"""
+	if mesh is None:
+		mesh = get_incontext_mesh()
+
+	mesh_shape: tp.Dict[str, int] = mesh.shape
+	return list(mesh_shape.keys())
+
+
+def get_mesh_axis_size(axis_names: AxisType) -> int:
+	"""Calculates the total number of devices along the specified mesh axis or axes.
+
+	Args:
+	    axis_names: The name of a single mesh axis (str) or a sequence (list/tuple)
+	                of mesh axis names. The order in the sequence does not affect
+	                the result (product is commutative).
+
+	Returns:
+	    The total number of devices (size) in the submesh defined by the axis/axes.
+	    Returns 1 if axis_names is an empty sequence.
+
+	Raises:
+	    TypeError: If axis_names is not a str or a sequence of str.
+	"""
+	if isinstance(axis_names, str):
+		# Size along a single axis dimension
+		return lax.psum(1, axis_name=axis_names)
+	elif isinstance(axis_names, (list, tuple)):
+		if not axis_names:
+			return 1  # The size of a submesh with zero dimensions is 1
+
+		# Calculate the product of sizes along each specified axis
+		product = 1
+		for axis in axis_names:
+			product *= lax.psum(1, axis_name=axis)
+		return product
+		# Alternative using math.prod (Python 3.8+)
+		# return math.prod(lax.psum(1, axis_name=ax) for ax in axis_names)
+	else:
+		raise TypeError(
+			f"Input 'axis_names' must be a string or sequence (list/tuple), "
+			f"but got type {type(axis_names)}"
+		)
+
+
+def get_submesh_device_index(axis_names: AxisType) -> int:
+	"""
+	Calculates the linear index of the current device within the specified mesh axes.
+
+	This effectively flattens the multi-dimensional coordinates of the device
+	within the submesh defined by `axis_names` into a single integer index.
+
+	IMPORTANT: It assumes the input `axis_names` sequence is ordered from
+	most major to most minor dimension. The calculation performs a
+	row-major-like flattening based on this order.
+
+	Args:
+	    axis_names: The name of a single mesh axis (str) or a sequence (list/tuple)
+	                of mesh axis names, ordered from major to minor.
+
+	Returns:
+	    The 0-based linear index of the current device within the submesh.
+	    Returns 0 if axis_names is an empty sequence.
+
+	Raises:
+	    TypeError: If axis_names is not a str or a sequence of str.
+	"""
+	if isinstance(axis_names, str):
+		# Index along a single axis dimension
+		return lax.axis_index(axis_name=axis_names)
+	elif isinstance(axis_names, (list, tuple)):
+		if not axis_names:
+			return 0  # Index within a zero-dimensional submesh is 0
+
+		linear_index = 0
+		stride = 1
+		# Iterate from the minor axis to the major axis (reverse of the input order)
+		# This implements the formula: idx = sum(local_idx[dim] * stride[dim])
+		# where stride[dim] = product(size[k] for k > dim)
+		for axis in reversed(axis_names):
+			index_on_axis = lax.axis_index(axis_name=axis)
+			linear_index += index_on_axis * stride
+
+			# Update stride for the next (more major) dimension
+			axis_size = lax.psum(1, axis_name=axis)  # Use lax.psum, not the other func
+			stride *= axis_size
+		return linear_index
+	else:
+		raise TypeError(
+			f"Input 'axis_names' must be a string or sequence (list/tuple), "
+			f"but got type {type(axis_names)}"
+		)
 
 
 class PartitionAxis(tp.NamedTuple):
 	"""
-	A NamedTuple representing different axes of partitioning in a model.
+	Configuration for partitioning model axes across a device mesh.
 
-	Each field represents an axis and its corresponding partitioning strategy.
-	The value of each field can be:
+	Defines the mesh dimension names for standard parallelism strategies and maps
+	logical model axes to these dimensions. Allows overriding defaults.
 
-	* None: The axis is not partitioned.
-	* str: The name of the single mesh dimension across which the axis is partitioned.
-	* Tuple[str, ...]: A tuple of mesh dimension names, indicating a sharding strategy
-		where the axis is split across multiple mesh dimensions.
+	Mesh Dimensions:
+	    data_parallel_axis: Name for data parallel mesh dim. Default: "dp".
+	    fully_sharded_data_parallel_axis: Name for FSDP mesh dim. Default: "fsdp".
+	    tensor_parallel_axis: Name for tensor parallel mesh dim. Default: "tp".
+	    sequence_parallel_axis: Name for sequence parallel mesh dim. Default: "sp".
+	    expert_parallel_axis: Name for expert parallel mesh dim (MoE). Default: "ep".
 
-	Attributes:
-		batch_axis: Partitioning strategy for the batch dimension. Defaults to ("fsdp", "dp").
-		sequence_axis: Partitioning strategy for the sequence dimension. Defaults to "sp".
-		query_sequence_axis: Partitioning strategy for the query sequence dimension. Defaults to "sp".
-		head_axis: Partitioning strategy for the attention head dimension. Defaults to "tp".
-		key_sequence_axis: Partitioning strategy for the key sequence dimension. Defaults to "sp".
-		hidden_state_axis: Partitioning strategy for the hidden state dimension. Defaults to "tp".
-		attention_dim_axis: Partitioning strategy for the attention dimension. Defaults to None.
-		bias_head_sequence_axis: Partitioning strategy for the bias head sequence dimension. Defaults to None.
-		bias_key_sequence_axis: Partitioning strategy for the bias key sequence dimension. Defaults to None.
-		generation_query_sequence_axis: Partitioning strategy for the query sequence dimension during generation.
-			Defaults to None.
-		generation_head_axis: Partitioning strategy for the attention head dimension during generation.
-			Defaults to "tp".
-		generation_key_sequence_axis: Partitioning strategy for the key sequence dimension during generation.
-			Defaults to "sp".
-		generation_attention_dim_axis: Partitioning strategy for the attention dimension during generation.
-			Defaults to None.
+	Logical Model Axes:
+	    Maps logical tensor axes (like batch, sequence, hidden) to one or more
+	    mesh dimension names defined above, or None if not partitioned.
+	    Defaults are derived from the standard mesh dimension names but can be
+	    overridden during instantiation. For example, `head_axis` defaults to
+	    the value of `tensor_parallel_axis` ('tp').
 	"""
 
-	batch_axis: AxisType = ("fsdp", "dp")
-	sequence_axis: AxisType = "sp"
-	query_sequence_axis: AxisType = "sp"
-	head_axis: AxisType = "tp"
-	key_sequence_axis: AxisType = "sp"
-	hidden_state_axis: AxisType = "tp"
-	attention_dim_axis: AxisType = None
+	# --- Mesh Dimension Names ---
+	data_parallel_axis: str = "dp"
+	fully_sharded_data_parallel_axis: str = "fsdp"
+	tensor_parallel_axis: str = "tp"
+	sequence_parallel_axis: str = "sp"
+	expert_parallel_axis: str = "ep"  # Added for MoE
+
+	# --- Logical Axis Partitioning ---
+	# Defaults using Ellipsis will be resolved in __new__ based on mesh dim names
+	batch_axis: AxisType = ...
+	sequence_axis: AxisType = ...
+	query_sequence_axis: AxisType = ...
+	head_axis: AxisType = ...
+	key_sequence_axis: AxisType = ...
+	hidden_state_axis: AxisType = ...
+	mlp_intermediate_axis: AxisType = ...
+	vocab_axis: AxisType = ...
+	expert_axis: AxisType = ...  # Added for MoE
+
+	attention_dim_axis: AxisType = None  # Usually not partitioned
 	bias_head_sequence_axis: AxisType = None
 	bias_key_sequence_axis: AxisType = None
 
-	generation_query_sequence_axis: AxisType = None
-	generation_head_axis: AxisType = "tp"
-	generation_key_sequence_axis: AxisType = "sp"
+	# --- Generation Specific ---
+	generation_batch_axis: AxisType = None
+	generation_query_sequence_axis: AxisType = None  # Often length 1, not sharded
+	generation_head_axis: AxisType = ...
+	generation_key_sequence_axis: AxisType = ...
 	generation_attention_dim_axis: AxisType = None
+
+	def __new__(
+		cls,
+		*,
+		# Mesh dimension names (allow override)
+		data_parallel_axis: str = "dp",
+		fully_sharded_data_parallel_axis: str = "fsdp",
+		tensor_parallel_axis: str = "tp",
+		sequence_parallel_axis: str = "sp",
+		expert_parallel_axis: str = "ep",
+		# Logical axes (allow override, use Ellipsis for default derivation)
+		batch_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		query_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		head_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		key_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		hidden_state_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		mlp_intermediate_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		vocab_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		expert_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		attention_dim_axis: AxisType = None,
+		bias_head_sequence_axis: AxisType = None,
+		bias_key_sequence_axis: AxisType = None,
+		# Generation specific
+		generation_batch_axis: AxisType = None,
+		generation_query_sequence_axis: AxisType = None,
+		generation_head_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		generation_key_sequence_axis: tp.Union[AxisType, _EllipsisType] = Ellipsis,
+		generation_attention_dim_axis: AxisType = None,
+	):
+		"""
+		Creates a PartitionAxis instance, resolving default partitioning strategies.
+
+		Checks arguments set to Ellipsis and replaces them with defaults derived
+		from the mesh dimension name arguments (dp, fsdp, tp, sp, ep).
+		"""
+		# Resolve Ellipsis defaults based on mesh dimension names
+		if batch_axis is Ellipsis:
+			# Default batch sharding uses both FSDP and DP dimensions
+			batch_axis = (fully_sharded_data_parallel_axis, data_parallel_axis)
+		if sequence_axis is Ellipsis:
+			sequence_axis = sequence_parallel_axis
+		if query_sequence_axis is Ellipsis:
+			query_sequence_axis = sequence_parallel_axis
+		if head_axis is Ellipsis:
+			head_axis = tensor_parallel_axis
+		if key_sequence_axis is Ellipsis:
+			key_sequence_axis = sequence_parallel_axis
+		if hidden_state_axis is Ellipsis:
+			hidden_state_axis = tensor_parallel_axis
+		if mlp_intermediate_axis is Ellipsis:
+			mlp_intermediate_axis = tensor_parallel_axis
+		if vocab_axis is Ellipsis:
+			vocab_axis = tensor_parallel_axis
+		if expert_axis is Ellipsis:  # Added
+			expert_axis = expert_parallel_axis
+			# Default logical expert axis to expert parallel dim name
+
+		if generation_head_axis is Ellipsis:
+			generation_head_axis = tensor_parallel_axis
+		if generation_key_sequence_axis is Ellipsis:
+			generation_key_sequence_axis = sequence_parallel_axis
+
+		# Call the original NamedTuple constructor with resolved values
+		# Ensure the order matches the field definition order!
+		return super().__new__(
+			cls,
+			# Mesh dims first
+			data_parallel_axis,
+			fully_sharded_data_parallel_axis,
+			tensor_parallel_axis,
+			sequence_parallel_axis,
+			expert_parallel_axis,  # Added order
+			# Logical axes next
+			batch_axis,
+			sequence_axis,
+			query_sequence_axis,
+			head_axis,
+			key_sequence_axis,
+			hidden_state_axis,
+			mlp_intermediate_axis,
+			vocab_axis,
+			expert_axis,  # Added order
+			attention_dim_axis,
+			bias_head_sequence_axis,
+			bias_key_sequence_axis,
+			# Generation axes
+			generation_batch_axis,
+			generation_query_sequence_axis,
+			generation_head_axis,
+			generation_key_sequence_axis,
+			generation_attention_dim_axis,
+		)
