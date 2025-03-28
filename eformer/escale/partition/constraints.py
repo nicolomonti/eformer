@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-from dataclasses import dataclass
 import dataclasses
 import os
 import re
 import typing as tp
 import warnings
+from dataclasses import dataclass
 from functools import partial
 
 import chex
@@ -575,6 +575,7 @@ class PartitionAxis:
 	mlp_intermediate_axis: AxisType = ...
 	vocab_axis: AxisType = ...
 	expert_axis: AxisType = ...
+	expert_gate_axis: AxisType = None
 
 	attention_dim_axis: AxisType = None  # Usually not partitioned
 	bias_head_sequence_axis: AxisType = None
@@ -598,43 +599,44 @@ class PartitionAxis:
 		def set_attr(obj, name, value):
 			object.__setattr__(obj, name, value)
 
-		# Resolve fields that need defaults
-		if self.batch_axis is Ellipsis:
-			# Default batch sharding uses both FSDP and DP dimensions
-			set_attr(
-				self,
-				"batch_axis",
-				(self.fully_sharded_data_parallel_axis, self.data_parallel_axis),
-			)
+		def _operate(val):
+			return val is Ellipsis
 
-		if self.sequence_axis is Ellipsis:
+		# Resolve fields that need defaults
+		if _operate(self.batch_axis):
+			# Default batch sharding uses both FSDP and DP dimensions
+
+			_shardin = (self.fully_sharded_data_parallel_axis, self.data_parallel_axis)
+			set_attr(self, "batch_axis", _shardin)
+
+		if _operate(self.sequence_axis):
 			set_attr(self, "sequence_axis", self.sequence_parallel_axis)
 
-		if self.query_sequence_axis is Ellipsis:
+		if _operate(self.query_sequence_axis):
 			set_attr(self, "query_sequence_axis", self.sequence_parallel_axis)
 
-		if self.head_axis is Ellipsis:
+		if _operate(self.head_axis):
 			set_attr(self, "head_axis", self.tensor_parallel_axis)
 
-		if self.key_sequence_axis is Ellipsis:
+		if _operate(self.key_sequence_axis):
 			set_attr(self, "key_sequence_axis", self.sequence_parallel_axis)
 
-		if self.hidden_state_axis is Ellipsis:
+		if _operate(self.hidden_state_axis):
 			set_attr(self, "hidden_state_axis", self.tensor_parallel_axis)
 
-		if self.mlp_intermediate_axis is Ellipsis:
+		if _operate(self.mlp_intermediate_axis):
 			set_attr(self, "mlp_intermediate_axis", self.tensor_parallel_axis)
 
-		if self.vocab_axis is Ellipsis:
+		if _operate(self.vocab_axis):
 			set_attr(self, "vocab_axis", self.tensor_parallel_axis)
 
-		if self.expert_axis is Ellipsis:
+		if _operate(self.expert_axis):
 			set_attr(self, "expert_axis", self.expert_parallel_axis)
 
-		if self.generation_head_axis is Ellipsis:
+		if _operate(self.generation_head_axis):
 			set_attr(self, "generation_head_axis", self.tensor_parallel_axis)
 
-		if self.generation_key_sequence_axis is Ellipsis:
+		if _operate(self.generation_key_sequence_axis):
 			set_attr(self, "generation_key_sequence_axis", self.sequence_parallel_axis)
 
 		self._safety_check()
