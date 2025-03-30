@@ -536,6 +536,100 @@ def get_submesh_device_index(axis_names: AxisType) -> int:
 		)
 
 
+def extract_shardings(tree, mesh: Mesh = None):
+	"""
+	Extracts JAX NamedSharding objects from the leaves of a PyTree.
+
+	This function traverses the input PyTree and inspects each leaf.
+	- If a leaf has a `.sharding` attribute that is already a `NamedSharding`,
+	  it's returned directly.
+	- If a leaf has a `.sharding` attribute that is a `PartitionSpec`, it
+	  attempts to convert it into a `NamedSharding` using the provided `mesh`.
+	  If no `mesh` is provided, it tries to get one from the JAX context
+	  (e.g., using `get_incontext_mesh`). If no mesh is available in either
+	  case, an AssertionError is raised.
+	- If a leaf does not have a `.sharding` attribute, or if its sharding
+	  is not a `NamedSharding` or convertible `PartitionSpec`, `None` is
+	  returned for that leaf in the output tree.
+
+	Args:
+	    tree: The input PyTree (e.g., nested dictionary, list, tuple) potentially
+	          containing JAX arrays or other objects with sharding information.
+	    mesh: An optional `jax.sharding.Mesh`. If provided, it's used to convert
+	          `PartitionSpec` objects to `NamedSharding`. If `None`, the function
+	          attempts to find a mesh from the current JAX context.
+
+	Returns:
+	    A PyTree with the same structure as the input `tree`. Each leaf will
+	    contain either a `jax.sharding.NamedSharding` object corresponding
+	    to the input leaf's sharding, or `None` if no valid sharding
+	    information was found or could be constructed.
+
+	Raises:
+	    AssertionError: If a leaf has a `PartitionSpec` sharding but no `mesh`
+	                    is provided or found in the context.
+	"""
+	if mesh is None:
+		mesh = get_incontext_mesh()
+
+	def cond(x):
+		sharding = x.sharding if hasattr(x, "sharding") else None
+		if isinstance(sharding, jax.sharding.PartitionSpec):
+			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
+			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
+		if not isinstance(sharding, jax.sharding.NamedSharding):
+			return None
+		return sharding
+
+	return jax.tree_util.tree_map(cond, tree)
+
+
+def get_partition_spec(tree):
+	"""
+	Retrieves the PartitionSpec for each leaf in a PyTree.
+
+	This function traverses the input PyTree and determines the
+	`jax.sharding.PartitionSpec` for each leaf based on its type:
+	- If the leaf is a `jax.Array`, it returns the `PartitionSpec` from
+	  `leaf.sharding.spec`.
+	- If the leaf is a Python scalar (`int` or `float`), it returns an
+	  empty `PartitionSpec()`, assuming scalars are typically replicated.
+	- For any other leaf type, it raises a `ValueError`.
+
+	Args:
+	    tree: The input PyTree (e.g., nested dictionary, list, tuple) containing
+	          JAX arrays, scalars, or potentially other types.
+
+	Returns:
+	    A PyTree with the same structure as the input `tree`. Each leaf
+	    contains the corresponding `jax.sharding.PartitionSpec`.
+
+	Raises:
+	    ValueError: If a leaf in the tree is not a `jax.Array`, `int`, or `float`.
+	    AttributeError: If a `jax.Array` leaf doesn't have `.sharding.spec` (which
+	                    would be unusual for a properly sharded array).
+	"""
+
+	def _call(arr):
+		if isinstance(arr, jax.Array):
+			if hasattr(arr, "sharding") and hasattr(arr.sharding, "spec"):
+				return arr.sharding.spec
+			else:
+				raise AttributeError(
+					f"jax.Array leaf does not have expected .sharding.spec: {arr}"
+				)
+
+		elif isinstance(arr, (int, float)):
+			return PartitionSpec()
+		else:
+			raise ValueError(
+				f"Unsupported leaf type for get_partition_spec: {type(arr)}. "
+				"Expected jax.Array, int, or float."
+			)
+
+	return jax.tree_util.tree_map(_call, tree)
+
+
 @dataclass(frozen=True)
 class PartitionAxis:
 	"""

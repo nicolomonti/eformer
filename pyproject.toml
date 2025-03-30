@@ -2,7 +2,7 @@
 name = "eformer"
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 readme = "README.md"
-version = "0.0.19"
+version = "0.0.20"
 
 classifiers = [
 	"Development Status :: 3 - Alpha",
@@ -37,7 +37,7 @@ optax = ">=0.2.2"
 chex = "*"
 ml-collections = "0.1.1"
 plum-dispatch = "2.3.2"
-ray = "~2.42.1"
+ray = { version = ">=2.44.1", extras = ["default"] }
 mergedeep = "~1.3.4"
 tblib = "~3.0.0"
 pyyaml = "~6.0.2"
