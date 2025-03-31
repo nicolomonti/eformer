@@ -76,10 +76,10 @@ def test_partition():
 
 
 def test_combine(sample_trees):
-	"""Test combine function."""
+	"""Test merge function."""
 	tree1 = {"a": jnp.array([1]), "b": None}
 	tree2 = {"a": None, "b": jnp.array([2])}
-	combined = combine(tree1, tree2)
+	combined = merge(tree1, tree2)
 	assert tree_equal(combined, {"a": jnp.array([1]), "b": jnp.array([2])})
 
 

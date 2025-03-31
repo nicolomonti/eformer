@@ -33,7 +33,6 @@ from jax import Array
 from typing_extensions import ParamSpec, dataclass_transform
 
 from ._pprint import tree_pformat
-from ._tree_util import tree_equal
 
 _T = tp.TypeVar("_T")
 _P = ParamSpec("_P")
@@ -684,12 +683,23 @@ else:
 	_ModuleMeta = _ActualModuleMeta
 
 
+def _static_tree_equal(
+	*pytrees: PyTree,
+	typematch: bool = False,
+	rtol=0.0,
+	atol=0.0,
+) -> bool:
+	from ._tree_util import tree_equal
+
+	return tree_equal(*pytrees, typematch=typematch, rtol=rtol, atol=atol)
+
+
 class PyTree(metaclass=_ModuleMeta):
 	def __hash__(self):
 		return hash(tuple(tu.tree_leaves(self)))
 
 	def __eq__(self, other) -> tp.Union[bool, np.bool_, Array]:
-		return tree_equal(self, other)
+		return _static_tree_equal(self, other)
 
 	def __repr__(self):
 		return tree_pformat(self)

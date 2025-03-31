@@ -17,7 +17,6 @@ import os
 import re
 import typing as tp
 import warnings
-from dataclasses import dataclass
 from functools import partial
 
 import chex
@@ -31,7 +30,7 @@ from jax.interpreters import pxla
 from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from ..tree_util import named_tree_map
+from eformer.pytree import auto_pytree, named_tree_map
 
 MIN_SHARDING_SIZE = int(os.environ.get("MIN_SHARDING_SIZE", "16384"))
 LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
@@ -630,7 +629,7 @@ def get_partition_spec(tree):
 	return jax.tree_util.tree_map(_call, tree)
 
 
-@dataclass(frozen=True)
+@auto_pytree
 class PartitionAxis:
 	"""
 	Configuration for partitioning model axes across a device mesh.

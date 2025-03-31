@@ -9,4 +9,3 @@ Escale
    escale_mesh
    escale_partition
    escale_tpexec
-   escale_tree_util

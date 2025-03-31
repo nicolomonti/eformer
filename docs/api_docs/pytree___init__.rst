@@ -1,7 +1,7 @@
-eformer.jaximus._pprint
+eformer.pytree.__init__
 =======================
 
-.. automodule:: eformer.jaximus._pprint
+.. automodule:: eformer.pytree.__init__
     :members:
     :undoc-members:
     :show-inheritance:
