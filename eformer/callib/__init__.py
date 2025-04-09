@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .triton_call import cdiv, next_power_of_2, strides_from_shape, triton_call
+from .triton_call import (
+	cdiv,
+	get_triton_type,
+	next_power_of_2,
+	normalize_grid,
+	strides_from_shape,
+	triton_call,
+)
 
-__all__ = ("cdiv", "next_power_of_2", "strides_from_shape", "triton_call")
+try:
+	from .suppress_triton import (
+		enable_all_triton_output,
+		silence_all_triton_output,
+	)
+except ImportError:
+
+	def silence_all_triton_output():
+		"""Fallback function when real suppression isn't available."""
+		return False
+
+	def enable_all_triton_output():
+		"""Fallback function when real suppression isn't available."""
+		pass
+
+
+__all__ = (
+	"cdiv",
+	"get_triton_type",
+	"normalize_grid",
+	"next_power_of_2",
+	"strides_from_shape",
+	"triton_call",
+	"silence_all_triton_output",
+	"enable_all_triton_output",
+)

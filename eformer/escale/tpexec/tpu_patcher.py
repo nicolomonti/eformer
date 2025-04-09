@@ -28,7 +28,7 @@ import yaml
 
 TPU_VERSION = os.getenv("TPU_VERSION", "v4")
 TPU_SLICE_SIZE = int(os.getenv("TPU_SLICE_SIZE", "8"))
-TPU_CORES_PER_HOST = int(os.getenv("TPU_CORES_PER_HOST", "8"))
+TPU_CORES_PER_HOST = int(os.getenv("TPU_CORES_PER_HOST", "4"))
 SSH_USER = os.getenv("PATCHER_USER")
 INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
