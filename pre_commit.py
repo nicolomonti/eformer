@@ -7,7 +7,7 @@ sys.path.append(dirname)
 sys.path.append(os.path.join(dirname, "src"))
 
 # Global cache to record module paths (keys as tuples representing the hierarchy)
-cache = {}
+cache = {} 
 
 # Directives to include in automodule docs.
 static_joins = "\n\t:members:\n\t:undoc-members:\n\t:show-inheritance:"
