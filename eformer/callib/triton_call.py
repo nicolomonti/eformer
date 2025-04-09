@@ -13,7 +13,6 @@
 # limitations under the License.
 
 # Edited in EasyDeL For caching kernels which doesn't work in jax-triton version
-"""Module for calling Triton kernels from JAX."""
 
 from __future__ import annotations
 
@@ -30,12 +29,14 @@ import types
 import zlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Protocol, Union
+from typing import Any, Protocol, Union, overload
 
 import jax
 import jax.dlpack
+import jax.extend as jex
 import jax.numpy as jnp
 import numpy as np
+from absl import logging
 from jax import tree_util
 from jax._src import core, state, util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
@@ -60,15 +61,27 @@ try:
 	import triton.backends.amd.compiler as hb
 except ImportError:
 	hb = None
-	pass
 
-if TYPE_CHECKING:
-	from triton import JITFunction
-else:
-	JITFunction = Any
+try:
+	import triton.backends.cpu.compiler as cpub  # type:ignore
+
+except ImportError:
+	cpub = None
 
 
 def get_cache_dir() -> Path:
+	"""Get the directory for caching compiled Triton kernels.
+
+	Returns a platform-specific directory for caching compiled kernels:
+	- Windows: %LOCALAPPDATA%\triton-compiled-kernels
+	- macOS: ~/Library/Caches/triton-compiled-kernels
+	- Linux: ~/.cache/triton-compiled-kernels
+
+	The directory is created if it doesn't exist.
+
+	Returns:
+		A Path object pointing to the cache directory.
+	"""
 	home_dir = Path.home()
 	app_name = "triton-compiled-kernels"
 	if os.name == "nt":  # Windows
@@ -86,6 +99,7 @@ def get_cache_dir() -> Path:
 	return cache_dir
 
 
+os.environ["TRITON_CACHE_DIR"] = ""
 _JAX_TRITON_DUMP_DIR = Path(os.environ.get("JAX_TRITON_DUMP_DIR", get_cache_dir()))
 _CACHE_TRITON_KERNELS = os.environ.get("CACHE_TRITON_KERNELS", "true") in [
 	"1",
@@ -114,15 +128,47 @@ _JAX_TO_TRITON_TYPE_MAP = {
 	jnp.dtype("uint32"): "u32",
 	jnp.dtype("uint16"): "u16",
 	jnp.dtype("uint8"): "u8",
-	# Triton defines a 'B' type, which is an alias for both i1 and bool.
 	jnp.dtype("bool"): "B",
 }
 
 Grid = Union[int, tuple[int], tuple[int, int], tuple[int, int, int]]
+"""Type definition for grid dimensions in Triton kernels.
+
+Can be one of:
+- A single integer for 1D grids
+- A tuple of 1 integer for 1D grids
+- A tuple of 2 integers for 2D grids
+- A tuple of 3 integers for 3D grids
+
+This represents the number of thread blocks in each dimension of the execution grid.
+"""
+
 GridOrLambda = Union[Grid, Callable[[dict[str, Any]], Grid]]
+"""Type definition for grid specification that can be static or dynamic.
+
+Can be either:
+- A Grid (integer or tuple of integers) for static grid dimensions
+- A callable that takes a dictionary of metaparameters and returns a Grid
+
+The callable form allows for dynamic grid dimension calculation based on
+runtime parameters, which is useful for autotuning and adaptive execution.
+"""
 
 
 def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
+	"""Normalize grid specification to a 3D tuple.
+
+	Args:
+		grid: An integer, tuple of integers, or a function that returns a tuple.
+		metaparams: Parameters to pass to grid function if grid is callable.
+
+	Returns:
+		A tuple of 3 integers representing the normalized grid dimensions.
+		If grid has fewer than 3 dimensions, remaining dimensions are filled with 1.
+
+	Raises:
+		ValueError: If grid has more than 3 dimensions.
+	"""
 	if callable(grid):
 		grid = grid(metaparams)
 	if isinstance(grid, int):
@@ -133,10 +179,31 @@ def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
 
 
 def avals_to_layouts(avals):
+	"""Convert abstract values to memory layouts.
+
+	Args:
+		avals: Sequence of abstract values with ndim attributes.
+
+	Returns:
+		List of layout specifications where each dimension is in reverse order,
+		corresponding to the memory layout in row-major order.
+	"""
 	return [list(reversed(range(aval.ndim))) for aval in avals]
 
 
 def get_triton_type(obj: Any) -> str:
+	"""Convert Python/JAX types to Triton type strings.
+
+	Args:
+		obj: The object whose type needs to be converted to a Triton type.
+
+	Returns:
+		A string representing the Triton type.
+
+	Raises:
+		ValueError: If an integer overflows its representation.
+		NotImplementedError: If the type is not supported.
+	"""
 	if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
 		return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
 	if isinstance(obj, tl.constexpr):
@@ -163,7 +230,7 @@ def get_triton_type(obj: Any) -> str:
 	raise NotImplementedError(f"could not compute type name for {obj}: {type(obj)}")
 
 
-triton_kernel_call_p = jax.core.Primitive("triton_kernel_call")
+triton_kernel_call_p = jex.core.Primitive("triton_kernel_call")
 triton_kernel_call_p.multiple_results = True
 triton_kernel_call_p.def_impl(
 	functools.partial(xla.apply_primitive, triton_kernel_call_p)
@@ -172,22 +239,61 @@ triton_kernel_call_p.def_impl(
 
 @triton_kernel_call_p.def_abstract_eval
 def triton_kernel_call_abstract_eval(*_, out_shapes, **__):
+	"""Abstract evaluation of the triton_kernel_call primitive.
+
+	This function determines the abstract shape and type information for the outputs
+	of a triton kernel call without actually executing the kernel.
+
+	Args:
+		*_: Ignored positional arguments.
+		out_shapes: Sequence of ShapeDtype objects describing the expected output shapes.
+		**__: Ignored keyword arguments.
+
+	Returns:
+		A list of ShapedArray objects representing the abstract outputs of the kernel.
+	"""
 	return [
 		core.ShapedArray(out_shape.shape, out_shape.dtype) for out_shape in out_shapes
 	]
 
 
 def aval_size_bytes(aval):
+	"""Calculate the size in bytes of an abstract value.
+
+	Args:
+		aval: Abstract value with dtype and size attributes.
+
+	Returns:
+		The total size in bytes of the array.
+	"""
 	return np.dtype(aval.dtype).itemsize * aval.size
 
 
 def get_cuda_backend(device, compute_capability):
+	"""Create a CUDA backend for Triton.
+
+	Args:
+		device: The device ID.
+		compute_capability: The compute capability of the device.
+
+	Returns:
+		A CUDABackend instance configured for the specified device.
+	"""
 	target = cb.GPUTarget("cuda", compute_capability, 32)
 	backend = cb.CUDABackend(target)
 	return backend
 
 
 def get_hip_backend(device, compute_capability):
+	"""Create a HIP backend for Triton on AMD GPUs.
+
+	Args:
+		device: The device ID.
+		compute_capability: The compute capability of the device.
+
+	Returns:
+		A HIPBackend instance configured for the specified device.
+	"""
 	arch = triton_kernel_call_lib.get_arch_details(device)
 	arch = arch.split(":")[0]
 	target = hb.GPUTarget("hip", arch, 64)
@@ -195,8 +301,36 @@ def get_hip_backend(device, compute_capability):
 	return backend
 
 
+def get_cpu_backend(device, compute_capability):
+	"""Create a CPU backend for Triton.
+
+	Args:
+		device: The device ID.
+		compute_capability: The compute capability (unused for CPU but kept for API consistency).
+
+	Returns:
+		A CPUBackend instance configured for the host CPU.
+	"""
+	arch = _triton.llvm.get_cpu_tripple()
+	arch = arch.split("-")[0]
+	target = cpub.GPUTarget("cpu", arch, 0)
+	backend = cpub.CPUBackend(target)
+	return backend
+
+
 @dataclasses.dataclass
 class CompilationResult:
+	"""Container for the result of a Triton kernel compilation.
+
+	Attributes:
+		binary: The compiled binary code (PTX, HSACO, or assembly).
+		name: The name of the compiled kernel.
+		shared_mem_bytes: Amount of shared memory used by the kernel in bytes.
+		cluster_dims: Tuple specifying the cluster dimensions.
+		ttgir: String representation of the Triton GPU IR (if dumping is enabled).
+		llir: String representation of the LLVM IR (if dumping is enabled).
+	"""
+
 	binary: str
 	name: str
 	shared_mem_bytes: int
@@ -207,11 +341,26 @@ class CompilationResult:
 
 def compile_ttir_inplace(
 	ttir,
-	backend: List[Union[cb.CUDABackend, hb.HIPBackend]],  # type:ignore
-	options: List[Union[cb.CUDAOptions, hb.HIPOptions]],  # type:ignore
+	backend: cb.CUDABackend | hb.HIPBackend | cpub.CPUBackend,  # type:ignore
+	options: cb.CUDAOptions | hb.HIPOptions | cpub.CPUOptions,  # type:ignore
 	compute_capability,
 	platform,
 ):
+	"""Compile Triton IR to the appropriate target based on platform.
+
+	Args:
+		ttir: Triton IR to compile.
+		backend: Backend compiler instance (CUDA, HIP, or CPU).
+		options: Compiler options specific to the backend.
+		compute_capability: The compute capability of the target device.
+		platform: Target platform ("cuda", "rocm", or "cpu").
+
+	Returns:
+		A CompilationResult instance with the compiled kernel.
+
+	Raises:
+		ValueError: If the platform is not supported.
+	"""
 	if platform == "cuda":
 		return compile_ttir_to_ptx_inplace(
 			ttir,
@@ -227,6 +376,13 @@ def compile_ttir_inplace(
 			options,
 			compute_capability,
 		)
+	elif platform == "cpu":
+		return compile_ttir_to_asm_inplace(
+			ttir,
+			backend,
+			options,
+			compute_capability,
+		)
 	else:
 		raise ValueError("Unsupported device.")
 
@@ -237,6 +393,23 @@ def compile_ttir_to_ptx_inplace(
 	cuda_options: cb.CUDAOptions,
 	compute_capability,
 ) -> CompilationResult:
+	"""Compile Triton IR to PTX for NVIDIA GPUs.
+
+	This function handles the compilation pipeline for CUDA:
+	TTIR → optimized TTIR → TTGIR → LLIR → PTX
+
+	Args:
+		ttir: Triton IR to compile.
+		cuda_backend: CUDA backend compiler instance.
+		cuda_options: CUDA compiler options.
+		compute_capability: The compute capability of the target NVIDIA GPU.
+
+	Returns:
+		A CompilationResult instance with the compiled PTX.
+
+	Raises:
+		ValueError: If any compilation stage fails.
+	"""
 	if cuda_options.debug:
 		print(ttir)
 	try:
@@ -276,8 +449,8 @@ def compile_ttir_to_ptx_inplace(
 		print(ptx)
 	name = metadata["name"]
 	cluster_dims = metadata["cluster_dims"]
-	ttgir = str(ttgir)
-	llir = str(llir)
+	ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
+	llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
 	return CompilationResult(
 		binary=ptx,
 		name=name,
@@ -294,6 +467,23 @@ def compile_ttir_to_hsaco_inplace(
 	hip_options: hb.HIPOptions,  # type:ignore
 	compute_capability,
 ) -> CompilationResult:
+	"""Compile Triton IR to HSACO for AMD GPUs.
+
+	This function handles the compilation pipeline for ROCm:
+	TTIR → optimized TTIR → TTGIR → LLIR → AMDGCN → HSACO
+
+	Args:
+		ttir: Triton IR to compile.
+		hip_backend: HIP backend compiler instance.
+		hip_options: HIP compiler options.
+		compute_capability: The architecture details of the target AMD GPU.
+
+	Returns:
+		A CompilationResult instance with a path to the compiled HSACO.
+
+	Raises:
+		ValueError: If any compilation stage fails.
+	"""
 	if hip_options.debug:
 		print(ttir)
 	try:
@@ -318,8 +508,8 @@ def compile_ttir_to_hsaco_inplace(
 	hsaco = hip_backend.make_hsaco(amdgcn, metadata, hip_options)
 
 	name = metadata["name"]
-	ttgir = str(ttgir)
-	llir = str(llir)
+	ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
+	llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
 	cluster_dims = (0, 0, 0)
 	fd, hsaco_path = tempfile.mkstemp()
 	with os.fdopen(fd, "wb") as f:
@@ -334,26 +524,70 @@ def compile_ttir_to_hsaco_inplace(
 	)
 
 
-def cdiv(a: int | jax.Array, b: int | jax.Array) -> int | jax.Array:
-	if isinstance(a, int) and isinstance(b, int):
-		return (a + b - 1) // b
-	return jax.lax.div(a + b - 1, b)
+def compile_ttir_to_asm_inplace(
+	ttir,
+	cpu_backend: cpub.CPUBackend,  # type:ignore
+	cpu_options: cpub.CPUOptions,  # type:ignore
+	compute_capability,
+) -> CompilationResult:
+	"""Compile Triton IR to assembly for CPU targets.
 
+	This function handles the compilation pipeline for CPU:
+	TTIR → optimized TTIR → TTCIR → TTTCIR → LLIR → Assembly
 
-def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
-	size = np.prod(shape)
-	strides = []
-	for s in shape:
-		size = size // s
-		strides.append(int(size))
-	return tuple(strides)
+	Args:
+		ttir: Triton IR to compile.
+		cpu_backend: CPU backend compiler instance.
+		cpu_options: CPU compiler options.
+		compute_capability: Unused for CPU but kept for API consistency.
 
+	Returns:
+		A CompilationResult instance with the compiled assembly.
 
-def next_power_of_2(x: int) -> int:
-	"""Returns the next power of two greater than or equal to `x`."""
-	if x < 0:
-		raise ValueError("`next_power_of_2` requires a non-negative integer.")
-	return 1 if x == 0 else 2 ** (x - 1).bit_length()
+	Raises:
+		ValueError: If any compilation stage fails.
+	"""
+	if cpu_options.debug:
+		print(ttir)
+	try:
+		metadata = {}
+		opt_ttir = cpu_backend.make_ttir(ttir, metadata, cpu_options)
+		ttcir = cpu_backend.make_ttcir(opt_ttir, metadata, cpu_options)
+	except RuntimeError as e:
+		ttir.dump()
+		raise ValueError("TTIR->TTCIR pass failed!") from e
+	if cpu_options.debug:
+		print(ttcir)
+	try:
+		tttcir = cpu_backend.make_tttcir(ttcir, metadata, cpu_options)
+	except RuntimeError as e:
+		ttcir.dump()
+		raise ValueError("TTCIR->TTTCIR pass failed!") from e
+	if cpu_options.debug:
+		print(tttcir)
+	try:
+		llir = cpu_backend.make_llir(tttcir, metadata, cpu_options)
+	except RuntimeError as e:
+		tttcir.dump()
+		raise ValueError("TTTCIR->LLIR pass failed!") from e
+	shared_mem_bytes = metadata["shared"]
+	if cpu_options.debug:
+		print(llir)
+	asm = cpu_backend.make_asm(llir, metadata, cpu_options)
+	if cpu_options.debug:
+		print(asm)
+	name = metadata["name"]
+	cluster_dims = metadata["cluster_dims"]
+	tttcir = str(tttcir) if _JAX_TRITON_DUMP_DIR else None
+	llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
+	return CompilationResult(
+		binary=asm,
+		name=name,
+		shared_mem_bytes=shared_mem_bytes,
+		cluster_dims=cluster_dims,
+		ttgir=tttcir,
+		llir=llir,
+	)
 
 
 _COMPILED_KERNEL_CACHE = {}
@@ -362,10 +596,10 @@ _COMPILED_KERNEL_CACHE = {}
 def get_or_create_triton_kernel(
 	backend_init_func,
 	platform,
-	fn: JITFunction,
+	fn,
 	arg_dtypes,
 	scalar_args,
-	device,
+	device=0,
 	*,
 	num_warps,
 	num_stages,
@@ -375,6 +609,36 @@ def get_or_create_triton_kernel(
 	metaparams,
 	dump: bool,
 ) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:  # type:ignore
+	"""Get a cached Triton kernel or compile it if not found.
+
+	This function is responsible for:
+	1. Creating a unique signature for the kernel configuration
+	2. Checking if the kernel is already cached
+	3. Compiling the kernel if it's not cached
+	4. Caching the compiled kernel for future use
+
+	Args:
+		backend_init_func: Function to initialize the backend compiler.
+		platform: Target platform ("cuda", "rocm", or "cpu").
+		fn: The Triton kernel function to compile.
+		arg_dtypes: List of Triton type strings for each argument.
+		scalar_args: Tuple of (index, type, value) for scalar arguments.
+		device: Device ID to compile for.
+		num_warps: Number of warps to use.
+		num_stages: Number of pipeline stages to use.
+		num_ctas: Number of CTAs (thread blocks) per cluster.
+		compute_capability: Compute capability of the target device.
+		enable_fp_fusion: Whether to enable floating-point operation fusion.
+		metaparams: Additional metadata parameters for the kernel.
+		dump: Whether to print debug information during compilation.
+
+	Returns:
+		A tuple of (TritonKernel, specialization_attr) where specialization_attr
+		contains information about specialized parameters.
+
+	Raises:
+		ValueError: If num_ctas > 1 is used with compute capability < 90.
+	"""
 	if num_warps is None:
 		num_warps = 4
 	if num_stages is None:
@@ -390,7 +654,7 @@ def get_or_create_triton_kernel(
 	backend = backend_init_func(device, compute_capability)
 	for i, _, v in scalar_args:
 		args_for_specialization_attr[i] = v
- 
+
 	specialization_attr = backend.get_attrs_descriptor(
 		fn.params[: len(args_for_specialization_attr)], args_for_specialization_attr
 	)
@@ -417,7 +681,7 @@ def get_or_create_triton_kernel(
 
 	if not Path(_JAX_TRITON_DUMP_DIR / kernel_hash).exists():
 		if _CACHE_TRITON_KERNELS:
-			os.makedirs(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}")
+			os.makedirs(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}", exist_ok=True)
 			with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/config", "w") as f:
 				pprint.pprint(cache_key, stream=f)
 		opts = {
@@ -508,6 +772,7 @@ def get_or_create_triton_kernel(
 			compute_capability,
 			*compilation_result.cluster_dims,
 		)
+		_COMPILED_KERNEL_CACHE[cache_key] = kernel
 
 	return kernel, specialization_attr
 
@@ -531,7 +796,7 @@ def triton_kernel_call_lowering(
 	zeroed_outputs,
 	debug,
 	serialized_metadata,
-	device,
+	device=0,
 	**metaparams,
 ):
 	kernel_call_name = name
@@ -545,6 +810,16 @@ def triton_kernel_call_lowering(
 	named_args = dict(unsafe_zip(fn.arg_names, args))
 
 	if isinstance(fn, autotuner.Autotuner):
+		if hasattr(fn, "key_idx"):
+			key_idxs = fn.key_idx
+		else:
+			key_idxs = [fn.arg_names.index(k) for k in fn.keys]
+		if any(idx not in key_idxs for idx, _, _ in scalar_args):
+			logging.warning(
+				"Auto-tuning key does not include all scalar arguments. "
+				"We may perform redundant auto-tuning."
+			)
+
 		prev_early_config_prune_fn = fn.early_config_prune
 
 		def prune_configs(configs, named_args, **kwargs):
@@ -698,8 +973,87 @@ mlir.register_lowering(
 	platform="rocm",
 )
 
+mlir.register_lowering(
+	triton_kernel_call_p,
+	functools.partial(triton_kernel_call_lowering, get_cpu_backend),
+	platform="cpu",
+)
+
+
+@overload
+def cdiv(a: int, b: int) -> int: ...
+
+
+@overload
+def cdiv(a: int, b: jax.Array) -> jax.Array: ...
+
+
+@overload
+def cdiv(a: jax.Array, b: int) -> jax.Array: ...
+
+
+@overload
+def cdiv(a: jax.Array, b: jax.Array) -> jax.Array: ...
+
+
+def cdiv(a: int | jax.Array, b: int | jax.Array) -> int | jax.Array:
+	"""Ceiling division operation.
+
+	Computes the ceiling division of a by b, which is equivalent to (a + b - 1) // b.
+
+	Args:
+		a: Dividend, can be an integer or a JAX array.
+		b: Divisor, can be an integer or a JAX array.
+
+	Returns:
+		The ceiling division result with the same type as inputs.
+	"""
+	if isinstance(a, int) and isinstance(b, int):
+		return (a + b - 1) // b
+	return jax.lax.div(a + b - 1, b)
+
+
+def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+	"""Calculate the strides for a contiguous array with the given shape.
+
+	Args:
+		shape: A tuple of integers representing the dimensions of an array.
+
+	Returns:
+		A tuple of integers representing the strides of a contiguous array.
+	"""
+	size = np.prod(shape)
+	strides = []
+	for s in shape:
+		size = size // s
+		strides.append(int(size))
+	return tuple(strides)
+
+
+def next_power_of_2(x: int) -> int:
+	"""Returns the next power of two greater than or equal to `x`.
+
+	Args:
+		x: A non-negative integer.
+
+	Returns:
+		The smallest power of 2 greater than or equal to x.
+
+	Raises:
+		ValueError: If x is negative.
+	"""
+	if x < 0:
+		raise ValueError("`next_power_of_2` requires a non-negative integer.")
+	return 1 if x == 0 else 2 ** (x - 1).bit_length()
+
 
 class ShapeDtype(Protocol):
+	"""Protocol defining an object with shape and dtype attributes.
+
+	This protocol is used to specify the expected output shape and data type
+	for Triton kernels. It's compatible with jax.ShapeDtypeStruct and similar classes.
+	"""
+
 	@property
 	def shape(self) -> tuple[int, ...]: ...
 
@@ -727,6 +1081,8 @@ def triton_call(
 	**metaparams: Any,
 ) -> Any:
 	"""Calls a Triton kernel with `jax.Array` arguments.
+
+
 	Args:
 	  *args: Inputs for the Triton kernel.
 	  kernel: A Triton kernel (e.g. a function decorated with `triton.jit`). All
@@ -741,23 +1097,43 @@ def triton_call(
 	    integers, `kernel` is launched in a `prod(grid)`-many parallel execution.
 	    When `grid` is a function, it is passed `**metaparams` and should return a
 	    tuple of up to 3 integers.
+	  name: Optional name for the kernel. This is useful for debugging and profiling
+	    purposes. If not provided, a default name will be generated based on the
+	    kernel function name.
+	  custom_call_target_name: Name of the custom call target for XLA. This is
+	    used internally for the XLA custom call mechanism and typically should
+	    not be changed unless you need to intercept specific kernel calls at the
+	    XLA level.
 	  input_output_aliases: A dictionary mapping input argument indices to output
 	    indices. Providing a mapping will alias the corresponding buffers.
 	  zeroed_outputs: A sequence of indices, or a function returning a sequence of
 	    indices, for outputs that should be zeroed before the kernel is launched.
-	  num_warps: The number of warps used to execute the Triton kernel.
-	  num_stages: The number of stages emitted by the Triton compiler.
+	  num_warps: The number of warps used to execute the Triton kernel. If None,
+	    defaults to 4. This affects performance and resource utilization.
+	  num_stages: The number of stages emitted by the Triton compiler. If None,
+	    defaults to 3. This affects pipeline efficiency.
 	  num_ctas: The size of thread blocks per cluster to be used on GPUs with
 	    compute capabilities >= 9.0. It must be less or equal to 8.
+	  compute_capability: The compute capability of the target GPU. If None,
+	    it will be determined automatically from the current device.
+	  enable_fp_fusion: Whether to enable fusion of floating point operations
+	    during compilation, which may improve performance at the cost of
+	    strict IEEE compliance.
 	  debug: Prints out intermediate IRs if True for debugging purposes.
 	  serialized_metadata: Arbitrary metadata that will be added into the
-	    serialized kernel call.
-	  device (int): device id in current process to compile triton kernel on
+	    serialized kernel call as a binary blob. Useful for passing additional
+	    information through the XLA compilation boundary that can be accessed
+	    during runtime.
+	  device: Device ID in current process to compile the Triton kernel for.
+	    This is important when targeting a specific GPU in a multi-GPU setup.
 	  **metaparams: Additional keyword arguments that will be provided to a `grid`
 	    (if it is a function) and to the Triton kernel as `constexpr` arguments.
+	    These are typically used to pass specialized configuration parameters
+	    to the kernel, such as block_size or other tuning variables.
 
 	Returns:
-	  Outputs from the Triton kernel.
+	  Outputs from the Triton kernel. The number and shape of outputs are
+	  determined by the `out_shape` parameter.
 	"""
 	if not CAN_USE_TRITON:
 		raise ValueError("`triton_call` is only available when `triton` is installed.")
@@ -766,6 +1142,7 @@ def triton_call(
 	)
 	flat_args, _ = tree_util.tree_flatten(args)
 	flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
+
 	array_args = []
 	scalar_args = []
 	for i, arg in enumerate(flat_args):
@@ -775,26 +1152,86 @@ def triton_call(
 			scalar_args.append((i, get_triton_type(arg), float(arg)))
 		else:
 			array_args.append(arg)
+
 	if input_output_aliases is None:
 		input_output_aliases = {}
-	out_flat = triton_kernel_call_p.bind(
-		*array_args,
-		fn=kernel,
-		scalar_args=tuple(scalar_args),
-		name=name,
-		custom_call_target_name=custom_call_target_name,
-		out_shapes=tuple(flat_out_shapes),
-		grid=grid,
-		num_warps=num_warps,
-		num_stages=num_stages,
-		num_ctas=num_ctas,
-		compute_capability=compute_capability,
-		enable_fp_fusion=enable_fp_fusion,
-		input_output_aliases=tuple(input_output_aliases.items()),
-		zeroed_outputs=zeroed_outputs,
-		debug=debug,
-		serialized_metadata=serialized_metadata,
-		device=device,
-		**metaparams,
-	)
+
+	if triton.runtime.driver.active.get_current_target().backend != "cpu":
+		out_flat = triton_kernel_call_p.bind(
+			*array_args,
+			fn=kernel,
+			scalar_args=tuple(scalar_args),
+			name=name,
+			custom_call_target_name=custom_call_target_name,
+			out_shapes=tuple(flat_out_shapes),
+			grid=grid,
+			num_warps=num_warps,
+			num_stages=num_stages,
+			num_ctas=num_ctas,
+			compute_capability=compute_capability,
+			enable_fp_fusion=enable_fp_fusion,
+			input_output_aliases=tuple(input_output_aliases.items()),
+			zeroed_outputs=zeroed_outputs,
+			debug=debug,
+			serialized_metadata=serialized_metadata,
+			device=device,
+			**metaparams,
+		)
+	else:
+		if isinstance(kernel, autotuner.Autotuner):
+			for config in kernel.configs:
+				if config.pre_hook is not None:
+					raise NotImplementedError("`pre_hook` is not supported")
+
+		class Pointer:
+			def __init__(self, x):
+				self.x = x
+				self.dtype = x.dtype
+
+			def data_ptr(self):
+				return self.x.unsafe_buffer_pointer()
+
+		def to_triton_arg(arg):
+			if arg.ndim == 0:
+				dtypes = {
+					jnp.bool.dtype: bool,
+					jnp.int32.dtype: int,
+					jnp.int64.dtype: int,
+					jnp.float32.dtype: float,
+					jnp.float64.dtype: float,
+				}
+				if arg.dtype not in dtypes:
+					raise ValueError(f"Invalid argument {arg} with type {arg.dtype}.")
+				return dtypes[arg.dtype](arg)
+			else:
+				return Pointer(arg)
+
+		def callback(flat_args, outputs):
+			kernel[lambda meta: normalize_grid(grid, metaparams | meta)](
+				*map(to_triton_arg, flat_args),
+				*map(Pointer, outputs),
+				**metaparams,
+			)
+			return outputs
+
+		config_zeroed_outputs = zeroed_outputs
+		if callable(zeroed_outputs):
+			config_zeroed_outputs = config_zeroed_outputs(metaparams)
+
+		output_input_aliases = {}
+		for input_idx, output_idx in input_output_aliases.items():
+			if output_idx in output_input_aliases:
+				raise NotImplementedError(
+					"Multiple inputs aliased to the same output is not supported."
+				)
+			output_input_aliases[output_idx] = flat_args[input_idx]
+			if output_idx in config_zeroed_outputs:
+				flat_args[input_idx] = flat_args[input_idx].at[:].set(0)
+
+		out_shapes = tuple(flat_out_shapes)
+		outputs = [
+			output_input_aliases.get(i, jnp.zeros(shape.shape, shape.dtype))
+			for i, shape in enumerate(out_shapes)
+		]
+		out_flat = jax.pure_callback(callback, out_shapes, flat_args, outputs)
 	return tree_util.tree_unflatten(out_tree, out_flat)

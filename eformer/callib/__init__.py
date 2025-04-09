@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .triton_call import (
-	cdiv,
-	next_power_of_2,
-	strides_from_shape,
-	triton_call,
-)
+from .triton_call import cdiv, next_power_of_2, strides_from_shape, triton_call
 
-__all__ = (
-	"cdiv",
-	"next_power_of_2",
-	"strides_from_shape",
-	"triton_call",
-)
+__all__ = ("cdiv", "next_power_of_2", "strides_from_shape", "triton_call")
