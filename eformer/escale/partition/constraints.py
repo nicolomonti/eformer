@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import dataclasses
 import os
 import re
@@ -160,35 +159,262 @@ def get_names_from_partition_spec(
 
 def with_sharding_constraint(
 	arr: jnp.ndarray,
-	sharding: tp.Dict[str, tp.Union[PartitionSpec, NamedSharding]],
+	sharding: tp.Union[PartitionSpec, NamedSharding],
 ) -> jnp.ndarray:
 	"""
-	Apply sharding constraints if axis names are present in the current mesh.
+	Apply sharding constraints with automatic correction based on array shape and mesh.
 
-	This is a smarter version of `jax.lax.with_sharding_constraint`. It only applies the
-	sharding constraint if all the axis names specified in the `partition_specs` are
-	present in the current JAX mesh.
+	This function takes a JAX array and a sharding specification (PartitionSpec or
+	NamedSharding). It attempts to apply the sharding, but first checks if the
+	specification is compatible with the array's shape and the current mesh configuration.
+
+	If an axis specified in the PartitionSpec:
+	  - Does not exist in the mesh,
+	  - Corresponds to a mesh axis of size 1, or
+	  - Is incompatible with the array's dimension size (not divisible),
+	then that part of the PartitionSpec is automatically corrected to None, effectively
+	preventing sharding along that dimension.
 
 	Args:
-	        arr: The JAX array to apply sharding constraints to.
-	        sharding: A dictionary mapping parameter names to their respective `PartitionSpec`.
+	    arr: The JAX array to apply sharding constraints to.
+	    sharding: The desired sharding specification (PartitionSpec or NamedSharding).
 
 	Returns:
-	        The JAX array with sharding constraints applied (if applicable).
+	    The JAX array with potentially corrected sharding constraints applied.
 	"""
-	if isinstance(arr, (jax.Array, jnp.ndarray)):
-		if isinstance(sharding, NamedSharding):
-			mesh = sharding.mesh
-			sharding = sharding.spec
+	if not isinstance(arr, (jax.Array, jnp.ndarray)):
+		return arr
+	if isinstance(sharding, NamedSharding):
+		mesh = sharding.mesh
+		original_spec = sharding.spec
+	elif isinstance(sharding, PartitionSpec):
+		mesh = get_incontext_mesh(False)
+		original_spec = sharding
+	else:
+		raise TypeError(f"Unsupported sharding type: {type(sharding)}")
+
+	if mesh.empty() if callable(mesh.empty) else mesh.empty:
+		if LOG_SHARDING_MOVE:
+			warnings.warn(
+				"Attempted to apply sharding constraint with an empty mesh. Constraint ignored.",
+				stacklevel=1,
+			)
+		return arr
+
+	if len(original_spec) == 0:
+		return arr
+	spec_tuple = tuple(original_spec)
+	if len(spec_tuple) < arr.ndim:
+		spec_tuple += (None,) * (arr.ndim - len(spec_tuple))
+	elif len(spec_tuple) > arr.ndim:
+		if LOG_SHARDING_MOVE:
+			warnings.warn(
+				f"PartitionSpec length ({len(spec_tuple)}) exceeds array rank ({arr.ndim}). "
+				f"Truncating spec: {original_spec} -> {spec_tuple[: arr.ndim]}",
+				stacklevel=1,
+			)
+		spec_tuple = spec_tuple[: arr.ndim]
+
+	corrected_spec_list = list(spec_tuple)
+	mesh_axis_names = set(mesh.axis_names)
+
+	for i, axis_spec in enumerate(spec_tuple):
+		if axis_spec is None:
+			continue
+
+		current_axis_names = []
+		if isinstance(axis_spec, str):
+			current_axis_names.append(axis_spec)
+		elif isinstance(axis_spec, tuple):
+			current_axis_names.extend(axis_spec)
 		else:
-			mesh = None
-		if mesh is None:
-			mesh = get_incontext_mesh()
-		axis_names = get_names_from_partition_spec(sharding)
-		if names_in_current_mesh(*axis_names):
-			with mesh or contextlib.nullcontext():
-				arr = _with_sharding_constraint(arr, sharding)
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Unexpected element type in PartitionSpec at index {i}: {axis_spec}. Treating as None.",
+					stacklevel=1,
+				)
+			corrected_spec_list[i] = None
+			continue
+
+		valid_axis = True
+		total_mesh_size_for_dim = 1
+		for axis_name in current_axis_names:
+			if axis_name not in mesh_axis_names:
+				if LOG_SHARDING_MOVE:
+					warnings.warn(
+						f"Axis name '{axis_name}' in PartitionSpec {original_spec} at index {i} "
+						f"not found in mesh axes {mesh_axis_names}. Correcting dimension {i} to None.",
+						stacklevel=1,
+					)
+				valid_axis = False
+				break
+			total_mesh_size_for_dim *= mesh.shape[axis_name]
+		if not valid_axis:
+			corrected_spec_list[i] = None
+			continue
+		if total_mesh_size_for_dim > 0 and arr.shape[i] % total_mesh_size_for_dim != 0:
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Array dimension {i} (size {arr.shape[i]}) is not divisible by the total mesh "
+					f"size ({total_mesh_size_for_dim}) for axis spec {axis_spec} in {original_spec}. "
+					f"Correcting to None.",
+					stacklevel=1,
+				)
+			corrected_spec_list[i] = None
+			continue
+		elif total_mesh_size_for_dim == 0:
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Total mesh axis size for dimension {i} based on spec {axis_spec} resulted in 0. "
+					f"Correcting to None.",
+					stacklevel=1,
+				)
+			corrected_spec_list[i] = None
+			continue
+	corrected_spec = PartitionSpec(*corrected_spec_list)
+	if not any(axis is not None for axis in corrected_spec):
+		final_spec_to_apply = PartitionSpec()
+	else:
+		final_spec_to_apply = corrected_spec
+	with mesh:
+		arr = _with_sharding_constraint(arr, final_spec_to_apply)
 	return arr
+
+
+def get_corrected_named_sharding(
+	shape: tuple[int, ...],
+	partition_spec: PartitionSpec,
+	raise_mesh_error: bool = True,
+) -> NamedSharding:
+	"""
+	Calculates the corrected PartitionSpec based on shape and mesh, returns NamedSharding.
+
+	This function takes an array shape and a desired PartitionSpec.
+	It determines the effective PartitionSpec by correcting the input based on:
+	  - Axis names present in the current mesh.
+	  - Divisibility of array dimensions by the product of corresponding mesh axis sizes.
+
+	It does NOT correct based on mesh axes having size 1, allowing such axes
+	to persist in the spec if explicitly provided and divisibility holds.
+
+	Args:
+	    shape: The shape of the target JAX array.
+	    partition_spec: The desired PartitionSpec.
+	    raise_mesh_error: If True, raises an error if no mesh is active.
+	                      If False, returns a replicated NamedSharding on an
+	                      empty mesh if no mesh is found.
+
+	Returns:
+	    A NamedSharding object containing the current mesh and the corrected
+	    PartitionSpec.
+
+	Raises:
+	    AssertionError: If no mesh is active and raise_mesh_error is True.
+	"""
+	try:
+		mesh = get_incontext_mesh(raise_error=raise_mesh_error)
+	except AssertionError:
+		if raise_mesh_error:
+			raise
+		else:
+			# Create a dummy empty mesh to return replicated sharding
+			mesh = Mesh(np.empty((0,), dtype=np.int32), [])
+			warnings.warn(
+				"No active mesh found. Returning replicated NamedSharding on empty mesh.",
+				stacklevel=2,
+			)
+			return NamedSharding(mesh, PartitionSpec())  # Replicated on empty mesh
+
+	if mesh.empty():
+		warnings.warn(
+			"Active mesh is empty. Returning replicated NamedSharding.",
+			stacklevel=2,
+		)
+		return NamedSharding(mesh, PartitionSpec())
+
+	ndim = len(shape)
+	original_spec = partition_spec  # Keep original name for clarity
+
+	if len(original_spec) == 0:
+		return NamedSharding(mesh, PartitionSpec())
+
+	spec_tuple = tuple(original_spec)
+	if len(spec_tuple) < ndim:
+		spec_tuple += (None,) * (ndim - len(spec_tuple))
+	elif len(spec_tuple) > ndim:
+		if LOG_SHARDING_MOVE:
+			warnings.warn(
+				f"PartitionSpec length ({len(spec_tuple)}) exceeds array rank ({ndim}). "
+				f"Truncating spec: {original_spec} -> {spec_tuple[:ndim]}",
+				stacklevel=2,
+			)
+		spec_tuple = spec_tuple[:ndim]
+
+	corrected_spec_list = list(spec_tuple)
+	mesh_axis_names = set(mesh.axis_names)
+
+	for i, axis_spec in enumerate(spec_tuple):
+		if axis_spec is None:
+			continue
+
+		current_axis_names = []
+		if isinstance(axis_spec, str):
+			current_axis_names.append(axis_spec)
+		elif isinstance(axis_spec, tuple):
+			current_axis_names.extend(axis_spec)
+		else:
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Unexpected element type in PartitionSpec at index {i}: {axis_spec}. Treating as None.",
+					stacklevel=2,
+				)
+			corrected_spec_list[i] = None
+			continue
+
+		valid_axis = True
+		total_mesh_size_for_dim = 1
+		for axis_name in current_axis_names:
+			if axis_name not in mesh_axis_names:
+				if LOG_SHARDING_MOVE:
+					warnings.warn(
+						f"Axis name '{axis_name}' in PartitionSpec {original_spec} at index {i} "
+						f"not found in mesh axes {mesh_axis_names}. Correcting dimension {i} to None.",
+						stacklevel=2,
+					)
+				valid_axis = False
+				break
+			total_mesh_size_for_dim *= mesh.shape[axis_name]
+		if not valid_axis:
+			corrected_spec_list[i] = None
+			continue
+
+		if total_mesh_size_for_dim > 0 and shape[i] % total_mesh_size_for_dim != 0:
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Array dimension {i} (size {shape[i]}) is not divisible by the total mesh "
+					f"size ({total_mesh_size_for_dim}) for axis spec {axis_spec} in {original_spec}. "
+					f"Correcting to None.",
+					stacklevel=2,
+				)
+			corrected_spec_list[i] = None
+			continue
+		elif total_mesh_size_for_dim == 0:
+			if LOG_SHARDING_MOVE:
+				warnings.warn(
+					f"Total mesh axis size for dimension {i} based on spec {axis_spec} resulted in 0. "
+					f"Correcting to None.",
+					stacklevel=2,
+				)
+			corrected_spec_list[i] = None
+			continue
+
+	corrected_spec = PartitionSpec(*corrected_spec_list)
+	if not any(axis is not None for axis in corrected_spec):
+		final_spec_to_apply = PartitionSpec()
+	else:
+		final_spec_to_apply = corrected_spec
+
+	return NamedSharding(mesh, final_spec_to_apply)
 
 
 def match_partition_rules(
@@ -353,7 +579,7 @@ def get_shardings_with_structure(pytree: tp.Any) -> tp.Any:
 	return extract_sharding_structure(pytree)
 
 
-def get_incontext_mesh() -> Mesh:
+def get_incontext_mesh(raise_error: bool = True) -> Mesh:
 	"""Retrieves the mesh object active in the current execution context.
 
 	This function accesses the physical mesh defined within the thread's
@@ -368,10 +594,10 @@ def get_incontext_mesh() -> Mesh:
 	"""
 	mesh = pxla.thread_resources.env.physical_mesh
 	if mesh.empty() if callable(mesh.empty) else mesh.empty:
-		raise AssertionError("No mesh found under this context manager.")
-	# It might be better practice to raise a more specific exception type
-	# e.g., class NoActiveMeshError(RuntimeError): pass
-	# raise NoActiveMeshError("No mesh found under this context manager.")
+		if raise_error:
+			raise AssertionError("No mesh found under this context manager.")
+		else:
+			return mesh
 	return mesh
 
 
