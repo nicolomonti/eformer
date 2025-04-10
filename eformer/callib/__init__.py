@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .triton_call import (
+from ._triton_call import (
 	cdiv,
 	get_triton_type,
 	next_power_of_2,
@@ -22,7 +22,7 @@ from .triton_call import (
 )
 
 try:
-	from .suppress_triton import (
+	from ._suppress_triton import (
 		enable_all_triton_output,
 		silence_all_triton_output,
 	)

@@ -42,7 +42,7 @@ from jax._src.lib import gpu_triton as triton_kernel_call_lib
 from jax._src.lib.mlir import ir
 from jax.interpreters import mlir, xla
 
-from .suppress_triton import enable_all_triton_output, silence_all_triton_output
+from ._suppress_triton import enable_all_triton_output, silence_all_triton_output
 
 CAN_USE_TRITON = False
 try:

@@ -876,6 +876,28 @@ class PartitionAxis:
 	    Defaults are derived from the standard mesh dimension names but can be
 	    overridden during instantiation. For example, `head_axis` defaults to
 	    the value of `tensor_parallel_axis` ('tp').
+
+	Shorthand Symbols (for `get_partition_spec`):
+	    B: batch_axis
+	    S: sequence_axis
+	    qS: query_sequence_axis
+	    kS: key_sequence_axis
+	    H: hidden_state_axis
+	    h: head_axis
+	    I: mlp_intermediate_axis
+	    V: vocab_axis
+	    E: expert_axis
+	    Eg: expert_gate_axis
+	    D: attention_dim_axis
+	    bS_h: bias_head_sequence_axis
+	    bS_k: bias_key_sequence_axis
+	    _: None (no sharding for this axis)
+	    # Generation mode automatically maps:
+	    # B -> generation_batch_axis (if defined, else uses B)
+	    # qS -> generation_query_sequence_axis (if defined, else uses qS)
+	    # kS -> generation_key_sequence_axis (if defined, else uses kS)
+	    # h -> generation_head_axis (if defined, else uses h)
+	    # D -> generation_attention_dim_axis (if defined, else uses D)
 	"""
 
 	# --- Mesh Dimension Names ---
@@ -901,11 +923,45 @@ class PartitionAxis:
 	bias_key_sequence_axis: AxisType = None
 
 	# --- Generation Specific ---
-	generation_batch_axis: AxisType = None
+	generation_batch_axis: AxisType = ...
 	generation_query_sequence_axis: AxisType = None  # Often length 1, not sharded
 	generation_head_axis: AxisType = ...
 	generation_key_sequence_axis: AxisType = ...
 	generation_attention_dim_axis: AxisType = None
+
+	_SHORTHAND_MAP: tp.Dict[str, str] = dataclasses.field(
+		default_factory=lambda: {
+			"B": "batch_axis",
+			"S": "sequence_axis",
+			"qS": "query_sequence_axis",
+			"kS": "key_sequence_axis",
+			"H": "hidden_state_axis",
+			"h": "head_axis",
+			"I": "mlp_intermediate_axis",
+			"V": "vocab_axis",
+			"E": "expert_axis",
+			"Eg": "expert_gate_axis",
+			"D": "attention_dim_axis",
+			"bS_h": "bias_head_sequence_axis",
+			"bS_k": "bias_key_sequence_axis",
+			"_": None,  # Special symbol for no sharding
+		},
+		init=False,
+		repr=False,
+	)
+
+	# Maps standard symbol -> generation attribute name
+	_GEN_MODE_SUBS: tp.Dict[str, str] = dataclasses.field(
+		default_factory=lambda: {
+			"B": "generation_batch_axis",
+			"qS": "generation_query_sequence_axis",
+			"kS": "generation_key_sequence_axis",
+			"h": "generation_head_axis",
+			"D": "generation_attention_dim_axis",
+		},
+		init=False,
+		repr=False,
+	)
 
 	def __post_init__(self):
 		"""
@@ -952,6 +1008,8 @@ class PartitionAxis:
 		if _operate(self.expert_axis):
 			set_attr(self, "expert_axis", self.expert_parallel_axis)
 
+		if _operate(self.generation_batch_axis):
+			set_attr(self, "generation_batch_axis", self.batch_axis)
 		if _operate(self.generation_head_axis):
 			set_attr(self, "generation_head_axis", self.tensor_parallel_axis)
 
@@ -966,3 +1024,46 @@ class PartitionAxis:
 			val = getattr(self, field.name)
 			if val == Ellipsis:
 				raise ValueError(f"`{field.name}` shouldn't be ellipsis")
+
+	def resolve_spec(self, shorthand: str, generation: bool = False) -> PartitionSpec:
+		"""
+		Generates a PartitionSpec from a shorthand string notation.
+
+		Args:
+		    shorthand: A string of space-separated symbols (e.g., "B qS H").
+		               See class docstring for symbol definitions. Use '_' for None.
+		    generation: If True, attempts to substitute symbols with their
+		              generation-specific counterparts (e.g., 'qS' -> 'generation_query_sequence_axis')
+		              if the corresponding generation attribute is defined (not None).
+
+		Returns:
+		    A jax.sharding.PartitionSpec instance.
+
+		Raises:
+		    ValueError: If an unknown symbol is encountered in the shorthand.
+		"""
+		symbols = shorthand.split()
+		resolved_axes = []
+
+		for symbol in symbols:
+			if symbol == "_":
+				resolved_axes.append(None)
+				continue
+
+			attr_name = self._SHORTHAND_MAP.get(symbol)
+
+			if attr_name is None:
+				raise ValueError(
+					f"Unknown sharding symbol: '{symbol}' in shorthand '{shorthand}'"
+				)
+
+			if generation:
+				gen_attr_name = self._GEN_MODE_SUBS.get(symbol)
+				if gen_attr_name and hasattr(self, gen_attr_name):
+					attr_name = gen_attr_name
+				# else: print(f"Gen Mode: No specific gen axis for {symbol}, using {attr_name}") # Debugging
+
+			mesh_axis = getattr(self, attr_name)
+			resolved_axes.append(mesh_axis)
+
+		return PartitionSpec(*resolved_axes)
