@@ -1117,15 +1117,15 @@ def triton_call(
 	  Outputs from the Triton kernel. The number and shape of outputs are
 	  determined by the `out_shape` parameter.
 	"""
-	if disable_verbose_logging:
-		silence_all_triton_output()
-	else:
-		enable_all_triton_output()
 
 	if not CAN_USE_TRITON:
 		raise ValueError("`triton_call` is only available when `triton` is installed.")
 
 	try:
+		if disable_verbose_logging:
+			silence_all_triton_output()
+		else:
+			enable_all_triton_output()
 		out_shape = tree_util.tree_map(
 			lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
 		)
@@ -1239,6 +1239,10 @@ def triton_call(
 			]
 			out_flat = jax.pure_callback(callback, out_shapes, flat_args, outputs)
 		result = tree_util.tree_unflatten(out_tree, out_flat)
+		if disable_verbose_logging:
+			enable_all_triton_output()
 		return result
 	except Exception:
+		if disable_verbose_logging:
+			enable_all_triton_output()
 		raise
