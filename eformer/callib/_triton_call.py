@@ -1124,8 +1124,6 @@ def triton_call(
 	try:
 		if disable_verbose_logging:
 			silence_all_triton_output()
-		else:
-			enable_all_triton_output()
 		out_shape = tree_util.tree_map(
 			lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
 		)
@@ -1239,10 +1237,7 @@ def triton_call(
 			]
 			out_flat = jax.pure_callback(callback, out_shapes, flat_args, outputs)
 		result = tree_util.tree_unflatten(out_tree, out_flat)
-		if disable_verbose_logging:
-			enable_all_triton_output()
 		return result
 	except Exception:
-		if disable_verbose_logging:
-			enable_all_triton_output()
+		enable_all_triton_output()
 		raise
