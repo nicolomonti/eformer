@@ -1,3 +1,16 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import dataclasses
@@ -17,11 +30,20 @@ FilterSpec = tp.Union[bool, tp.Callable[[tp.Any], bool]]
 IsLeafFn = tp.Callable[[tp.Any], bool]
 
 
-# Cache for type checking to avoid repeated expensive operations
 @lru_cache(maxsize=1024)
-def _is_non_jax_type(typ):
-	"""Check if a type is not JAX-compatible with caching for performance."""
-	# Types that are not compatible with JAX operations
+def _is_non_jax_type(typ: tp.Type) -> bool:
+	"""
+	Checks if a given type is considered a non-JAX type.
+
+	Non-JAX types are typically those that should not be treated as leaves
+	in a PyTree structure by default, such as strings, functions, or types.
+
+	Args:
+	    typ: The type to check.
+
+	Returns:
+	    True if the type is considered a non-JAX type, False otherwise.
+	"""
 	NON_JAX_TYPES = (
 		str,
 		bytes,
@@ -44,285 +66,350 @@ def _is_non_jax_type(typ):
 			if issubclass(typ, non_jax_type):
 				return True
 		except TypeError:
+			# issubclass raises TypeError if typ is not a class (e.g., tp.Callable)
 			pass
 
 	return False
 
 
-def field(pytree_node=True, *, metadata=None, **kwargs):
-	"""Define a field with pytree_node metadata."""
+def field(
+	pytree_node: bool = True, *, metadata: tp.Optional[tp.Dict] = None, **kwargs
+) -> dataclasses.Field:
+	"""
+	A dataclass field replacement that allows specifying whether a field
+	should be treated as a PyTree node.
+
+	Args:
+	    pytree_node: If True (default), the field is treated as a PyTree leaf/node.
+	                 If False, the field is treated as metadata.
+	    metadata: Optional dictionary of metadata to pass to `dataclasses.field`.
+	    **kwargs: Additional keyword arguments passed to `dataclasses.field`.
+
+	Returns:
+	    A dataclasses.Field object.
+	"""
 	metadata_dict = (metadata or {}).copy()
 	metadata_dict["pytree_node"] = pytree_node
 	return dataclasses.field(metadata=metadata_dict, **kwargs)
 
 
-# Pre-compute field information only once per class
 class PyTreeClassInfo:
-	"""Cache for class metadata to avoid repeated computation."""
+	"""Stores metadata about a class registered as a PyTree."""
 
 	__slots__ = ["data_fields", "meta_fields", "frozen", "type_hints"]
 
-	def __init__(self, data_fields, meta_fields, frozen, type_hints):
+	def __init__(
+		self,
+		data_fields: tp.Tuple[str, ...],
+		meta_fields: tp.Tuple[str, ...],
+		frozen: bool,
+		type_hints: tp.Dict[str, tp.Type],
+	):
+		"""
+		Initializes the PyTreeClassInfo.
+
+		Args:
+		    data_fields: Tuple of field names treated as PyTree data (children).
+		    meta_fields: Tuple of field names treated as PyTree metadata.
+		    frozen: Boolean indicating if the original dataclass was frozen.
+		    type_hints: Dictionary mapping field names to their type hints.
+		"""
 		self.data_fields = data_fields
 		self.meta_fields = meta_fields
 		self.frozen = frozen
 		self.type_hints = type_hints
 
 
-# Global registry to store class information
-_CLASS_INFO_REGISTRY = {}
+_CLASS_INFO_REGISTRY: tp.Dict[tp.Type, PyTreeClassInfo] = {}
 
 
 @typing_extensions.dataclass_transform(field_specifiers=(field,))
 def auto_pytree(
-	cls=None,
+	cls: tp.Optional[tp.Type[T]] = None,
 	meta_fields: tp.Optional[tp.Tuple[str, ...]] = None,
 	json_serializable: bool = True,
 	frozen: bool = False,
 ):
 	"""
-	Register a class as a JAX PyTree with performance optimizations.
+	A class decorator that automatically registers a dataclass as a JAX PyTree.
+
+	It uses `dataclasses.dataclass` to make the class a dataclass if it isn't already,
+	determines which fields are data (PyTree children) and which are metadata,
+	and registers the class with `jax.tree_util.register_dataclass`.
+
+	Fields are considered metadata if:
+	- They are explicitly listed in `meta_fields`.
+	- They are marked with `field(pytree_node=False)`.
+	- Their type hint suggests they are non-JAX types (checked by `_is_non_jax_type`).
+
+	Args:
+	    cls: The class to be decorated.
+	    meta_fields: A tuple of field names to always treat as metadata.
+	    json_serializable: If True (default), adds `to_dict`, `from_dict`, `to_json`,
+	                       and `from_json` methods to the class.
+	    frozen: If True, makes the dataclass frozen (immutable). Defaults to False.
+
+	Returns:
+	    The decorated class, registered as a PyTree.
 	"""
 
-	def wrap(cls):
-		# Create a dataclass with the frozen option if specified
-		cls = dataclasses.dataclass(cls, frozen=frozen)
+	def wrap(cls_inner: tp.Type[T]) -> tp.Type[T]:
+		"""Internal wrapper function for the decorator."""
+		cls_inner = dataclasses.dataclass(cls_inner, frozen=frozen)
 
-		# Get all fields that are included in initialization
-		fields = [f for f in dataclasses.fields(cls) if f.init]
+		fields = [f for f in dataclasses.fields(cls_inner) if f.init]
 		all_field_names = tuple(f.name for f in fields)
 
-		# Start with explicitly provided meta fields
 		final_meta_fields: tp.Set[str] = set(meta_fields or ())
 
-		# First pass: check explicit field metadata (highest priority)
+		# Determine meta fields based on field metadata
 		for field_obj in fields:
 			field_metadata = field_obj.metadata
 			if field_metadata and "pytree_node" in field_metadata:
-				# If explicitly marked, respect that marking
 				if field_metadata["pytree_node"] is False:
 					final_meta_fields.add(field_obj.name)
 				elif (
 					field_metadata["pytree_node"] is True and field_obj.name in final_meta_fields
 				):
+					# Explicitly marked as node, overrides meta_fields argument
 					final_meta_fields.remove(field_obj.name)
 
-		# Get type hints once to avoid repeated lookups
-		type_hints = tp.get_type_hints(cls)
+		type_hints = tp.get_type_hints(cls_inner)
 
-		# Second pass: auto-detect non-JAX types, but don't override explicit settings
+		# Determine meta fields based on type hints
 		for field_obj in fields:
 			if field_obj.name in final_meta_fields:
-				continue
+				continue  # Already marked as meta
 
-			# Skip fields with explicit pytree_node=True marking
 			if field_obj.metadata and field_obj.metadata.get("pytree_node") is True:
-				continue
+				continue  # Explicitly marked as node
 
 			field_type = type_hints.get(field_obj.name)
 			if field_type is not None and _is_non_jax_type(field_type):
 				final_meta_fields.add(field_obj.name)
 
-		# All fields not marked as meta are data fields
 		data_fields = tuple(f for f in all_field_names if f not in final_meta_fields)
 		meta_fields_tuple = tuple(final_meta_fields)
 
-		# Optimized replace method using __new__ directly for better performance
-		def fast_replace(self, **kwargs):
-			if not kwargs:  # No changes, return self
+		# Add a replace method similar to flax.struct.replace
+		def _replace(self, **kwargs):
+			"""Creates a new instance with specified fields replaced."""
+			if not kwargs:
 				return self
+			return dataclasses.replace(self, **kwargs)
 
-			# Create new instance directly without re-validation
-			if frozen:
-				# For frozen dataclasses, we need to use the underlying __new__ pattern
-				# to avoid validation errors when setting fields
-				new_values = {**{f: getattr(self, f) for f in all_field_names}, **kwargs}
-				new_instance = cls.__new__(cls)
-				object.__setattr__(new_instance, "__dict__", new_values)
-				return new_instance
-			else:
-				# For non-frozen, dataclasses.replace is fine
-				return dataclasses.replace(self, **kwargs)
+		cls_inner.replace = _replace
 
-		cls.replace = fast_replace
-
-		# Enhanced string representation with length limiting
+		# Add an enhanced repr
 		def enhanced_repr(self):
+			"""Provides a more detailed representation of the object."""
 			cls_name = self.__class__.__name__
 			items = []
 
 			for k, v in self.__dict__.items():
-				if not k.startswith("_"):
+				if not k.startswith("_"):  # Avoid private/internal attributes
 					try:
 						repr_str = str(v)
-						if len(repr_str) > 200:  # Limit long representations
+						if len(repr_str) > 200:  # Truncate long representations
 							repr_str = f"{v.__class__.__name__}(...)"
 						items.append(f"  {k} : {repr_str}")
 					except TypeError:
-						pass
+						# Handle cases where str() might fail
+						items.append(f"  {k} : <unrepresentable>")
 
 			return f"{cls_name}(\n" + "\n".join(items) + "\n)"
 
-		cls.__repr__ = enhanced_repr
-		cls.__str__ = enhanced_repr
+		cls_inner.__repr__ = enhanced_repr
+		cls_inner.__str__ = enhanced_repr  # Use the same for str
 
-		# Store class info in registry for faster lookups
+		# Store class info for potential later use (e.g., serialization)
 		class_info = PyTreeClassInfo(
 			data_fields=data_fields,
 			meta_fields=meta_fields_tuple,
 			frozen=frozen,
 			type_hints=type_hints,
 		)
-		_CLASS_INFO_REGISTRY[cls] = class_info
+		_CLASS_INFO_REGISTRY[cls_inner] = class_info
 
-		# Store pytree metadata for introspection
-		cls.__pytree_meta__ = {
+		# Store basic info directly on the class for easier access if needed
+		cls_inner.__pytree_meta__ = {
 			"data_fields": data_fields,
 			"meta_fields": meta_fields_tuple,
 			"frozen": frozen,
 		}
 
-		# Add JSON serialization capabilities if requested
+		# Add JSON serialization methods if requested
 		if json_serializable:
 
-			def to_dict(self):
-				"""Convert the instance to a dictionary for JSON serialization."""
+			def to_dict(self) -> tp.Dict[str, tp.Any]:
+				"""Serializes the PyTree object to a dictionary."""
 				result = {}
-				for field in dataclasses.fields(self):
-					value = getattr(self, field.name)
-					# Skip Ellipsis values
-					if value is Ellipsis:
+				for field_obj in dataclasses.fields(self):
+					value = getattr(self, field_obj.name)
+					if value is Ellipsis:  # Skip Ellipsis sentinel values
 						continue
-					# Convert tuples to lists for JSON compatibility
+					# Basic type handling for JSON compatibility
 					if isinstance(value, tuple):
-						result[field.name] = list(value)
-					# Handle None values
+						result[field_obj.name] = list(value)  # Convert tuples to lists
 					elif value is None:
-						result[field.name] = None
-					# Try to convert other objects that might have to_dict
+						result[field_obj.name] = None
 					elif hasattr(value, "to_dict") and callable(value.to_dict):
-						result[field.name] = value.to_dict()
+						# Recursively call to_dict if available
+						result[field_obj.name] = value.to_dict()
 					else:
-						# For primitive types or those without to_dict method
+						# Attempt direct JSON serialization, fallback to str
 						try:
-							# Check if value is JSON serializable
-							json.dumps(value)
-							result[field.name] = value
+							json.dumps(value)  # Check if serializable
+							result[field_obj.name] = value
 						except (TypeError, OverflowError):
-							# If not serializable, convert to string representation
-							result[field.name] = str(value)
+							result[field_obj.name] = str(value)
 				return result
 
-			cls.to_dict = to_dict
+			cls_inner.to_dict = to_dict
 
 			@classmethod
-			def from_dict(cls, data):
-				"""Create an instance from a dictionary (deserialization)."""
-				# Process the data to convert lists back to tuples where needed
+			def from_dict(cls_inner_classmethod: tp.Type[T], data: tp.Dict[str, tp.Any]) -> T:
+				"""Deserializes a dictionary into a PyTree object."""
 				processed_data = {}
 
-				# Get cached type hints for fields to handle conversion
-				class_info = _CLASS_INFO_REGISTRY.get(cls)
-				type_hints = class_info.type_hints if class_info else tp.get_type_hints(cls)
+				# Retrieve type hints for potential type conversions
+				class_info_local = _CLASS_INFO_REGISTRY.get(cls_inner_classmethod)
+				type_hints_local = (
+					class_info_local.type_hints
+					if class_info_local
+					else tp.get_type_hints(cls_inner_classmethod)
+				)
 
-				for field in dataclasses.fields(cls):
-					field_name = field.name
+				for field_obj in dataclasses.fields(cls_inner_classmethod):
+					field_name = field_obj.name
 					if field_name not in data:
-						# Skip missing fields
-						continue
+						continue  # Skip fields not present in the data
 
 					value = data[field_name]
-					field_type = type_hints.get(field_name)
+					field_type = type_hints_local.get(field_name)
 
-					# Convert lists back to tuples if the field type is a tuple
+					# Handle specific type conversions (e.g., list back to tuple)
 					if (
 						value is not None
 						and isinstance(value, list)
 						and field_type is not None
-						and tp.get_origin(field_type) is tuple
+						and tp.get_origin(field_type) is tuple  # Check if original type was tuple
 					):
 						processed_data[field_name] = tuple(value)
+					# TODO: Add more robust deserialization for nested PyTrees if needed
+					# elif hasattr(field_type, "from_dict") and callable(field_type.from_dict):
+					#     processed_data[field_name] = field_type.from_dict(value)
 					else:
 						processed_data[field_name] = value
 
-				return cls(**processed_data)
+				return cls_inner_classmethod(**processed_data)
 
-			cls.from_dict = from_dict
+			cls_inner.from_dict = from_dict
 
-			def to_json(self, **kwargs):
-				"""Convert the instance to a JSON string."""
+			def to_json(self, **kwargs) -> str:
+				"""Serializes the PyTree object to a JSON string."""
 				return json.dumps(self.to_dict(), **kwargs)
 
-			cls.to_json = to_json
+			cls_inner.to_json = to_json
 
 			@classmethod
-			def from_json(cls, json_str):
-				"""Create an instance from a JSON string."""
+			def from_json(cls_inner_classmethod: tp.Type[T], json_str: str) -> T:
+				"""Deserializes a JSON string into a PyTree object."""
 				data = json.loads(json_str)
-				return cls.from_dict(data)
+				return cls_inner_classmethod.from_dict(data)
 
-			cls.from_json = from_json
+			cls_inner.from_json = from_json
 
-			# Custom JSON encoder support (only patch once)
+			# Patch json.JSONEncoder to handle PyTree objects by default
 			if not hasattr(json.JSONEncoder, "_pytree_patched"):
 				original_default = json.JSONEncoder.default
 
 				@wraps(original_default)
-				def json_default(self, obj):
+				def json_default(encoder_self, obj):
+					"""JSON encoder default method patched to handle PyTrees."""
 					if hasattr(obj, "to_dict") and callable(obj.to_dict):
 						return obj.to_dict()
-					return original_default(self, obj)
+					return original_default(encoder_self, obj)
 
 				json.JSONEncoder.default = json_default
-				json.JSONEncoder._pytree_patched = True
+				json.JSONEncoder._pytree_patched = True  # Mark as patched
 
-		# Register with JAX tree utilities
+		# Register the class with JAX
 		return tu.register_dataclass(
-			cls,
+			cls_inner,
 			data_fields=data_fields,
 			meta_fields=meta_fields_tuple,
 		)
 
-	# Handle both @auto_pytree and @auto_pytree(meta_fields=(...))
+	# Handle decorator usage with or without arguments
 	if cls is None:
 		return wrap
 	return wrap(cls)
 
 
-# Base implementation for PyTree - not a dataclass itself
 class _PyTreeNodeBase:
-	"""Base implementation for PyTree classes."""
+	"""Base class providing a default `replace` method."""
 
-	def replace(self, **kwargs):
-		"""Return a new instance with the specified fields replaced with new values."""
+	def replace(self: T, **kwargs) -> T:
+		"""Creates a new instance with specified fields replaced.
+
+		This method is typically overridden by the `auto_pytree` decorator
+		if the class is decorated directly. It serves as a fallback or
+		base for classes inheriting from PyTree/FrozenPyTree.
+
+		Args:
+		    **kwargs: Field names and their new values.
+
+		Returns:
+		    A new instance of the class with the specified fields updated.
+		"""
 		return dataclasses.replace(self, **kwargs)
 
 
 @typing_extensions.dataclass_transform(field_specifiers=(field,))
 class PyTree(_PyTreeNodeBase):
-	"""Base class for dataclasses that should act like a JAX pytree node."""
+	"""
+	Base class for mutable PyTree dataclasses.
+
+	Inheriting from this class automatically applies the `auto_pytree`
+	decorator to the subclass, registering it as a JAX PyTree.
+	"""
 
 	def __init_subclass__(
 		cls,
 		*,
-		frozen: bool = False,
+		frozen: bool = False,  # Keep frozen option, though typically False for PyTree
 		json_serializable: bool = True,
 		meta_fields: tp.Optional[tp.Tuple[str, ...]] = None,
 		**kwargs,
 	):
-		"""Initialize a PyTree subclass."""
+		"""
+		Applies `auto_pytree` to subclasses.
+
+		Args:
+		    frozen: If True, makes the dataclass frozen. Defaults to False.
+		    json_serializable: If True (default), adds JSON serialization methods.
+		    meta_fields: Tuple of field names to always treat as metadata.
+		    **kwargs: Additional arguments passed to `auto_pytree`.
+		"""
+		super().__init_subclass__(**kwargs)
 		auto_pytree(
 			cls,
 			meta_fields=meta_fields,
 			json_serializable=json_serializable,
-			frozen=frozen,
-			**kwargs,
+			frozen=frozen,  # Pass frozen status
 		)
 
 
 @typing_extensions.dataclass_transform(field_specifiers=(field,))
 class FrozenPyTree(_PyTreeNodeBase):
-	"""Immutable base class for JAX pytree nodes."""
+	"""
+	Base class for immutable (frozen) PyTree dataclasses.
+
+	Inheriting from this class automatically applies the `auto_pytree`
+	decorator with `frozen=True` to the subclass, registering it as a
+	frozen JAX PyTree.
+	"""
 
 	def __init_subclass__(
 		cls,
@@ -331,11 +418,18 @@ class FrozenPyTree(_PyTreeNodeBase):
 		meta_fields: tp.Optional[tp.Tuple[str, ...]] = None,
 		**kwargs,
 	):
-		"""Initialize a FrozenPyTree subclass."""
+		"""
+		Applies `auto_pytree` with frozen=True to subclasses.
+
+		Args:
+		    json_serializable: If True (default), adds JSON serialization methods.
+		    meta_fields: Tuple of field names to always treat as metadata.
+		    **kwargs: Additional arguments passed to `auto_pytree`.
+		"""
+		super().__init_subclass__(**kwargs)
 		auto_pytree(
 			cls,
 			meta_fields=meta_fields,
 			json_serializable=json_serializable,
-			frozen=True,
-			**kwargs,
+			frozen=True,  # Ensure subclasses are frozen
 		)
