@@ -32,6 +32,7 @@ import jax._src
 import jax._src.lax
 import jax.core
 import jax.core as core
+import jax.extend
 import jax.extend.linear_util as lu
 import jax.numpy as jnp
 import jax.tree_util as tu
@@ -777,7 +778,7 @@ def _(
 	**kwargs,
 ):
 	del kwargs
-	fun = use_implicit(core.jaxpr_as_fun(jaxpr))
+	fun = use_implicit(jax.extend.core.jaxpr_as_fun(jaxpr))
 	if inline:
 		return fun(*args)
 	else:
