@@ -193,7 +193,7 @@ def with_sharding_constraint(
 	else:
 		raise TypeError(f"Unsupported sharding type: {type(sharding)}")
 
-	if mesh.empty() if callable(mesh.empty) else mesh.empty:
+	if mesh.empty if callable(mesh.empty) else mesh.empty:
 		if LOG_SHARDING_MOVE:
 			warnings.warn(
 				"Attempted to apply sharding constraint with an empty mesh. Constraint ignored.",
@@ -325,7 +325,7 @@ def get_corrected_named_sharding(
 			)
 			return NamedSharding(mesh, PartitionSpec())  # Replicated on empty mesh
 
-	if mesh.empty():
+	if mesh.empty:
 		warnings.warn(
 			"Active mesh is empty. Returning replicated NamedSharding.",
 			stacklevel=2,
@@ -590,10 +590,10 @@ def get_incontext_mesh(raise_error: bool = True) -> Mesh:
 
 	Raises:
 	    AssertionError: If no mesh is found in the current context
-	                    (i.e., mesh.empty() is True).
+	                    (i.e., mesh.empty is True).
 	"""
 	mesh = pxla.thread_resources.env.physical_mesh
-	if mesh.empty() if callable(mesh.empty) else mesh.empty:
+	if mesh.empty if callable(mesh.empty) else mesh.empty:
 		if raise_error:
 			raise AssertionError("No mesh found under this context manager.")
 		else:

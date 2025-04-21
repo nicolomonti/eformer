@@ -5,4 +5,5 @@ Callib
    :maxdepth: 2
 
    callib___init__
-   callib_triton_call
+   callib__suppress_triton
+   callib__triton_call

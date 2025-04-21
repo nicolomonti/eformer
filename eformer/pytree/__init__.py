@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._pytree import FrozenPyTree, PyTree, auto_pytree, field
+from ._pytree import FrozenPyTree, PyTree, auto_pytree
+from ._smart_tree import dataclass, field, xTree
 from ._tree_util import is_array, is_array_like, is_flatten, named_tree_map
 
 __all__ = (
 	"FrozenPyTree",
 	"PyTree",
 	"auto_pytree",
+	"xTree",
 	"field",
+	"dataclass",
 	"is_array",
 	"is_array_like",
 	"is_flatten",
