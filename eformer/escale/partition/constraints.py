@@ -420,6 +420,7 @@ def get_corrected_named_sharding(
 def match_partition_rules(
 	rules: tp.List[tp.Tuple[str, PartitionSpec]],
 	tree: tp.Dict,
+	min_size: tp.Optional[int] = 0,
 ) -> tp.Dict:
 	"""
 	Match partition rules to parameters based on their names.
@@ -439,6 +440,7 @@ def match_partition_rules(
 	        with the corresponding `PartitionSpec` based on matching rules.
 	"""
 
+	min_size = min_size if min_size is not None else MIN_SHARDING_SIZE
 	def get_partition_spec(name: str, leaf: jnp.ndarray) -> PartitionSpec:
 		"""
 		Determine the partition spec for a parameter based on its name.
@@ -453,7 +455,7 @@ def match_partition_rules(
 
 		for rule, ps in rules:
 			if re.search(rule, name) is not None:
-				if size < MIN_SHARDING_SIZE:
+				if size < min_size:
 					if LOG_SHARDING_MOVE:
 						warnings.warn(
 							f"PartitionSpec Related to {name} was safer and faster being local array.",

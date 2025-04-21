@@ -1,12 +1,3 @@
-"""
-This module provides utilities for creating JAX PyTree-compatible dataclasses
-with enhanced serialization capabilities.
-
-It includes a custom `dataclass` decorator that automatically registers
-dataclasses with JAX's tree utility and provides serialization/deserialization
-helpers. It also defines a base class `xTree` for convenience.
-"""
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
