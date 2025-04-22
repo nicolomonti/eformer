@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import dataclasses
 import os
 import re
 import typing as tp
@@ -29,7 +28,8 @@ from jax.interpreters import pxla
 from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from eformer.pytree import auto_pytree, named_tree_map
+from eformer.common_types import AxisType
+from eformer.pytree import named_tree_map
 
 MIN_SHARDING_SIZE = int(os.environ.get("MIN_SHARDING_SIZE", "16384"))
 LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
@@ -38,8 +38,6 @@ LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
 	"1",
 	"on",
 ]
-
-AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str, tp.Any]]
 
 
 def names_in_current_mesh(*names: str) -> bool:
@@ -441,6 +439,7 @@ def match_partition_rules(
 	"""
 
 	min_size = min_size if min_size is not None else MIN_SHARDING_SIZE
+
 	def get_partition_spec(name: str, leaf: jnp.ndarray) -> PartitionSpec:
 		"""
 		Determine the partition spec for a parameter based on its name.
@@ -855,217 +854,3 @@ def get_partition_spec(tree):
 			)
 
 	return jax.tree_util.tree_map(_call, tree)
-
-
-@auto_pytree
-class PartitionAxis:
-	"""
-	Configuration for partitioning model axes across a device mesh.
-
-	Defines the mesh dimension names for standard parallelism strategies and maps
-	logical model axes to these dimensions. Allows overriding defaults.
-
-	Mesh Dimensions:
-	    data_parallel_axis: Name for data parallel mesh dim. Default: "dp".
-	    fully_sharded_data_parallel_axis: Name for FSDP mesh dim. Default: "fsdp".
-	    tensor_parallel_axis: Name for tensor parallel mesh dim. Default: "tp".
-	    sequence_parallel_axis: Name for sequence parallel mesh dim. Default: "sp".
-	    expert_parallel_axis: Name for expert parallel mesh dim (MoE). Default: "ep".
-
-	Logical Model Axes:
-	    Maps logical tensor axes (like batch, sequence, hidden) to one or more
-	    mesh dimension names defined above, or None if not partitioned.
-	    Defaults are derived from the standard mesh dimension names but can be
-	    overridden during instantiation. For example, `head_axis` defaults to
-	    the value of `tensor_parallel_axis` ('tp').
-
-	Shorthand Symbols (for `get_partition_spec`):
-	    B: batch_axis
-	    S: sequence_axis
-	    qS: query_sequence_axis
-	    kS: key_sequence_axis
-	    H: hidden_state_axis
-	    h: head_axis
-	    I: mlp_intermediate_axis
-	    V: vocab_axis
-	    E: expert_axis
-	    Eg: expert_gate_axis
-	    D: attention_dim_axis
-	    bS_h: bias_head_sequence_axis
-	    bS_k: bias_key_sequence_axis
-	    _: None (no sharding for this axis)
-	    # Generation mode automatically maps:
-	    # B -> generation_batch_axis (if defined, else uses B)
-	    # qS -> generation_query_sequence_axis (if defined, else uses qS)
-	    # kS -> generation_key_sequence_axis (if defined, else uses kS)
-	    # h -> generation_head_axis (if defined, else uses h)
-	    # D -> generation_attention_dim_axis (if defined, else uses D)
-	"""
-
-	# --- Mesh Dimension Names ---
-	data_parallel_axis: str = "dp"
-	fully_sharded_data_parallel_axis: str = "fsdp"
-	tensor_parallel_axis: str = "tp"
-	sequence_parallel_axis: str = "sp"
-	expert_parallel_axis: str = "ep"
-
-	batch_axis: AxisType = ...
-	sequence_axis: AxisType = ...
-	query_sequence_axis: AxisType = ...
-	head_axis: AxisType = ...
-	key_sequence_axis: AxisType = ...
-	hidden_state_axis: AxisType = ...
-	mlp_intermediate_axis: AxisType = ...
-	vocab_axis: AxisType = ...
-	expert_axis: AxisType = ...
-	expert_gate_axis: AxisType = None
-
-	attention_dim_axis: AxisType = None  # Usually not partitioned
-	bias_head_sequence_axis: AxisType = None
-	bias_key_sequence_axis: AxisType = None
-
-	# --- Generation Specific ---
-	generation_batch_axis: AxisType = ...
-	generation_query_sequence_axis: AxisType = None  # Often length 1, not sharded
-	generation_head_axis: AxisType = ...
-	generation_key_sequence_axis: AxisType = ...
-	generation_attention_dim_axis: AxisType = None
-
-	_SHORTHAND_MAP: tp.Dict[str, str] = dataclasses.field(
-		default_factory=lambda: {
-			"B": "batch_axis",
-			"S": "sequence_axis",
-			"qS": "query_sequence_axis",
-			"kS": "key_sequence_axis",
-			"H": "hidden_state_axis",
-			"h": "head_axis",
-			"I": "mlp_intermediate_axis",
-			"V": "vocab_axis",
-			"E": "expert_axis",
-			"Eg": "expert_gate_axis",
-			"D": "attention_dim_axis",
-			"bS_h": "bias_head_sequence_axis",
-			"bS_k": "bias_key_sequence_axis",
-			"_": None,  # Special symbol for no sharding
-		},
-		init=False,
-		repr=False,
-	)
-
-	# Maps standard symbol -> generation attribute name
-	_GEN_MODE_SUBS: tp.Dict[str, str] = dataclasses.field(
-		default_factory=lambda: {
-			"B": "generation_batch_axis",
-			"qS": "generation_query_sequence_axis",
-			"kS": "generation_key_sequence_axis",
-			"h": "generation_head_axis",
-			"D": "generation_attention_dim_axis",
-		},
-		init=False,
-		repr=False,
-	)
-
-	def __post_init__(self):
-		"""
-		Resolve default partitioning strategies after initialization.
-
-		Since the dataclass is frozen, we need to use object.__setattr__ to modify fields.
-		"""
-
-		# Helper to set attribute on frozen dataclass
-		def set_attr(obj, name, value):
-			object.__setattr__(obj, name, value)
-
-		def _operate(val):
-			return val is Ellipsis
-
-		# Resolve fields that need defaults
-		if _operate(self.batch_axis):
-			# Default batch sharding uses both FSDP and DP dimensions
-
-			_shardin = (self.fully_sharded_data_parallel_axis, self.data_parallel_axis)
-			set_attr(self, "batch_axis", _shardin)
-
-		if _operate(self.sequence_axis):
-			set_attr(self, "sequence_axis", self.sequence_parallel_axis)
-
-		if _operate(self.query_sequence_axis):
-			set_attr(self, "query_sequence_axis", self.sequence_parallel_axis)
-
-		if _operate(self.head_axis):
-			set_attr(self, "head_axis", self.tensor_parallel_axis)
-
-		if _operate(self.key_sequence_axis):
-			set_attr(self, "key_sequence_axis", self.sequence_parallel_axis)
-
-		if _operate(self.hidden_state_axis):
-			set_attr(self, "hidden_state_axis", self.tensor_parallel_axis)
-
-		if _operate(self.mlp_intermediate_axis):
-			set_attr(self, "mlp_intermediate_axis", self.tensor_parallel_axis)
-
-		if _operate(self.vocab_axis):
-			set_attr(self, "vocab_axis", self.tensor_parallel_axis)
-
-		if _operate(self.expert_axis):
-			set_attr(self, "expert_axis", self.expert_parallel_axis)
-
-		if _operate(self.generation_batch_axis):
-			set_attr(self, "generation_batch_axis", self.batch_axis)
-		if _operate(self.generation_head_axis):
-			set_attr(self, "generation_head_axis", self.tensor_parallel_axis)
-
-		if _operate(self.generation_key_sequence_axis):
-			set_attr(self, "generation_key_sequence_axis", self.sequence_parallel_axis)
-
-		self._safety_check()
-
-	def _safety_check(self):
-		"""Ensures no essential attributes are left uninitialized (as Ellipsis)."""
-		for field in dataclasses.fields(self):
-			val = getattr(self, field.name)
-			if val == Ellipsis:
-				raise ValueError(f"`{field.name}` shouldn't be ellipsis")
-
-	def resolve_spec(self, shorthand: str, generation: bool = False) -> PartitionSpec:
-		"""
-		Generates a PartitionSpec from a shorthand string notation.
-
-		Args:
-		    shorthand: A string of space-separated symbols (e.g., "B qS H").
-		               See class docstring for symbol definitions. Use '_' for None.
-		    generation: If True, attempts to substitute symbols with their
-		              generation-specific counterparts (e.g., 'qS' -> 'generation_query_sequence_axis')
-		              if the corresponding generation attribute is defined (not None).
-
-		Returns:
-		    A jax.sharding.PartitionSpec instance.
-
-		Raises:
-		    ValueError: If an unknown symbol is encountered in the shorthand.
-		"""
-		symbols = shorthand.split()
-		resolved_axes = []
-
-		for symbol in symbols:
-			if symbol == "_":
-				resolved_axes.append(None)
-				continue
-
-			attr_name = self._SHORTHAND_MAP.get(symbol)
-
-			if attr_name is None:
-				raise ValueError(
-					f"Unknown sharding symbol: '{symbol}' in shorthand '{shorthand}'"
-				)
-
-			if generation:
-				gen_attr_name = self._GEN_MODE_SUBS.get(symbol)
-				if gen_attr_name and hasattr(self, gen_attr_name):
-					attr_name = gen_attr_name
-				# else: print(f"Gen Mode: No specific gen axis for {symbol}, using {attr_name}") # Debugging
-
-			mesh_axis = getattr(self, attr_name)
-			resolved_axes.append(mesh_axis)
-
-		return PartitionSpec(*resolved_axes)

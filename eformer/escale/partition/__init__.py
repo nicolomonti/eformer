@@ -22,7 +22,6 @@ from .auto_spec import (
 	vrn_auto_partition_spec,
 )
 from .constraints import (
-	PartitionAxis,
 	analyze_sharding_strategy,
 	create_pattern_based_partition_spec,
 	extract_sharding_structure,
@@ -41,9 +40,18 @@ from .constraints import (
 	names_in_current_mesh,
 	with_sharding_constraint,
 )
+from .manager import (
+	PartitionAxis,
+	PartitionManager,
+	get_current_partition_manager,
+	get_partition_manager,
+)
 
 __all__ = (
 	"PartitionAxis",
+	"PartitionManager",
+	"get_current_partition_manager",
+	"get_partition_manager",
 	"analyze_sharding_strategy",
 	"create_pattern_based_partition_spec",
 	"extract_sharding_structure",
