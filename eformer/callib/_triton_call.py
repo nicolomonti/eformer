@@ -1058,7 +1058,7 @@ def triton_call(
 	debug: bool = False,
 	serialized_metadata: bytes = b"",
 	device: int = 0,
-	disable_verbose_logging: bool = True,
+	disable_verbose_logging: bool = False,
 	**metaparams: Any,
 ) -> Any:
 	"""Calls a Triton kernel with `jax.Array` arguments.

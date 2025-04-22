@@ -145,7 +145,7 @@ class AttnQSharding(DynamicShardingAxes):
 class AttnKVSharding(DynamicShardingAxes):
 	"""Dynamic sharding specification for attention keys/values."""
 
-	axes = [BATCH, KV_LENGTH, HEAD, HEAD_DIM]
+	axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
 	mode = 1  # Infer mode based on the second dimension (sequence length)
 
 
