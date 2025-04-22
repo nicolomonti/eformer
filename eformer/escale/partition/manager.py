@@ -37,6 +37,8 @@ from eformer.common_types import (
 	GENERATION_MODES,
 	HEAD,
 	HEAD_DIM,
+	KV_HEAD,
+	KV_HEAD_DIM,
 	KV_LENGTH,
 	LENGTH,
 	MLP_INTERMEDIATE,
@@ -106,6 +108,7 @@ class PartitionAxis(xTree):
 	sequence_axis: AxisType = NOT_GIVEN
 	query_sequence_axis: AxisType = NOT_GIVEN
 	head_axis: AxisType = NOT_GIVEN
+	kv_head_axis: AxisType = NOT_GIVEN
 	key_sequence_axis: AxisType = NOT_GIVEN
 	hidden_state_axis: AxisType = NOT_GIVEN
 	mlp_intermediate_axis: AxisType = NOT_GIVEN
@@ -114,14 +117,17 @@ class PartitionAxis(xTree):
 	expert_gate_axis: AxisType = None
 
 	attention_dim_axis: AxisType = None
+	attention_kv_dim_axis: AxisType = None
 	bias_head_sequence_axis: AxisType = None
 	bias_key_sequence_axis: AxisType = None
 
 	decode_batch_axis: AxisType = NOT_GIVEN
 	decode_query_sequence_axis: AxisType = None
 	decode_head_axis: AxisType = NOT_GIVEN
+	decode_kv_head_axis: AxisType = NOT_GIVEN
 	decode_key_sequence_axis: AxisType = NOT_GIVEN
 	decode_attention_dim_axis: AxisType = None
+	decode_attention_kv_dim_axis: AxisType = None
 
 	_SEMANTIC_MAP: tp.ClassVar[tp.Dict[str, str]] = {
 		BATCH: "batch_axis",
@@ -130,11 +136,13 @@ class PartitionAxis(xTree):
 		KV_LENGTH: "key_sequence_axis",
 		EMBED: "hidden_state_axis",
 		HEAD: "head_axis",
+		KV_HEAD: "kv_head_axis",
 		MLP_INTERMEDIATE: "mlp_intermediate_axis",
 		VOCAB: "vocab_axis",
 		EXPERT: "expert_axis",
 		EXPERT_GATE: "expert_gate_axis",
 		HEAD_DIM: "attention_dim_axis",
+		KV_HEAD_DIM: "decode_attention_kv_dim_axis",
 		BIAS_HEAD_SEQ: "bias_head_sequence_axis",
 		BIAS_KV_SEQ: "bias_key_sequence_axis",
 		"_": None,  # Represents an unsharded dimension
@@ -149,7 +157,9 @@ class PartitionAxis(xTree):
 		"query_sequence_axis": "decode_query_sequence_axis",
 		"key_sequence_axis": "decode_key_sequence_axis",
 		"head_axis": "decode_head_axis",
+		"kv_head_axis": "decode_kv_head_axis",
 		"attention_dim_axis": "decode_attention_dim_axis",
+		"attention_kv_dim_axis": "decode_attention_kv_dim_axis",
 	}
 	"""
 	Maps standard axis attribute names to their corresponding generation-specific
@@ -186,6 +196,7 @@ class PartitionAxis(xTree):
 		resolve_field("query_sequence_axis", lambda: self.sequence_parallel_axis)
 		# Default qS = S rule
 		resolve_field("head_axis", lambda: self.tensor_parallel_axis)
+		resolve_field("kv_head_axis", lambda: None)
 		resolve_field("key_sequence_axis", lambda: self.sequence_parallel_axis)
 		# Default kS = S rule
 		resolve_field("hidden_state_axis", lambda: self.tensor_parallel_axis)
@@ -196,6 +207,7 @@ class PartitionAxis(xTree):
 		# Resolve generation-specific axis defaults based on standard axes
 		resolve_field("decode_batch_axis", lambda: get_resolved("batch_axis"))
 		resolve_field("decode_head_axis", lambda: get_resolved("head_axis"))
+		resolve_field("decode_kv_head_axis", lambda: get_resolved("kv_head_axis"))
 		resolve_field("decode_key_sequence_axis", lambda: get_resolved("key_sequence_axis"))
 
 		# Ensure all fields are included in resolved_values, even if not NOT_GIVEN

@@ -7,3 +7,4 @@ Partition
    escale_partition___init__
    escale_partition_auto_spec
    escale_partition_constraints
+   escale_partition_manager
