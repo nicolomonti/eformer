@@ -45,6 +45,7 @@ from .manager import (
 	PartitionManager,
 	get_current_partition_manager,
 	get_partition_manager,
+	apply_logical_sharding,
 )
 
 __all__ = (
@@ -69,6 +70,7 @@ __all__ = (
 	"match_partition_rules",
 	"names_in_current_mesh",
 	"with_sharding_constraint",
+	"apply_logical_sharding",
 	"auto_namedsharding",
 	"auto_partition_spec",
 	"auto_shard_array",
