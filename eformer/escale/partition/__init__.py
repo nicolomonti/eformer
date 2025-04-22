@@ -43,16 +43,12 @@ from .constraints import (
 from .manager import (
 	PartitionAxis,
 	PartitionManager,
-	get_current_partition_manager,
-	get_partition_manager,
 	apply_logical_sharding,
 )
 
 __all__ = (
 	"PartitionAxis",
 	"PartitionManager",
-	"get_current_partition_manager",
-	"get_partition_manager",
 	"analyze_sharding_strategy",
 	"create_pattern_based_partition_spec",
 	"extract_sharding_structure",

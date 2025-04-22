@@ -56,6 +56,7 @@ or potentially other types depending on context (though typically str or tuple[s
 """
 
 # String constants representing semantic axis names for partitioning
+EMPTY = "_"
 BATCH = "__BATCH__"
 """Semantic axis name for the batch dimension."""
 LENGTH = "__LENGTH__"

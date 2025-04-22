@@ -20,8 +20,8 @@ It includes the `PartitionAxis` class for defining logical-to-physical axis mapp
 and the `PartitionManager` context manager for applying these rules.
 """
 
-import contextvars
 import dataclasses
+import hashlib
 import typing as tp
 
 import jax
@@ -32,6 +32,7 @@ from eformer.common_types import (
 	BIAS_HEAD_SEQ,
 	BIAS_KV_SEQ,
 	EMBED,
+	EMPTY,
 	EXPERT,
 	EXPERT_GATE,
 	GENERATION_MODES,
@@ -51,9 +52,29 @@ from eformer.common_types import (
 	AxisType,
 	DynamicShardingAxes,
 )
-from eformer.pytree import xTree
+from eformer.pytree import xTree, PyTree
 
 from .constraints import get_corrected_named_sharding, with_sharding_constraint
+
+
+def hash_fn(self) -> int:
+	shu = "".join(
+		str(cu)
+		for cu in self.__dict__.values()
+		if isinstance(cu, (float, int, float, bool, dict, list))
+	)
+	return get_safe_hash_int(shu)
+
+
+def get_safe_hash_int(text, algorithm="md5"):
+	try:
+		text_str = str(text)
+		hash_object = getattr(hashlib, algorithm)(text_str.encode())
+		return int.from_bytes(hash_object.digest(), byteorder="big")
+	except AttributeError as e:
+		raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
+	except Exception as e:
+		raise Exception(f"Error generating hash: {str(e)}") from e
 
 
 class PartitionAxis(xTree):
@@ -145,7 +166,7 @@ class PartitionAxis(xTree):
 		KV_HEAD_DIM: "decode_attention_kv_dim_axis",
 		BIAS_HEAD_SEQ: "bias_head_sequence_axis",
 		BIAS_KV_SEQ: "bias_key_sequence_axis",
-		"_": None,  # Represents an unsharded dimension
+		EMPTY: None,  # Represents an unsharded dimension
 	}
 	"""
 	Maps semantic axis name constants (e.g., BATCH) to their corresponding
@@ -316,22 +337,10 @@ class PartitionAxis(xTree):
 		# Create and return the PartitionSpec tuple
 		return PartitionSpec(*resolved_rules)
 
-
-# Context variable to hold the currently active PartitionManager instance.
-# Defaults to None when no manager is active.
-_CURRENT_PARTITION_MANAGER: contextvars.ContextVar[tp.Optional["PartitionManager"]] = (
-	contextvars.ContextVar("current_partition_manager", default=None)
-)
+	__hash__ = hash_fn
 
 
-# Context variable to hold the last active PartitionManager instance.
-# Useful for retrieving a manager outside of its 'with' block if needed.
-_LAST_PARTITION_MANAGER: contextvars.ContextVar[tp.Optional["PartitionManager"]] = (
-	contextvars.ContextVar("last_partition_manager", default=None)
-)
-
-
-class PartitionManager:
+class PartitionManager(PyTree):
 	"""
 	Context manager for applying sharding constraints using PartitionAxis.
 
@@ -345,31 +354,11 @@ class PartitionManager:
 	           to be used within this context.
 	"""
 
-	def __init__(self, paxis: PartitionAxis):
-		if not isinstance(paxis, PartitionAxis):
-			raise TypeError(f"Expected PartitionAxis, got {type(paxis)}")
-		self.paxis = paxis
-		self._reset_token: tp.Optional[contextvars.Token] = None
-		# Store this instance as the last created manager
-		_LAST_PARTITION_MANAGER.set(self)
+	paxis: PartitionAxis
 
-	def __enter__(self):
-		"""Sets this manager as the active one in the current context."""
-		# Set the context variable and store the token needed for resetting
-		self._reset_token = _CURRENT_PARTITION_MANAGER.set(self)
-		return self
-
-	def __exit__(self, exc_type, exc_value, traceback):
-		"""Resets the context variable to its previous state upon exiting the 'with' block."""
-		if self._reset_token is None:
-			# Should not happen if __enter__ was called correctly
-			raise RuntimeError(
-				"PartitionManager context exited without being properly entered."
-			)
-
-		# Reset the context variable using the stored token
-		_CURRENT_PARTITION_MANAGER.reset(self._reset_token)
-		self._reset_token = None
+	def __post_init__(self):
+		if not isinstance(self.paxis, PartitionAxis):
+			raise TypeError(f"Expected PartitionAxis, got {type(self.paxis)}")
 
 	def shard(
 		self,
@@ -454,56 +443,16 @@ class PartitionManager:
 		"""Representation of the PartitionManager."""
 		return "PartitionManager(...)"
 
-
-def get_current_partition_manager() -> PartitionManager:
-	"""
-	Retrieves the currently active PartitionManager from the context.
-
-	This function accesses the context variable `_CURRENT_PARTITION_MANAGER`.
-
-	Returns:
-	    PartitionManager: The active PartitionManager instance.
-
-	Raises:
-	    LookupError: If called outside of an active `with PartitionManager(...)` context.
-	"""
-	manager = _CURRENT_PARTITION_MANAGER.get()
-	if manager is None:
-		raise LookupError(
-			"Cannot get partition manager: Not currently within a "
-			"`with PartitionManager(...)` context."
-		)
-	return manager
-
-
-def get_partition_manager() -> PartitionManager:
-	"""
-	Retrieves the last active PartitionManager from the context.
-
-	This function accesses the context variable `_LAST_PARTITION_MANAGER`.
-	It can be used to retrieve a manager instance even after its `with` block
-	has been exited.
-
-	Returns:
-	    PartitionManager: The last active PartitionManager instance.
-
-	Raises:
-	    LookupError: If no PartitionManager has been created yet in the current
-	                 context or any parent context.
-	"""
-	manager = _LAST_PARTITION_MANAGER.get()
-	if manager is None:
-		raise LookupError("Cannot get partition manager: you havent created one yet!")
-	return manager
+	__hash__ = hash_fn
 
 
 def apply_logical_sharding(
 	x: jax.Array,
+	partition_manager: PartitionManager,
 	axes: tp.Sequence[tp.Optional[str]] = NOT_GIVEN,
 	mode: RUNTIME_MODE_TYPES | int = NOT_GIVEN,  # type:ignore
 	dynamic_axes: tp.Optional[DynamicShardingAxes] = NOT_GIVEN,
 	auto_correct: bool = True,
-	partition_manager: PartitionManager = NOT_GIVEN,
 ):
 	"""
 	Applies logical sharding to a JAX array using an available PartitionManager.
@@ -515,6 +464,7 @@ def apply_logical_sharding(
 
 	Args:
 	    x: The JAX array to apply sharding to.
+	    partition_manager: An explicit `PartitionManager` instance to use.
 	    axes: A sequence of semantic axis name strings or None. Required if
 	          `dynamic_axes` is NOT_GIVEN and `partition_manager` is NOT_GIVEN.
 	    mode: The runtime mode or dimension index for inference. Required if
@@ -523,29 +473,15 @@ def apply_logical_sharding(
 	                  `axes` and `mode` are ignored.
 	    auto_correct: If True, automatically corrects the resolved PartitionSpec.
 	                  Defaults to True.
-	    partition_manager: An optional explicit `PartitionManager` instance to use.
-	                       If NOT_GIVEN, the function attempts to find one from
-	                       the context.
 
 	Returns:
 	    The JAX array with sharding constraints applied.
 
 	Raises:
-	    LookupError: If no `PartitionManager` is found in the current context
-	                 or as the last created manager, and `partition_manager`
-	                 is NOT_GIVEN.
 	    AssertionError: If neither `axes`/`mode` nor `dynamic_axes` are provided
 	                    when a manager is found or provided.
 	"""
-	# Find a partition manager: prefer current context, then last created,
-	# otherwise use the explicitly provided one.
-	if partition_manager is NOT_GIVEN:
-		try:
-			partition_manager = get_current_partition_manager()
-		except LookupError:
-			partition_manager = get_partition_manager()
 
-	# Delegate the sharding application to the found or provided manager's shard method
 	return partition_manager.shard(
 		x=x,
 		axes=axes,
