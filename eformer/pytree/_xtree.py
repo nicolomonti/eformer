@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import json
 import threading
 import types
 import typing as tp
@@ -24,6 +25,7 @@ import jax
 from typing_extensions import dataclass_transform
 
 _T = tp.TypeVar("_T")
+T = tp.TypeVar("__T")
 
 _PRIMITIVE_TYPES = (
 	str,
@@ -337,6 +339,198 @@ def dataclass(clz: _T | None = None, **kwargs) -> _T | Callable[[_T], _T]:
 	return data_clz
 
 
+def _list_to_state_dict(target: list) -> list:
+	return [xto_state_dict(item) for item in target]
+
+
+def _list_from_state_dict(target: list | None, state: list) -> list:
+	return [
+		xfrom_state_dict(None, item_state, name=f"[{i}]")
+		for i, item_state in enumerate(state)
+	]
+
+
+def _tuple_to_state_dict(target: tuple) -> list:
+	return [xto_state_dict(item) for item in target]
+
+
+def _tuple_from_state_dict(target: tuple | None, state: list) -> tuple:
+	elems = []
+	target_elems = target if target and len(target) == len(state) else [None] * len(state)
+	for i, item_state in enumerate(state):
+		elems.append(xfrom_state_dict(target_elems[i], item_state, name=f"[{i}]"))
+	return tuple(elems)
+
+
+def _set_to_state_dict(target: set) -> list:
+	try:
+		sorted_items = sorted(list(target))
+		return [xto_state_dict(item) for item in sorted_items]
+	except TypeError:
+		return [xto_state_dict(item) for item in target]
+
+
+def _set_from_state_dict(target: set | None, state: list) -> set:
+	return {
+		xfrom_state_dict(None, item_state, name=f"{{{i}}}")
+		for i, item_state in enumerate(state)
+	}
+
+
+def _frozenset_to_state_dict(target: frozenset) -> list:
+	try:
+		sorted_items = sorted(list(target))
+		return [xto_state_dict(item) for item in sorted_items]
+	except TypeError:
+		return [xto_state_dict(item) for item in target]
+
+
+def _frozenset_from_state_dict(target: frozenset | None, state: list) -> frozenset:
+	return frozenset(
+		xfrom_state_dict(None, item_state, name=f"f{{{i}}}")
+		for i, item_state in enumerate(state)
+	)
+
+
+def _dict_to_state_dict(target: dict) -> dict[str, tp.Any]:
+	new_dict = {}
+	for k, v in target.items():
+		if not isinstance(k, str):
+			if isinstance(k, (int, float, bool)) or k is None:
+				key_str = str(k)
+			else:
+				raise TypeError(
+					f"Dictionary key {k!r} of type {type(k).__name__} is not serializable to a JSON string key."
+				)
+		else:
+			key_str = k
+		new_dict[key_str] = xto_state_dict(v)
+	return new_dict
+
+
+def _dict_from_state_dict(target: dict | None, state: dict[str, tp.Any]) -> dict:
+	new_dict = {}
+	target_dict = target if target else {}
+	for k, v_state in state.items():
+		v_target = target_dict.get(k)  # Get corresponding value prototype from target
+		new_dict[k] = xfrom_state_dict(v_target, v_state, name=k)
+	return new_dict
+
+
+def _namedtuple_to_state_dict(target: tuple) -> dict[str, tp.Any]:
+	# Use _asdict() if available, otherwise iterate _fields
+	if hasattr(target, "_asdict"):
+		data = target._asdict()
+	else:
+		data = {field: getattr(target, field) for field in target._fields}
+	return {k: xto_state_dict(v) for k, v in data.items()}
+
+
+def _namedtuple_from_state_dict(
+	target: tuple | None, state: dict[str, tp.Any]
+) -> tuple:
+	if target is None:
+		raise TypeError(
+			"Cannot deserialize a namedtuple without a target prototype instance."
+		)
+	target_type = type(target)
+
+	missing_fields = set(target._fields) - set(state.keys())
+	if missing_fields:
+		path_str = ".".join(_error_context.path) or "."
+		raise ValueError(
+			f"Missing field(s) {missing_fields} in state dict for namedtuple {target_type.__name__} at path '{path_str}'"
+		)
+
+	deserialized_values = {}
+	for field_name in target._fields:
+		field_state = state[field_name]
+		field_target_value = getattr(target, field_name)  # Get prototype value
+		with _record_path(field_name):
+			deserialized_values[field_name] = xfrom_state_dict(
+				field_target_value,
+				field_state,
+				name=field_name,  # Pass name for context
+			)
+	try:
+		return target_type(**deserialized_values)
+	except Exception as e:
+		path_str = ".".join(_error_context.path) or "."
+		raise TypeError(
+			f"Failed to recreate namedtuple {target_type.__name__} at path '{path_str}': {e}"
+		) from e
+
+
+def _jax_array_to_state_dict(target: jax.Array) -> list:
+	return target.tolist()
+
+
+def _jax_array_from_state_dict(target: jax.Array | None, state: list) -> jax.Array:
+	dtype = target.dtype if target is not None else None
+	try:
+		arr = jax.numpy.array(state, dtype=dtype)
+		return arr
+	except Exception as e:
+		path_str = ".".join(_error_context.path) or "."
+		raise TypeError(
+			f"Failed to convert state back to jax.Array at path '{path_str}' (dtype: {dtype}): {e}"
+		) from e
+
+
+register_serialization_state(
+	list,
+	_list_to_state_dict,
+	_list_from_state_dict,
+)
+register_serialization_state(
+	tuple,
+	_tuple_to_state_dict,
+	_tuple_from_state_dict,
+)
+register_serialization_state(
+	set,
+	_set_to_state_dict,
+	_set_from_state_dict,
+)
+register_serialization_state(
+	frozenset,
+	_frozenset_to_state_dict,
+	_frozenset_from_state_dict,
+)
+register_serialization_state(
+	dict,
+	_dict_to_state_dict,
+	_dict_from_state_dict,
+)
+register_serialization_state(
+	_NamedTuple,
+	_namedtuple_to_state_dict,
+	_namedtuple_from_state_dict,
+)
+register_serialization_state(
+	jax.Array,
+	_jax_array_to_state_dict,
+	_jax_array_from_state_dict,
+)
+register_serialization_state(
+	tp.Sequence,
+	_list_to_state_dict,
+	_list_from_state_dict,
+	override=True,
+)
+register_serialization_state(
+	tp.Mapping,
+	_dict_to_state_dict,
+	_dict_from_state_dict,
+	override=True,
+)
+register_serialization_state(
+	tp.Set,
+	_set_to_state_dict,
+	_set_from_state_dict,
+	override=True,
+)
+
 STree = tp.TypeVar("STree", bound="xTree")
 
 
@@ -374,3 +568,59 @@ class xTree:
 			A new instance of the xTree subclass with the updated fields.
 		"""
 		raise NotImplementedError
+
+	def to_state_dict(self) -> tp.Any:
+		"""Serializes this instance to a JSON-compatible state."""
+		return xto_state_dict(self)
+
+	@classmethod
+	def from_state_dict(cls: tp.Type[STree], state: tp.Any) -> STree:
+		"""Deserializes state into an instance of this class."""
+		return xfrom_state_dict(None, state, name=cls.__name__)
+
+	def to_dict(self) -> tp.Dict[str, tp.Any]:
+		"""Serializes the PyTree object to a dictionary."""
+		result = {}
+		for field_obj in dataclasses.fields(self):
+			value = getattr(self, field_obj.name)
+			if value is Ellipsis:  # Skip Ellipsis sentinel values
+				continue
+			if isinstance(value, tuple):
+				result[field_obj.name] = list(value)
+			elif value is None:
+				result[field_obj.name] = None
+			elif hasattr(value, "to_dict") and callable(value.to_dict):
+				result[field_obj.name] = value.to_dict()
+			else:
+				try:
+					json.dumps(value)
+					result[field_obj.name] = value
+				except (TypeError, OverflowError):
+					result[field_obj.name] = str(value)
+		return result
+
+	@classmethod
+	def from_dict(cls_inner_classmethod: tp.Type[T], data: tp.Dict[str, tp.Any]) -> T:
+		"""Deserializes a dictionary into a PyTree object."""
+		processed_data = {}
+
+		type_hints_local = tp.get_type_hints(cls_inner_classmethod)
+
+		for field_obj in dataclasses.fields(cls_inner_classmethod):
+			field_name = field_obj.name
+			if field_name not in data:
+				continue
+			value = data[field_name]
+			field_type = type_hints_local.get(field_name)
+
+			if (
+				value is not None
+				and isinstance(value, list)
+				and field_type is not None
+				and tp.get_origin(field_type) is tuple
+			):
+				processed_data[field_name] = tuple(value)
+			else:
+				processed_data[field_name] = value
+
+		return cls_inner_classmethod(**processed_data)
