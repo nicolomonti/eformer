@@ -31,10 +31,13 @@ from eformer.common_types import (
 	BATCH,
 	BIAS_HEAD_SEQ,
 	BIAS_KV_SEQ,
+	DATA_PARALLEL,
 	EMBED,
 	EMPTY,
 	EXPERT,
 	EXPERT_GATE,
+	EXPERT_PARALLEL,
+	FULLY_SHARDED_DATA_PARALLEL,
 	GENERATION_MODES,
 	HEAD,
 	HEAD_DIM,
@@ -48,11 +51,13 @@ from eformer.common_types import (
 	NOT_GIVEN,
 	QUERY_LENGTH,
 	RUNTIME_MODE_TYPES,
+	SEQUENCE_PARALLEL,
+	TENSOR_PARALLEL,
 	VOCAB,
 	AxisType,
 	DynamicShardingAxes,
 )
-from eformer.pytree import xTree, PyTree
+from eformer.pytree import PyTree, xTree
 
 from .constraints import get_corrected_named_sharding, with_sharding_constraint
 
@@ -166,8 +171,14 @@ class PartitionAxis(xTree):
 		KV_HEAD_DIM: "decode_attention_kv_dim_axis",
 		BIAS_HEAD_SEQ: "bias_head_sequence_axis",
 		BIAS_KV_SEQ: "bias_key_sequence_axis",
-		EMPTY: None,  # Represents an unsharded dimension
+		EMPTY: None,
+		DATA_PARALLEL: "data_parallel_axis",
+		FULLY_SHARDED_DATA_PARALLEL: "fully_sharded_data_parallel_axis",
+		TENSOR_PARALLEL: "tensor_parallel_axis",
+		SEQUENCE_PARALLEL: "sequence_parallel_axis",
+		EXPERT_PARALLEL: "expert_parallel_axis",
 	}
+
 	"""
 	Maps semantic axis name constants (e.g., BATCH) to their corresponding
 	attribute names in the PartitionAxis class (e.g., "batch_axis").
@@ -300,7 +311,14 @@ class PartitionAxis(xTree):
 				continue
 
 			# Look up the standard attribute name from the semantic map
-			standard_attr_name = self._SEMANTIC_MAP.get(axis_name)
+			if isinstance(axis_name, list):
+				# If the axis name is a list, we need to resolve each element
+				standard_attr_name = [
+					self._SEMANTIC_MAP.get(axis) or axis for axis in axis_name
+				]
+
+			else:
+				standard_attr_name = self._SEMANTIC_MAP.get(axis_name)
 			if standard_attr_name is None:
 				raise ValueError(f"Unknown semantic axis name: '{axis_name}'")
 
@@ -318,7 +336,11 @@ class PartitionAxis(xTree):
 
 			try:
 				# Get the mesh axis rule (string or tuple of strings) from the instance
-				mesh_axis_rule: AxisType = getattr(self, target_attr_name)
+				if isinstance(target_attr_name, list):
+					# If the target attribute name is a list, resolve each element
+					mesh_axis_rule = [getattr(self, attr_name) for attr_name in target_attr_name]
+				else:
+					mesh_axis_rule: AxisType = getattr(self, target_attr_name)
 			except AttributeError as e:
 				# This indicates a mismatch between _SEMANTIC_MAP/_STANDARD_TO_GENERATION_ATTR_MAP
 				# and the actual class attributes.
@@ -417,11 +439,15 @@ class PartitionManager(PyTree):
 
 	def resolve(
 		self,
-		axes: tp.Sequence[tp.Optional[str]] = NOT_GIVEN,
-		mode: RUNTIME_MODE_TYPES | int = NOT_GIVEN,  # type:ignore
+		axes: tp.Union[tp.Sequence[tp.Optional[str]], DynamicShardingAxes] = NOT_GIVEN,
+		mode: tp.Union[RUNTIME_MODE_TYPES, int] = NOT_GIVEN,  # type:ignore
 		dynamic_axes: tp.Optional[DynamicShardingAxes] = NOT_GIVEN,
-		shape=NOT_GIVEN,
+		shape: tp.Sequence[int] = NOT_GIVEN,
 	) -> jax.Array:
+		if issubclass(axes, DynamicShardingAxes):
+			dynamic_axes = axes
+			axes = NOT_GIVEN
+
 		if axes is NOT_GIVEN or mode is NOT_GIVEN:
 			assert dynamic_axes is not NOT_GIVEN, (
 				"if axes or mode is empty you should provide dynamic axes"

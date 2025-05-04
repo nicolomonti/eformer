@@ -209,7 +209,7 @@ def auto_pytree(
 			for k, v in self.__dict__.items():
 				if not k.startswith("_"):  # Avoid private/internal attributes
 					try:
-						repr_str = str(v)
+						repr_str = str(v).replace("\n", "\n  ")
 						if len(repr_str) > 200:  # Truncate long representations
 							repr_str = f"{v.__class__.__name__}(...)"
 						items.append(f"  {k} : {repr_str}")

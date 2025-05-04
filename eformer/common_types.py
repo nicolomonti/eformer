@@ -86,6 +86,19 @@ BIAS_HEAD_SEQ = "__BIAS_HEAD_SEQ__"
 BIAS_KV_SEQ = "__BIAS_KV_SEQ__"
 """Semantic axis name for bias related to key/value sequence dimensions."""
 
+
+DATA_PARALLEL = "__DATA_PARALLEL__"
+FULLY_SHARDED_DATA_PARALLEL = "__FULLY_SHARDED_DATA_PARALLEL__"
+TENSOR_PARALLEL = "__TENSOR_PARALLEL__"
+EXPERT_PARALLEL = "__EXPERT_PARALLEL__"
+SEQUENCE_PARALLEL = "__SEQUENCE_PARALLEL__"
+
+DP = DATA_PARALLEL
+FSDP = FULLY_SHARDED_DATA_PARALLEL
+TP = TENSOR_PARALLEL
+EP = EXPERT_PARALLEL
+SP = SEQUENCE_PARALLEL
+
 # String constants representing runtime modes
 MODE_DECODE = "__autoregressive__"
 """Runtime mode for autoregressive decoding."""
@@ -148,6 +161,41 @@ class AttnKVSharding(DynamicShardingAxes):
 
 	axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
 	mode = 1  # Infer mode based on the second dimension (sequence length)
+
+
+class RowWise(DynamicShardingAxes):
+	"""Dynamic sharding specification for Row Wise sharding."""
+
+	axes = [TP, [FSDP, SP]]
+	mode = MODE_TRAIN
+
+
+class SRowWise(DynamicShardingAxes):
+	"""Dynamic sharding specification for Row Wise sharding."""
+
+	axes = [TP]
+	mode = MODE_TRAIN
+
+
+class ColumnWise(DynamicShardingAxes):
+	"""Dynamic sharding specification for Column Wise sharding."""
+
+	axes = [[FSDP, SP], TP]
+	mode = MODE_TRAIN
+
+
+class SColumnWise(DynamicShardingAxes):
+	"""Dynamic sharding specification for Column Wise sharding."""
+
+	axes = [[FSDP, SP]]
+	mode = MODE_TRAIN
+
+
+class Replicated(DynamicShardingAxes):
+	"""Dynamic sharding specification for Column Wise sharding."""
+
+	axes = [EMPTY]
+	mode = MODE_TRAIN
 
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
