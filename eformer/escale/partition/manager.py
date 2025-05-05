@@ -444,7 +444,7 @@ class PartitionManager(PyTree):
 		dynamic_axes: tp.Optional[DynamicShardingAxes] = NOT_GIVEN,
 		shape: tp.Sequence[int] = NOT_GIVEN,
 	) -> jax.Array:
-		if issubclass(axes, DynamicShardingAxes):
+		if isinstance(axes, type) and issubclass(axes, tuple) and hasattr(axes, "_fields"):
 			dynamic_axes = axes
 			axes = NOT_GIVEN
 
