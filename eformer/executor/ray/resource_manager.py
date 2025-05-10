@@ -3,12 +3,12 @@ import logging
 import multiprocessing
 import os
 import typing as tp
+import uuid
 from dataclasses import dataclass, field, replace
 from queue import Empty as QueueEmpty
 from typing import Any, Callable, Dict, Optional, Protocol
 
 import mergedeep
-
 import ray
 from ray._private.accelerators import NvidiaGPUAcceleratorManager, TPUAcceleratorManager
 from ray.remote_function import RemoteFunction
@@ -239,10 +239,8 @@ class ComputeResourceConfig(Protocol):
 	"""
 
 	execution_env: RuntimeEnv
-	"""
-    A Ray runtime environment configuration that specifies environment variables,
-    pip packages, working directory, and other runtime requirements.
-    """
+	head_name: tp.Union[str, None] = None
+	head_workers: int = 1
 
 	def hardware_identifier(self) -> Optional[str]:
 		"""
@@ -306,7 +304,7 @@ class ComputeResourceConfig(Protocol):
 
 
 @dataclass(frozen=True)
-class CpuOnlyConfig(ComputeResourceConfig):
+class CpuAcceleratorConfig(ComputeResourceConfig):
 	"""
 	Resource configuration for CPU-only workloads.
 
@@ -317,6 +315,8 @@ class CpuOnlyConfig(ComputeResourceConfig):
 	core_count: int = field(default_factory=available_cpu_cores)
 	execution_env: RuntimeEnv = field(default_factory=RuntimeEnv)
 	resource_name: str = field(default="GPU")
+	runtime_name: str = field(default_factory=uuid.uuid4)
+	worker_count: int = 1
 
 	def hardware_identifier(self) -> Optional[str]:
 		"""
@@ -366,6 +366,8 @@ class GpuAcceleratorConfig(ComputeResourceConfig):
 	chips_per_host: int = field(
 		default_factory=NvidiaGPUAcceleratorManager.get_current_node_num_accelerators
 	)
+	runtime_name: str = field(default_factory=uuid.uuid4)
+	worker_count: int = 1
 	resource_name: str = field(default="GPU")
 
 	def hardware_identifier(self) -> Optional[str]:
@@ -427,6 +429,12 @@ class TpuAcceleratorConfig(ComputeResourceConfig):
 	chips_per_host: int = field(
 		default_factory=TPUAcceleratorManager.get_current_node_num_accelerators
 	)
+	worker_count: int = field(
+		default_factory=ray.util.accelerators.tpu.get_current_pod_worker_count
+	)
+	runtime_name: str = field(
+		default_factory=ray.util.accelerators.tpu.get_current_pod_name
+	)
 	resource_name: str = field(default="TPU")
 
 	def hardware_identifier(self) -> str:
@@ -477,15 +485,17 @@ class TpuAcceleratorConfig(ComputeResourceConfig):
 		runtime_env = RayResources.update_fn_resource_env(
 			remote_fn=remote_fn,
 			runtime_env=self.execution_env,
-			extra_env=extra_envs,
+			**extra_envs,
 		)
 		remote_fn = remote_fn.options(
 			runtime_env=runtime_env,
 			resources={tpu_name: 1, self.resource_name: self.chips_per_host},
 		)
-		# if verbose:
-		# 	logger.info(
-		# 		f"Running on TPU {tpu_name} with {num_hosts} hosts "
-		# 		f"and {num_tpus_per_host} TPUs per host"
-		# 	)
 		return remote_fn
+
+
+AcceleratorConfigType: tp.TypeAlias = tp.Union[
+	TpuAcceleratorConfig,
+	GpuAcceleratorConfig,
+	CpuAcceleratorConfig,
+]

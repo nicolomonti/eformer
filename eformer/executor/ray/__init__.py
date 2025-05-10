@@ -1,6 +1,14 @@
+from .executor import (
+	RayExecutor,
+	execute,
+	execute_multislice,
+	execute_multislice_resumable,
+	execute_resumable,
+)
 from .resource_manager import (
+	AcceleratorConfigType,
 	ComputeResourceConfig,
-	CpuOnlyConfig,
+	CpuAcceleratorConfig,
 	GpuAcceleratorConfig,
 	RayResources,
 	TpuAcceleratorConfig,
@@ -18,8 +26,10 @@ from .types import (
 )
 
 __all__ = (
+	"RayExecutor",
+	"AcceleratorConfigType",
 	"ComputeResourceConfig",
-	"CpuOnlyConfig",
+	"CpuAcceleratorConfig",
 	"GpuAcceleratorConfig",
 	"RayResources",
 	"TpuAcceleratorConfig",
@@ -32,4 +42,8 @@ __all__ = (
 	"JobStatus",
 	"JobSucceeded",
 	"handle_ray_error",
+	"execute",
+	"execute_multislice",
+	"execute_multislice_resumable",
+	"execute_resumable",
 )
