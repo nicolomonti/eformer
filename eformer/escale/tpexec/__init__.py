@@ -7,12 +7,12 @@ from ._cluster_util import (
 	auto_ray_cluster,
 )
 from ._statics import (
-	TpuFailed,
-	TpuInfo,
-	TpuPreempted,
-	TpuRunError,
-	TpuRunResult,
-	TpuSuccess,
+	RunError,
+	RunFailed,
+	RunInfo,
+	RunPreempted,
+	RunResult,
+	RunSuccess,
 )
 from .executors import (
 	TPUExecutor,
@@ -26,10 +26,10 @@ __all__ = (
 	"auto_ray_cluster",
 	"TPUExecutor",
 	"TPUMultiSliceExecutor",
-	"TpuInfo",
-	"TpuFailed",
-	"TpuPreempted",
-	"TpuSuccess",
-	"TpuRunResult",
-	"TpuRunError",
+	"RunInfo",
+	"RunFailed",
+	"RunPreempted",
+	"RunSuccess",
+	"RunResult",
+	"RunError",
 )

@@ -20,9 +20,9 @@ from ray.exceptions import (
 from ray.remote_function import RemoteFunction
 
 from .._statics import (
-	TpuInfo,
-	TpuPreempted,
-	TpuRunError,
+	RunError,
+	RunInfo,
+	RunPreempted,
 )
 
 logger = logging.getLogger("ray")
@@ -52,31 +52,31 @@ def redecorate_remote_fn_for_tpu(
 			f"Running on TPU {tpu_name} with {num_hosts} hosts "
 			f"and {num_tpus_per_host} TPUs per host"
 		)
-	return remote_fn, tpu_name
+	return remote_fn
 
 
-def handle_ray_error(tpu_info: TpuInfo, e: RayError):
+def handle_ray_error(tpu_info: RunInfo, e: RayError):
 	if isinstance(e, NodeDiedError):
 		logger.exception("Node died", exc_info=e)
-		return TpuPreempted(tpu_info, e)
+		return RunPreempted(tpu_info, e)
 	elif isinstance(
 		e, ray.exceptions.ActorUnavailableError | ray.exceptions.ActorDiedError
 	):
 		logger.exception("Actor died", exc_info=e)
-		return TpuPreempted(tpu_info, e)
+		return RunPreempted(tpu_info, e)
 	elif isinstance(e, WorkerCrashedError):
 		logger.exception("Worker crashed", exc_info=e)
-		return TpuPreempted(tpu_info, e)
+		return RunPreempted(tpu_info, e)
 	elif isinstance(e, RaySystemError):
 		logger.exception("System error", exc_info=e)
-		return TpuRunError(tpu_info, e)
+		return RunError(tpu_info, e)
 	elif isinstance(e, RayTaskError):
 		logger.exception(f"Task error {e}", exc_info=e)
-		return TpuRunError(tpu_info, e)
+		return RunError(tpu_info, e)
 
 	else:
 		logger.exception("Unknown error", exc_info=e)
-		return TpuRunError(tpu_info, e)
+		return RunError(tpu_info, e)
 
 
 @dataclass

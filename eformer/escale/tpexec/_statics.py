@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class TpuInfo:
+class RunInfo:
 	"""Internal class to hold information about a TPU pod."""
 
 	name: str
@@ -11,27 +11,27 @@ class TpuInfo:
 
 
 @dataclass
-class TpuRunResult:
+class RunResult:
 	"""Internal class to hold the result of a TPU job."""
 
-	info: TpuInfo
+	info: RunInfo
 
 
 @dataclass
-class TpuSuccess(TpuRunResult):
+class RunSuccess(RunResult):
 	result: object
 
 
 @dataclass
-class TpuPreempted(TpuRunResult):
+class RunPreempted(RunResult):
 	error: Exception
 
 
 @dataclass
-class TpuFailed(TpuRunResult):
+class RunFailed(RunResult):
 	error: Exception
 
 
 @dataclass
-class TpuRunError(TpuRunResult):
+class RunError(RunResult):
 	error: Exception
