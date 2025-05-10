@@ -719,6 +719,7 @@ def main():
 			# Start head node with specific resources
 			resources = {
 				"TPU": tpu_cores_per_host,
+				f"TPU-{TPU_VERSION}": tpu_cores_per_host,
 				f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,  # Standard head marker
 				f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,  # Global head marker
 				f"slice-{slice_idx}": 1,
@@ -772,6 +773,7 @@ def main():
 			resources = json.dumps(
 				{
 					"TPU": tpu_cores_per_host,
+					f"TPU-{TPU_VERSION}": tpu_cores_per_host,
 					f"TPU-{TPU_VERSION}-worker": 1,
 					f"slice-{slice_idx}": 1,
 					f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,

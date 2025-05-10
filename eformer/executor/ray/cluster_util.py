@@ -1,4 +1,4 @@
-# all of this part is a copy-paste from Stanford/Tpexec
+# all of this part is a copy-paste from
 # https://github.com/stanford-crfm/levanter/blob/main/src/levanter/distributed.py
 
 import atexit
@@ -14,26 +14,22 @@ import jax
 import ray
 from jax._src import clusters, distributed
 
-logger = logging.getLogger("tpexec")
+logger = logging.getLogger("eray-executor")
 
 
 _JOBID_PARAM = "SLURM_JOB_ID"
 _NODE_LIST_CHOICES = ["SLURM_STEP_NODELIST", "SLURM_JOB_NODELIST", "SLURM_NODELIST"]
-_PROCESS_COUNT = "SLURM_NTASKS"
-_PROCESS_ID = "SLURM_PROCID"
-_LOCAL_PROCESS_ID = "SLURM_LOCALID"
-_NUM_NODES = "SLURM_STEP_NUM_NODES"
 _TASKS_PER_NODE = "SLURM_STEP_TASKS_PER_NODE"
 _VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 _NODE_NAME = "SLURMD_NODENAME"
 
 
-class TpexecSlurmCluster(clusters.SlurmCluster):
+class eRayExecutorSlurmCluster(clusters.SlurmCluster):
 	@classmethod
 	def get_coordinator_address(cls) -> str:
 		id = os.environ[_JOBID_PARAM]
 		port = _choose_port(id)
-		node_list = TpexecSlurmCluster._node_list()
+		node_list = eRayExecutorSlurmCluster._node_list()
 		if node_list is None:
 			raise ValueError(
 				"Could not find node list in environment variables. You must set coordinator_address manually."
@@ -81,7 +77,7 @@ class TpexecSlurmCluster(clusters.SlurmCluster):
 
 	@classmethod
 	def _infer_local_process_count(cls):
-		node_list = TpexecSlurmCluster._node_list()
+		node_list = eRayExecutorSlurmCluster._node_list()
 		if node_list is None:
 			raise ValueError(
 				"Could not find node list in environment variables. You must set coordinator_address manually."
@@ -195,8 +191,10 @@ def _is_local_leader():
 	random_id = random.randint(0, 1000000)
 	random_id = broadcast_one_to_all(random_id)
 
-	lock = filelock.FileLock(f"/tmp/tpexec_local_process_zero_lock.{random_id}")
-	action_performed_file = f"/tmp/tpexec_local_process_zero_action_performed.{random_id}"
+	lock = filelock.FileLock(f"/tmp/eray_executor_local_process_zero_lock.{random_id}")
+	action_performed_file = (
+		f"/tmp/eray_executor_local_process_zero_action_performed.{random_id}"
+	)
 
 	try:
 		with lock.acquire(timeout=0.1):
@@ -216,7 +214,7 @@ _already_initialized = False
 
 def auto_ray_cluster(
 	address: tp.Optional[str] = None,
-	namespace: tp.Optional[str] = "tpexec",
+	namespace: tp.Optional[str] = "eray-executor",
 	start_workers: bool = True,
 	fail_if_cluster_already_initialized: bool = False,
 	**kwargs,
@@ -343,12 +341,12 @@ class DistributedConfig:
 			device_ids = self.local_device_ids
 			coordinator_address = self.coordinator_address
 
-			if TpexecSlurmCluster.is_env_present():
+			if eRayExecutorSlurmCluster.is_env_present():
 				if device_ids is None:
-					device_ids = TpexecSlurmCluster.get_local_device_ids_for_process()
+					device_ids = eRayExecutorSlurmCluster.get_local_device_ids_for_process()
 
 				if coordinator_address is None:
-					coordinator_address = TpexecSlurmCluster.get_coordinator_address()
+					coordinator_address = eRayExecutorSlurmCluster.get_coordinator_address()
 
 			jax.distributed.initialize(
 				coordinator_address,

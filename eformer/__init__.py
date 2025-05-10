@@ -18,6 +18,7 @@ __all__ = (
 	"aparser",
 	"callib",
 	"escale",
+	"executor",
 	"jaximus",
 	"ops",
 	"optimizers",
