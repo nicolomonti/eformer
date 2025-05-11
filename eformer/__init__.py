@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.0.37"
+__version__ = "0.0.38"
 
 __all__ = (
 	"aparser",
