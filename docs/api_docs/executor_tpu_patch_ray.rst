@@ -1,7 +1,7 @@
-eformer.escale.tpexec.__init__
+eformer.executor.tpu_patch_ray
 ==============================
 
-.. automodule:: eformer.escale.tpexec.__init__
+.. automodule:: eformer.executor.tpu_patch_ray
     :members:
     :undoc-members:
     :show-inheritance:

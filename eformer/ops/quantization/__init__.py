@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .implicit_array_nf4 import ArrayNF4
 from .implicit_array_8bit import Array8B
+from .implicit_array_nf4 import ArrayNF4
 
 __all__ = ("Array8B", "ArrayNF4")

@@ -13,17 +13,15 @@
 # limitations under the License.
 import warnings
 
-
 try:
-	from .gpu_flash_attention import triton_flash_attention2_gpu
+    from .gpu_flash_attention import triton_flash_attention2_gpu
 except Exception:
 
-	def triton_flash_attention2_gpu(*_, **__):
-		return warnings.warn(
-			"please install triton and it dependencies "
-			"inorder to use `triton_flash_attention2_gpu`",
-			stacklevel=3,
-		)
+    def triton_flash_attention2_gpu(*_, **__):
+        return warnings.warn(
+            "please install triton and it dependencies inorder to use `triton_flash_attention2_gpu`",
+            stacklevel=3,
+        )
 
 
 __all__ = ("triton_flash_attention2_gpu",)

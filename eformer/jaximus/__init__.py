@@ -16,22 +16,6 @@
 # (https://github.com/patrick-kidger/equinox)
 
 
-from ._imus import (
-	ImplicitArray,
-	OrginArray,
-	aux_field,
-	implicit,
-	register,
-	ste,
-	use_implicit,
-)
+from ._imus import ImplicitArray, OrginArray, aux_field, implicit, register, ste, use_implicit
 
-__all__ = (
-	"ImplicitArray",
-	"OrginArray",
-	"aux_field",
-	"implicit",
-	"register",
-	"ste",
-	"use_implicit",
-)
+__all__ = ("ImplicitArray", "OrginArray", "aux_field", "implicit", "register", "ste", "use_implicit")

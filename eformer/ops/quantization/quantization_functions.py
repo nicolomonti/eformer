@@ -19,174 +19,172 @@ from jax import numpy as jnp
 
 
 def quantize_int8(x: jax.Array, axis: int | tuple = -1):
-	"""
-	Quantize values to 8-bit integers.
+    """
+    Quantize values to 8-bit integers.
 
-	Args:
-	    x (jax.Array): Input array.
+    Args:
+        x (jax.Array): Input array.
 
-	Returns:
-	    tuple: A tuple containing:
-	        - quantized_values (jax.Array): int8 array of shape (k,) containing quantized values.
-	        - scales (jax.Array): Array of shape (nb,) containing scaling factors.
-	"""
-	if not isinstance(axis, tuple):
-		axis = (axis,)
-	axis = tuple(z % x.ndim for z in axis)
-	amax = jnp.max(jnp.abs(x), axis=axis, keepdims=True)
-	scale = (amax / 127.0 + jnp.finfo(x.dtype).tiny).astype(x.dtype)
-	quant = jnp.round(x / scale).astype(jnp.int8)
-	return quant, scale
+    Returns:
+        tuple: A tuple containing:
+            - quantized_values (jax.Array): int8 array of shape (k,) containing quantized values.
+            - scales (jax.Array): Array of shape (nb,) containing scaling factors.
+    """
+    if not isinstance(axis, tuple):
+        axis = (axis,)
+    axis = tuple(z % x.ndim for z in axis)
+    amax = jnp.max(jnp.abs(x), axis=axis, keepdims=True)
+    scale = (amax / 127.0 + jnp.finfo(x.dtype).tiny).astype(x.dtype)
+    quant = jnp.round(x / scale).astype(jnp.int8)
+    return quant, scale
 
 
 def dequantize_int8(quants, scales):
-	"""
-	Dequantize 8-bit integers back to float32 values using blockwise scaling.
+    """
+    Dequantize 8-bit integers back to float32 values using blockwise scaling.
 
-	Args:
-	    quants (jax.Array): int8 array of shape (k,) containing quantized values.
-	    scales (jax.Array): Array of shape (nb,) containing scaling factors.
+    Args:
+        quants (jax.Array): int8 array of shape (k,) containing quantized values.
+        scales (jax.Array): Array of shape (nb,) containing scaling factors.
 
-	Returns:
-	    jax.Array: Array of shape (k,) containing dequantized float32 values.
-	"""
+    Returns:
+        jax.Array: Array of shape (k,) containing dequantized float32 values.
+    """
 
-	return quants * scales
+    return quants * scales
 
 
 @functools.partial(jax.jit, static_argnames=["block_size"])
 def single_quantize_and_pack_nf4(blocks, block_size=64):
-	"""
-	Combined quantization and packing for better performance.
-	Handles normalization, quantization, and packing in a single operation.
+    """
+    Combined quantization and packing for better performance.
+    Handles normalization, quantization, and packing in a single operation.
 
-	Args:
-	    blocks (jax.Array): Input array to be quantized and packed.
-	    block_size (int): Size of each quantization block. Defaults to 64.
+    Args:
+        blocks (jax.Array): Input array to be quantized and packed.
+        block_size (int): Size of each quantization block. Defaults to 64.
 
-	Returns:
-	    tuple: A tuple containing:
-	        - packed (jax.Array): uint8 array of packed quantized values.
-	        - absmax (jax.Array): Array of absolute maximum values for each block.
-	"""
-	blocks = blocks.reshape(-1, block_size)
-	absmax = jnp.max(jnp.abs(blocks), axis=1)
-	normalized = blocks / absmax[:, None]
-	quantized = (
-		jnp.searchsorted(
-			jnp.array(
-				[
-					-float("inf"),
-					-0.8480964004993439,
-					-0.6106329262256622,
-					-0.4599952697753906,
-					-0.33967943489551544,
-					-0.23460740596055984,
-					-0.13791173323988914,
-					-0.045525018125772476,
-					0.03979014977812767,
-					0.1202552504837513,
-					0.2035212516784668,
-					0.2920137718319893,
-					0.3893125355243683,
-					0.5016634166240692,
-					0.6427869200706482,
-					0.8614784181118011,
-				],
-				dtype=jnp.float32,
-			),
-			normalized.reshape(-1),
-		)
-		- 1
-	)
-	quantized = quantized.reshape(-1, 2)
-	packed = (quantized[:, 0] << 4) | quantized[:, 1]
+    Returns:
+        tuple: A tuple containing:
+            - packed (jax.Array): uint8 array of packed quantized values.
+            - absmax (jax.Array): Array of absolute maximum values for each block.
+    """
+    blocks = blocks.reshape(-1, block_size)
+    absmax = jnp.max(jnp.abs(blocks), axis=1)
+    normalized = blocks / absmax[:, None]
+    quantized = (
+        jnp.searchsorted(
+            jnp.array(
+                [
+                    -float("inf"),
+                    -0.8480964004993439,
+                    -0.6106329262256622,
+                    -0.4599952697753906,
+                    -0.33967943489551544,
+                    -0.23460740596055984,
+                    -0.13791173323988914,
+                    -0.045525018125772476,
+                    0.03979014977812767,
+                    0.1202552504837513,
+                    0.2035212516784668,
+                    0.2920137718319893,
+                    0.3893125355243683,
+                    0.5016634166240692,
+                    0.6427869200706482,
+                    0.8614784181118011,
+                ],
+                dtype=jnp.float32,
+            ),
+            normalized.reshape(-1),
+        )
+        - 1
+    )
+    quantized = quantized.reshape(-1, 2)
+    packed = (quantized[:, 0] << 4) | quantized[:, 1]
 
-	return packed.astype(jnp.uint8), absmax
+    return packed.astype(jnp.uint8), absmax
 
 
 @functools.partial(jax.jit, static_argnames=["block_size"])
 def single_dequantize_nf4(packed_values, absmax, block_size):
-	"""
-	Optimized dequantization combining unpacking and scaling in fewer operations.
+    """
+    Optimized dequantization combining unpacking and scaling in fewer operations.
 
-	Args:
-	    packed_values (jax.Array): uint8 array of packed quantized values.
-	    absmax (jax.Array): Array of absolute maximum values for each block.
-	    block_size (int): Size of each quantization block.
+    Args:
+        packed_values (jax.Array): uint8 array of packed quantized values.
+        absmax (jax.Array): Array of absolute maximum values for each block.
+        block_size (int): Size of each quantization block.
 
-	Returns:
-	    jax.Array: Dequantized array of float32 values.
-	"""
-	high = (packed_values >> 4) & 0xF
-	low = packed_values & 0xF
-	unpacked = jnp.stack([high, low], axis=1).reshape(-1)
+    Returns:
+        jax.Array: Dequantized array of float32 values.
+    """
+    high = (packed_values >> 4) & 0xF
+    low = packed_values & 0xF
+    unpacked = jnp.stack([high, low], axis=1).reshape(-1)
 
-	dequantized = jnp.array(
-		[
-			-1.0,
-			-0.6961928009986877,
-			-0.5250730514526367,
-			-0.39491748809814453,
-			-0.28444138169288635,
-			-0.18477343022823334,
-			-0.09105003625154495,
-			0.0,
-			0.07958029955625534,
-			0.16093020141124725,
-			0.24611230194568634,
-			0.33791524171829224,
-			0.44070982933044434,
-			0.5626170039176941,
-			0.7229568362236023,
-			1.0,
-		],
-		dtype=jnp.float32,
-	)[unpacked]
+    dequantized = jnp.array(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=jnp.float32,
+    )[unpacked]
 
-	dequantized = dequantized.reshape(-1, block_size)
-	scaled = dequantized * absmax[:, None]
-	return scaled
+    dequantized = dequantized.reshape(-1, block_size)
+    scaled = dequantized * absmax[:, None]
+    return scaled
 
 
 @functools.partial(jax.jit, static_argnames=["block_size"])
 def quantize_and_pack_nf4(blocks, block_size=64):
-	"""
-	Quantize and pack an array using NF4 quantization.
+    """
+    Quantize and pack an array using NF4 quantization.
 
-	Args:
-	    blocks (jax.Array): Input array to be quantized and packed.
-	    block_size (int): Size of each quantization block. Defaults to 64.
+    Args:
+        blocks (jax.Array): Input array to be quantized and packed.
+        block_size (int): Size of each quantization block. Defaults to 64.
 
-	Returns:
-	    tuple: A tuple containing:
-	        - packed (jax.Array): uint8 array of packed quantized values.
-	        - absmax (jax.Array): Array of absolute maximum values for each block.
-	"""
-	if blocks.ndim > 2:
-		return jax.vmap(quantize_and_pack_nf4, in_axes=(0, None), out_axes=(0, 0))(
-			blocks, block_size
-		)
-	return single_quantize_and_pack_nf4(blocks, block_size)
+    Returns:
+        tuple: A tuple containing:
+            - packed (jax.Array): uint8 array of packed quantized values.
+            - absmax (jax.Array): Array of absolute maximum values for each block.
+    """
+    if blocks.ndim > 2:
+        return jax.vmap(quantize_and_pack_nf4, in_axes=(0, None), out_axes=(0, 0))(blocks, block_size)
+    return single_quantize_and_pack_nf4(blocks, block_size)
 
 
 @functools.partial(jax.jit, static_argnames=["block_size"])
 def dequantize_nf4(packed_values, absmax, block_size):
-	"""
-	Dequantize an array packed using NF4 quantization.
+    """
+    Dequantize an array packed using NF4 quantization.
 
-	Args:
-	    packed_values (jax.Array): uint8 array of packed quantized values.
-	    absmax (jax.Array): Array of absolute maximum values for each block.
-	    block_size (int): Size of each quantization block.
+    Args:
+        packed_values (jax.Array): uint8 array of packed quantized values.
+        absmax (jax.Array): Array of absolute maximum values for each block.
+        block_size (int): Size of each quantization block.
 
-	Returns:
-	    jax.Array: Dequantized array of float32 values.
-	"""
-	if packed_values.ndim > 2:
-		return jax.vmap(
-			dequantize_nf4,
-			in_axes=(0, 0, None),
-			out_axes=(0,),
-		)(packed_values, absmax, block_size)
-	return single_dequantize_nf4(packed_values, absmax, block_size)
+    Returns:
+        jax.Array: Dequantized array of float32 values.
+    """
+    if packed_values.ndim > 2:
+        return jax.vmap(
+            dequantize_nf4,
+            in_axes=(0, 0, None),
+            out_axes=(0,),
+        )(packed_values, absmax, block_size)
+    return single_dequantize_nf4(packed_values, absmax, block_size)

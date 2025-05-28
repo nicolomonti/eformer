@@ -6,5 +6,5 @@ Pytree
 
    pytree___init__
    pytree__pytree
-   pytree__smart_tree
    pytree__tree_util
+   pytree__xtree

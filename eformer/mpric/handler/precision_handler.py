@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from functools import partial
-from typing import Any, Union
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -24,101 +24,96 @@ from ..policy.policy import Policy
 
 
 def _cast_to_dtype(tree: Any, dtype: jnp.dtype) -> Any:
-	"""Cast floating point values in tree to specified dtype."""
+    """Cast floating point values in tree to specified dtype."""
 
-	def conditional_cast(x):
-		if isinstance(x, (np.ndarray, jnp.ndarray)) and jnp.issubdtype(
-			x.dtype,
-			jnp.floating,
-		):
-			return x.astype(dtype)
-		return x
+    def conditional_cast(x):
+        if isinstance(x, np.ndarray | jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(dtype)
+        return x
 
-	return jax.tree_util.tree_map(conditional_cast, tree)
+    return jax.tree_util.tree_map(conditional_cast, tree)
 
 
 class PrecisionHandler:
-	"""Handles mixed precision operations for training and inference."""
+    """Handles mixed precision operations for training and inference."""
 
-	def __init__(
-		self,
-		policy: Union[str, Policy],
-		use_dynamic_scale: bool = True,
-		loss_scale_config: LossScaleConfig = None,
-	):
-		self.policy = policy if isinstance(policy, Policy) else Policy.from_string(policy)
-		self.loss_scale_config = loss_scale_config or LossScaleConfig()
+    def __init__(
+        self,
+        policy: str | Policy,
+        use_dynamic_scale: bool = True,
+        loss_scale_config: LossScaleConfig = None,
+    ):
+        self.policy = policy if isinstance(policy, Policy) else Policy.from_string(policy)
+        self.loss_scale_config = loss_scale_config or LossScaleConfig()
 
-		if use_dynamic_scale:
-			self.loss_scaler = DynamicLossScale(
-				loss_scale=jnp.array(self.loss_scale_config.initial_scale),
-				period=self.loss_scale_config.growth_interval,
-				factor=self.loss_scale_config.scale_factor,
-				min_loss_scale=jnp.array(self.loss_scale_config.min_scale),
-			)
-		else:
-			self.loss_scaler = NoOpLossScale()
+        if use_dynamic_scale:
+            self.loss_scaler = DynamicLossScale(
+                loss_scale=jnp.array(self.loss_scale_config.initial_scale),
+                period=self.loss_scale_config.growth_interval,
+                factor=self.loss_scale_config.scale_factor,
+                min_loss_scale=jnp.array(self.loss_scale_config.min_scale),
+            )
+        else:
+            self.loss_scaler = NoOpLossScale()
 
-	@partial(jax.jit, static_argnums=(0,))
-	def cast_for_compute(self, x: Any) -> Any:
-		"""Cast input to computation dtype."""
-		return _cast_to_dtype(x, self.policy.compute_dtype)
+    @partial(jax.jit, static_argnums=(0,))
+    def cast_for_compute(self, x: Any) -> Any:
+        """Cast input to computation dtype."""
+        return _cast_to_dtype(x, self.policy.compute_dtype)
 
-	@partial(jax.jit, static_argnums=(0,))
-	def cast_for_output(self, x: Any) -> Any:
-		"""Cast output to output dtype."""
-		return _cast_to_dtype(x, self.policy.output_dtype)
+    @partial(jax.jit, static_argnums=(0,))
+    def cast_for_output(self, x: Any) -> Any:
+        """Cast output to output dtype."""
+        return _cast_to_dtype(x, self.policy.output_dtype)
 
-	def cast_params(self, params: Any) -> Any:
-		"""Cast parameters to parameter dtype."""
-		return _cast_to_dtype(params, self.policy.param_dtype)
+    def cast_params(self, params: Any) -> Any:
+        """Cast parameters to parameter dtype."""
+        return _cast_to_dtype(params, self.policy.param_dtype)
 
-	def training_step_wrapper(self, training_step_fn):
-		"""Wrap training step with precision and loss scaling handling."""
+    def training_step_wrapper(self, training_step_fn):
+        """Wrap training step with precision and loss scaling handling."""
 
-		def wrapped_step(*args, **kwargs):
-			# Cast inputs to compute precision
-			args = jax.tree_util.tree_map(self.cast_for_compute, args)
-			kwargs = jax.tree_util.tree_map(self.cast_for_compute, kwargs)
+        def wrapped_step(*args, **kwargs):
+            # Cast inputs to compute precision
+            args = jax.tree_util.tree_map(self.cast_for_compute, args)
+            kwargs = jax.tree_util.tree_map(self.cast_for_compute, kwargs)
 
-			# Run forward pass and get loss and gradients
-			loss, grads = training_step_fn(*args, **kwargs)
+            # Run forward pass and get loss and gradients
+            loss, grads = training_step_fn(*args, **kwargs)
 
-			# Scale loss for better numerical stability
-			scaled_loss = self.loss_scaler.scale(loss)
+            # Scale loss for better numerical stability
+            scaled_loss = self.loss_scaler.scale(loss)
 
-			# The gradients should be computed with respect to the scaled loss
-			# so we pass the scaled_loss back along with the unscaled gradients
-			grads = self.loss_scaler.unscale(grads)
+            # The gradients should be computed with respect to the scaled loss
+            # so we pass the scaled_loss back along with the unscaled gradients
+            grads = self.loss_scaler.unscale(grads)
 
-			# Check gradient finiteness
-			grads_finite = jax.tree_util.tree_reduce(
-				lambda x, y: x and jnp.all(jnp.isfinite(y)),
-				grads,
-				True,
-			)
+            # Check gradient finiteness
+            grads_finite = jax.tree_util.tree_reduce(
+                lambda x, y: x and jnp.all(jnp.isfinite(y)),
+                grads,
+                True,
+            )
 
-			# Update loss scaler state
-			self.loss_scaler = self.loss_scaler.adjust(grads_finite)
+            # Update loss scaler state
+            self.loss_scaler = self.loss_scaler.adjust(grads_finite)
 
-			# Cast outputs back to output precision
-			unscaled_loss = self.loss_scaler.unscale(
-				scaled_loss
-			)  # Unscale the loss before returning
-			final_loss = self.cast_for_output(unscaled_loss)
-			final_grads = jax.tree_util.tree_map(self.cast_for_output, grads)
+            # Cast outputs back to output precision
+            unscaled_loss = self.loss_scaler.unscale(scaled_loss)  # Unscale the loss before returning
+            final_loss = self.cast_for_output(unscaled_loss)
+            final_grads = jax.tree_util.tree_map(self.cast_for_output, grads)
 
-			return final_loss, final_grads, grads_finite
+            return final_loss, final_grads, grads_finite
 
-		return wrapped_step
+        return wrapped_step
 
-	def inference_wrapper(self, inference_fn):
-		"""Wrap inference function with precision handling."""
+    def inference_wrapper(self, inference_fn):
+        """Wrap inference function with precision handling."""
 
-		def wrapped_inference(*args, **kwargs):
-			args = jax.tree_util.tree_map(self.cast_for_compute, args)
-			kwargs = jax.tree_util.tree_map(self.cast_for_compute, kwargs)
-			outputs = inference_fn(*args, **kwargs)
-			return jax.tree_util.tree_map(self.cast_for_output, outputs)
+        def wrapped_inference(*args, **kwargs):
+            args = jax.tree_util.tree_map(self.cast_for_compute, args)
+            kwargs = jax.tree_util.tree_map(self.cast_for_compute, kwargs)
+            outputs = inference_fn(*args, **kwargs)
+            return jax.tree_util.tree_map(self.cast_for_output, outputs)
 
-		return wrapped_inference
+        return wrapped_inference

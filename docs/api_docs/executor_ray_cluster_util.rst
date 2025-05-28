@@ -1,7 +1,7 @@
-eformer.escale.tpexec.tpu_patcher
+eformer.executor.ray.cluster_util
 =================================
 
-.. automodule:: eformer.escale.tpexec.tpu_patcher
+.. automodule:: eformer.executor.ray.cluster_util
     :members:
     :undoc-members:
     :show-inheritance:

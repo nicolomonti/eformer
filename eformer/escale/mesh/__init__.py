@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .creation import create_mesh, parse_mesh_from_string 
+from .creation import create_mesh, parse_mesh_from_string
 from .mesh_helpers import MeshPartitionHelper
 
 __all__ = (
-	"create_mesh",
-	"parse_mesh_from_string", 
-	"MeshPartitionHelper",
+    "MeshPartitionHelper",
+    "create_mesh",
+    "parse_mesh_from_string",
 )

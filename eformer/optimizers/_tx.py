@@ -31,7 +31,7 @@ class OptaxScheduledWeightDecayState(tp.NamedTuple):
 
 def optax_add_scheduled_weight_decay(
     schedule_fn: tp.Callable[[chex.Array], chex.Array],
-    mask: tp.Optional[chex.ArrayTree] = None,
+    mask: chex.ArrayTree | None = None,
 ) -> optax.GradientTransformation:
     """
     Create an optax optimizer that applies weight decay on a schedule.
@@ -60,7 +60,7 @@ def optax_add_scheduled_weight_decay(
     def update_fn(
         updates: chex.ArrayTree,
         state: OptaxScheduledWeightDecayState,
-        params: tp.Optional[chex.ArrayTree] = None,
+        params: chex.ArrayTree | None = None,
     ) -> tuple[chex.ArrayTree, OptaxScheduledWeightDecayState]:
         """
         Applies weight decay to the updates based on the schedule.
@@ -69,12 +69,8 @@ def optax_add_scheduled_weight_decay(
             raise ValueError("Params cannot be None for weight decay!")
 
         weight_decay = schedule_fn(state.count)  # Get scheduled decay rate
-        updates = jax.tree_util.tree_map(
-            lambda g, p: g + weight_decay * p, updates, params
-        )
-        return updates, OptaxScheduledWeightDecayState(
-            count=optax.safe_int32_increment(state.count)
-        )
+        updates = jax.tree_util.tree_map(lambda g, p: g + weight_decay * p, updates, params)
+        return updates, OptaxScheduledWeightDecayState(count=optax.safe_int32_increment(state.count))
 
     if mask is not None:
         return optax.masked(optax.GradientTransformation(init_fn, update_fn), mask)
@@ -85,7 +81,7 @@ def create_linear_scheduler(
     steps: int,
     learning_rate_start: float,
     learning_rate_end: float,
-    warmup_steps: tp.Optional[int] = None,
+    warmup_steps: int | None = None,
 ) -> optax.Schedule:
     """
     Creates a linear learning rate scheduler with optional warmup.
@@ -110,9 +106,7 @@ def create_linear_scheduler(
             end_value=learning_rate_end,
             transition_steps=steps - warmup_steps,
         )
-        return optax.join_schedules(
-            schedules=[scheduler_warmup, scheduler_decay], boundaries=[warmup_steps]
-        )
+        return optax.join_schedules(schedules=[scheduler_warmup, scheduler_decay], boundaries=[warmup_steps])
     else:
         return optax.linear_schedule(
             init_value=learning_rate_start,
@@ -124,8 +118,8 @@ def create_linear_scheduler(
 def create_cosine_scheduler(
     steps: int,
     learning_rate: float,
-    learning_rate_end: tp.Optional[float] = None,
-    warmup_steps: tp.Optional[int] = None,
+    learning_rate_end: float | None = None,
+    warmup_steps: int | None = None,
     exponent: float = 1.0,
 ) -> optax.Schedule:
     """
@@ -151,9 +145,7 @@ def create_cosine_scheduler(
             exponent=exponent,
         )
     else:
-        return optax.cosine_decay_schedule(
-            init_value=learning_rate, decay_steps=steps, alpha=learning_rate_end or 0.0
-        )
+        return optax.cosine_decay_schedule(init_value=learning_rate, decay_steps=steps, alpha=learning_rate_end or 0.0)
 
 
 def get_base_optimizer(
@@ -161,9 +153,9 @@ def get_base_optimizer(
     scheduler: optax.Schedule,
     optimizer_kwargs: dict,
     weight_decay: float = 0.0,
-    weight_decay_mask: tp.Optional[tp.Any] = None,
+    weight_decay_mask: tp.Any | None = None,
     gradient_accumulation_steps: int = 1,
-    clip_grad: tp.Optional[float] = None,
+    clip_grad: float | None = None,
     **kwargs,
 ) -> optax.GradientTransformation:
     """

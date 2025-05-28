@@ -13,6 +13,6 @@
 # limitations under the License.
 
 
-from .loss_scaler import LossScaleConfig, DynamicLossScale, NoOpLossScale
+from .loss_scaler import DynamicLossScale, LossScaleConfig, NoOpLossScale
 
-__all__ = ("LossScaleConfig", "DynamicLossScale", "NoOpLossScale")
+__all__ = ("DynamicLossScale", "LossScaleConfig", "NoOpLossScale")

@@ -25,9 +25,9 @@ from jax import numpy as jnp
 
 
 class _Empty:
-	"""A sentinel class used to indicate a value that has not been explicitly provided."""
+    """A sentinel class used to indicate a value that has not been explicitly provided."""
 
-	pass
+    pass
 
 
 # Type aliases for common JAX and Python types
@@ -47,7 +47,7 @@ AxisNames = tuple[str, ...]
 """Type alias for a tuple of mesh axis names."""
 AxisIdxes = tuple[int, ...]
 """Type alias for a tuple of axis indices."""
-AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str, tp.Any]]
+AxisType = tuple[str, ...] | str | tp.Any | None
 """
 Type alias for a mesh axis specification.
 
@@ -111,91 +111,91 @@ MODE_INSERT = "__insert__"
 
 # Set of modes considered as generation modes
 GENERATION_MODES = {
-	MODE_DECODE,
-	MODE_INSERT,
+    MODE_DECODE,
+    MODE_INSERT,
 }
 """Set of runtime modes considered as generation modes."""
 
 # Type alias for runtime modes
 RUNTIME_MODE_TYPES = tp.Literal[
-	MODE_DECODE,
-	MODE_PREFILL,
-	MODE_TRAIN,
-	MODE_INSERT,
+    MODE_DECODE,
+    MODE_PREFILL,
+    MODE_TRAIN,
+    MODE_INSERT,
 ]
 """Type alias for the possible runtime modes."""
 
 
 class DynamicShardingAxes(tp.NamedTuple):
-	"""
-	A NamedTuple to define sharding axes and mode dynamically.
+    """
+    A NamedTuple to define sharding axes and mode dynamically.
 
-	Used to specify sharding based on the runtime mode or other dynamic factors.
+    Used to specify sharding based on the runtime mode or other dynamic factors.
 
-	Attributes:
-	    axes: A sequence of semantic axis names or None.
-	    mode: The runtime mode (string constant) or an integer representing
-	          the dimension index to check for mode inference.
-	"""
+    Attributes:
+        axes: A sequence of semantic axis names or None.
+        mode: The runtime mode (string constant) or an integer representing
+              the dimension index to check for mode inference.
+    """
 
-	axes: tp.Sequence[tp.Optional[str]]
-	mode: RUNTIME_MODE_TYPES | int  # type:ignore
+    axes: tp.Sequence[str | None]
+    mode: RUNTIME_MODE_TYPES | int  # type:ignore
 
 
 class HiddenStateSharding(DynamicShardingAxes):
-	"""Dynamic sharding specification for hidden states."""
+    """Dynamic sharding specification for hidden states."""
 
-	axes = [BATCH, QUERY_LENGTH, EMBED]
-	mode = 1  # Infer mode based on the second dimension (sequence length)
+    axes: tp.ClassVar = [BATCH, QUERY_LENGTH, EMBED]
+    mode: tp.ClassVar = 1  # Infer mode based on the second dimension (sequence length)
 
 
 class AttnQSharding(DynamicShardingAxes):
-	"""Dynamic sharding specification for attention queries."""
+    """Dynamic sharding specification for attention queries."""
 
-	axes = [BATCH, QUERY_LENGTH, HEAD, HEAD_DIM]
-	mode = 1  # Infer mode based on the second dimension (sequence length)
+    axes: tp.ClassVar = [BATCH, QUERY_LENGTH, HEAD, HEAD_DIM]
+    mode: tp.ClassVar = 1  # Infer mode based on the second dimension (sequence length)
 
 
 class AttnKVSharding(DynamicShardingAxes):
-	"""Dynamic sharding specification for attention keys/values."""
+    """Dynamic sharding specification for attention keys/values."""
 
-	axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
-	mode = 1  # Infer mode based on the second dimension (sequence length)
+    axes: tp.ClassVar = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
+    mode: tp.ClassVar = 1  # Infer mode based on the second dimension (sequence length)
 
 
 class RowWise(DynamicShardingAxes):
-	"""Dynamic sharding specification for Row Wise sharding."""
+    """Dynamic sharding specification for Row Wise sharding."""
 
-	axes = [TP, [FSDP, SP]]
-	mode = MODE_TRAIN
+    axes: tp.ClassVar = [TP, [FSDP, SP]]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 class SRowWise(DynamicShardingAxes):
-	"""Dynamic sharding specification for Row Wise sharding."""
+    """Dynamic sharding specification for Row Wise sharding."""
 
-	axes = [TP]
-	mode = MODE_TRAIN
+    axes: tp.ClassVar = [TP]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 class ColumnWise(DynamicShardingAxes):
-	"""Dynamic sharding specification for Column Wise sharding."""
+    """Dynamic sharding specification for Column Wise sharding."""
 
-	axes = [[FSDP, SP], TP]
-	mode = MODE_TRAIN
+    axes: tp.ClassVar = [[FSDP, SP], TP]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 class SColumnWise(DynamicShardingAxes):
-	"""Dynamic sharding specification for Column Wise sharding."""
+    """Dynamic sharding specification for Column Wise sharding."""
 
-	axes = [[FSDP, SP]]
-	mode = MODE_TRAIN
+    axes: tp.ClassVar = [[FSDP, SP]]
+    mode = MODE_TRAIN
 
 
 class Replicated(DynamicShardingAxes):
-	"""Dynamic sharding specification for Column Wise sharding."""
+    """Dynamic sharding specification for Column Wise sharding."""
 
-	axes = [EMPTY]
-	mode = MODE_TRAIN
+    axes: tp.ClassVar = [EMPTY]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)

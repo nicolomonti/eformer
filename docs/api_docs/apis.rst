@@ -1,17 +1,17 @@
-eformer APIs 🔮
+eFormer APIs 🔮
 ====
-    
+
 .. toctree::
    :maxdepth: 2
-   
-   Aparser
-   Callib
-   Common Types
-   Escale
-   Init
-   Jaximus
-   Mpric
-   Ops
-   Optimizers
-   Pytree
+
+   aparser
+   callib
+   common types
+   escale
+   executor
+   jaximus
+   mpric
+   ops
+   optimizers
+   pytree
    

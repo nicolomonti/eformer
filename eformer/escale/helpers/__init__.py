@@ -13,19 +13,19 @@
 # limitations under the License.
 
 from .base import (
-	AutoShardingRule,
-	CompositeShardingRule,
-	MemoryConstrainedShardingRule,
-	ShapeBasedShardingRule,
-	ShardingAnalyzer,
-	ShardingRule,
+    AutoShardingRule,
+    CompositeShardingRule,
+    MemoryConstrainedShardingRule,
+    ShapeBasedShardingRule,
+    ShardingAnalyzer,
+    ShardingRule,
 )
 
 __all__ = (
-	"AutoShardingRule",
-	"CompositeShardingRule",
-	"MemoryConstrainedShardingRule",
-	"ShapeBasedShardingRule",
-	"ShardingAnalyzer",
-	"ShardingRule",
+    "AutoShardingRule",
+    "CompositeShardingRule",
+    "MemoryConstrainedShardingRule",
+    "ShapeBasedShardingRule",
+    "ShardingAnalyzer",
+    "ShardingRule",
 )

@@ -2,7 +2,7 @@
 name = "eformer"
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 readme = "README.md"
-version = "0.0.38"
+version = "0.0.39"
 
 classifiers = [
 	"Development Status :: 3 - Alpha",
@@ -47,25 +47,32 @@ pyyaml = "~6.0.2"
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"eformer" = ["py.typed"]
+
+[tool.black]
+line-length = 121
+target-version = ["py310"]
+preview = true
+
+
+[tool.ruff]
+line-length = 121
+target-version = "py310"
+
+
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B"]
-ignore = ["E501", "B905", "B007"]
-unfixable = ["B"]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = ["F722", "B008", "UP015", "A005"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
-"**/{tests,docs,tools}/*" = ["E402"]
-"tests/*" = ["E402", "E731", "F403", "F405"]
-"benchmarks/*" = ["E402", "E731"]
-"triton_*" = ["E741", "ISC001", "E501", "E731"]
-"pallas_*" = ["E741", "ISC001", "E501", "E731"]
 
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "tab"
-docstring-code-format = true
+[tool.mypy]
+python_version = "3.10"
 
-[tool.ruff]
-target-version = "py311"
-line-length = 88
-indent-width = 2
+ignore_missing_imports = true
+exclude = ["eformer/"]

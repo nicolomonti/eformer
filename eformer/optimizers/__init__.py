@@ -24,9 +24,9 @@ from ._factory import OptimizerFactory, SchedulerFactory
 __all__ = (
     "AdafactorConfig",
     "AdamWConfig",
-    "RMSPropConfig",
     "LionConfig",
-    "SchedulerConfig",
     "OptimizerFactory",
+    "RMSPropConfig",
+    "SchedulerConfig",
     "SchedulerFactory",
 )
