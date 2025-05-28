@@ -335,7 +335,6 @@ def setup_cluster(use_external):
 
     head_ip = ips[0]
     worker_ips = ips[1:]
-    TPU_CORES_PER_HOST = TPU_SLICE_SIZE // len(ips)
 
     print(f"Setting up Ray cluster with {'external' if use_external else 'internal'} IPs")
     print(f"TPU Version: {TPU_VERSION}")
@@ -631,8 +630,6 @@ def main():
         head_ip = ips_to_use[0]
         slice_head_ip = slice_config["ips"][0]
         slice_tpu_cores = slice_config.get("tpu_cores", TPU_SLICE_SIZE)
-        hosts_in_slice = len(slice_config["ips"])
-        tpu_cores_per_host = slice_tpu_cores // hosts_in_slice
 
         if args.stop:
             run_local_command(f"{RAY_PATH} stop", False)
@@ -641,8 +638,8 @@ def main():
         if local_ip == head_ip:
             print("This machine is the global head node")
             resources = {
-                "TPU": tpu_cores_per_host,
-                f"TPU-{TPU_VERSION}": tpu_cores_per_host,
+                "TPU": TPU_CORES_PER_HOST,
+                f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
                 f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,
                 f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,
                 f"slice-{slice_idx}": 1,
@@ -666,7 +663,7 @@ def main():
             print(f"This machine is a slice head node for slice {slice_idx + 1}, connecting to global head at {head_ip}")
             resources = json.dumps(
                 {
-                    "TPU": tpu_cores_per_host,
+                    "TPU": TPU_CORES_PER_HOST,
                     f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,
                     f"TPU-{TPU_VERSION}-{slice_tpu_cores}-slice-{slice_idx}-head": 1,
                     f"slice-{slice_idx}": 1,
@@ -688,8 +685,8 @@ def main():
             print(f"This machine is a worker node in slice {slice_idx + 1}, connecting to global head at {head_ip}")
             resources = json.dumps(
                 {
-                    "TPU": tpu_cores_per_host,
-                    f"TPU-{TPU_VERSION}": tpu_cores_per_host,
+                    "TPU": TPU_CORES_PER_HOST,
+                    f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
                     f"TPU-{TPU_VERSION}-worker": 1,
                     f"slice-{slice_idx}": 1,
                     f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,

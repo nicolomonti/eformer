@@ -224,7 +224,7 @@ class PartitionAxis(xTree):
         resolve_field("query_sequence_axis", lambda: self.sequence_parallel_axis)
         # Default qS = S rule
         resolve_field("head_axis", lambda: self.tensor_parallel_axis)
-        resolve_field("kv_head_axis", lambda: None)
+        resolve_field("kv_head_axis", lambda: self.tensor_parallel_axis)
         resolve_field("key_sequence_axis", lambda: self.sequence_parallel_axis)
         # Default kS = S rule
         resolve_field("hidden_state_axis", lambda: self.tensor_parallel_axis)
