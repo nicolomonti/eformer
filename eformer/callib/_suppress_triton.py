@@ -44,32 +44,34 @@ class OutputSuppressor:
 
     def start(self):
         """Start suppressing C-level stderr output."""
-        if not SUPPRESSION_AVAILABLE or self.suppressing:
-            return False
+        if os.environ.get("LET_TRITON_TALK", "true").lower() in ["1", "true", "on"]:
+            if not SUPPRESSION_AVAILABLE or self.suppressing:
+                return False
 
-        try:
-            self.old_stderr_fd = libc.dup(STDERR_FILENO)
-            if sys.platform == "win32":
-                self.null_fd = os.open("NUL", os.O_WRONLY)
-            else:
-                self.null_fd = os.open("/dev/null", os.O_WRONLY)
-            libc.dup2(self.null_fd, STDERR_FILENO)
-            self.suppressing = True
-            return True
-        except (OSError, AttributeError):
-            self.cleanup()
-            return False
+            try:
+                self.old_stderr_fd = libc.dup(STDERR_FILENO)
+                if sys.platform == "win32":
+                    self.null_fd = os.open("NUL", os.O_WRONLY)
+                else:
+                    self.null_fd = os.open("/dev/null", os.O_WRONLY)
+                libc.dup2(self.null_fd, STDERR_FILENO)
+                self.suppressing = True
+                return True
+            except (OSError, AttributeError):
+                self.cleanup()
+                return False
 
     def stop(self):
         """Stop suppressing C-level stderr output and restore original stderr."""
-        if not self.suppressing:
-            return
+        if os.environ.get("LET_TRITON_TALK", "true").lower() in ["1", "true", "on"]:
+            if not self.suppressing:
+                return
 
-        try:
-            if self.old_stderr_fd is not None:
-                libc.dup2(self.old_stderr_fd, STDERR_FILENO)
-        finally:
-            self.cleanup()
+            try:
+                if self.old_stderr_fd is not None:
+                    libc.dup2(self.old_stderr_fd, STDERR_FILENO)
+            finally:
+                self.cleanup()
 
     def cleanup(self):
         """Clean up resources."""
@@ -141,18 +143,21 @@ def enable_all_triton_output():
 
 
 @contextmanager
-def no_triton_logs():
+def disable_cpp_logs(verbose: bool = False):
     """Context manager to temporarily suppress Triton kernel autotuning logs."""
-    started = suppress_triton_logs()
-    try:
-        yield started
-    finally:
-        if started:
-            restore_triton_logs()
+    if verbose:
+        yield False
+    else:
+        started = suppress_triton_logs()
+        try:
+            yield started
+        finally:
+            if started:
+                restore_triton_logs()
 
 
 if __name__ == "__main__":
-    with no_triton_logs():
+    with disable_cpp_logs():
         print("Inside the context manager - C/C++ stderr is suppressed")
 
     suppress_triton_logs()

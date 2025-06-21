@@ -42,7 +42,7 @@ from jax._src.lib import gpu_triton as triton_kernel_call_lib
 from jax._src.lib.mlir import ir
 from jax.interpreters import mlir, xla
 
-from ._suppress_triton import enable_all_triton_output, silence_all_triton_output
+from ._suppress_triton import disable_cpp_logs
 
 CAN_USE_TRITON = False
 try:
@@ -651,7 +651,8 @@ def get_or_create_triton_kernel(
         args_for_specialization_attr[i] = v
 
     specialization_attr = backend.get_attrs_descriptor(
-        fn.params[: len(args_for_specialization_attr)], args_for_specialization_attr
+        fn.params[: len(args_for_specialization_attr)],
+        args_for_specialization_attr,
     )
     # pylint: disable=protected-access
     constants = dict(metaparams)
@@ -1046,7 +1047,7 @@ def triton_call(
     debug: bool = False,
     serialized_metadata: bytes = b"",
     device: int = 0,
-    disable_verbose_logging: bool = False,
+    disable_verbose_logging: bool = True,
     **metaparams: Any,
 ) -> Any:
     """Calls a Triton kernel with `jax.Array` arguments.
@@ -1106,121 +1107,121 @@ def triton_call(
       determined by the `out_shape` parameter.
     """
 
+    assert len([s for s in args if s is None]) == 0, "you can not pass any None Arguments into a Triton Kernel!."
+
     if not CAN_USE_TRITON:
         raise ValueError("`triton_call` is only available when `triton` is installed.")
-
     try:
-        if disable_verbose_logging:
-            silence_all_triton_output()
-        out_shape = tree_util.tree_map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape)
-        flat_args, _ = tree_util.tree_flatten(args)
-        flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
+        with disable_cpp_logs(verbose=not disable_verbose_logging):
+            out_shape = tree_util.tree_map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape)
+            flat_args, _ = tree_util.tree_flatten(args)
+            flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
-        array_args = []
-        scalar_args = []
-        for i, arg in enumerate(flat_args):
-            if isinstance(arg, bool | int | float):
-                scalar_args.append((i, get_triton_type(arg), arg))
-            elif isinstance(arg, np.float32):
-                scalar_args.append((i, get_triton_type(arg), float(arg)))
-            else:
-                array_args.append(arg)
-
-        if input_output_aliases is None:
-            input_output_aliases = {}
-
-        if disable_verbose_logging:
-            logging_options = {
-                "disable_verbose_logging": "1",
-                "disable_autotune_warnings": "1",
-                "disable_performance_warnings": "1",
-            }
-
-            metadata_string = ""
-            for key, value in logging_options.items():
-                metadata_string += f"{key}={value};"
-
-            if serialized_metadata:
-                serialized_metadata = serialized_metadata + metadata_string.encode()
-            else:
-                serialized_metadata = metadata_string.encode()
-
-        if triton.runtime.driver.active.get_current_target().backend != "cpu":
-            out_flat = triton_kernel_call_p.bind(
-                *array_args,
-                fn=kernel,
-                scalar_args=tuple(scalar_args),
-                name=name,
-                custom_call_target_name=custom_call_target_name,
-                out_shapes=tuple(flat_out_shapes),
-                grid=grid,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                num_ctas=num_ctas,
-                compute_capability=compute_capability,
-                enable_fp_fusion=enable_fp_fusion,
-                input_output_aliases=tuple(input_output_aliases.items()),
-                zeroed_outputs=zeroed_outputs,
-                debug=debug,
-                serialized_metadata=serialized_metadata,
-                device=device,
-                **metaparams,
-            )
-        else:
-            if isinstance(kernel, autotuner.Autotuner):
-                for config in kernel.configs:
-                    if config.pre_hook is not None:
-                        raise NotImplementedError("`pre_hook` is not supported")
-
-            class Pointer:
-                def __init__(self, x):
-                    self.x = x
-                    self.dtype = x.dtype
-
-                def data_ptr(self):
-                    return self.x.unsafe_buffer_pointer()
-
-            def to_triton_arg(arg):
-                if arg.ndim == 0:
-                    dtypes = {
-                        jnp.bool.dtype: bool,
-                        jnp.int32.dtype: int,
-                        jnp.int64.dtype: int,
-                        jnp.float32.dtype: float,
-                        jnp.float64.dtype: float,
-                    }
-                    if arg.dtype not in dtypes:
-                        raise ValueError(f"Invalid argument {arg} with type {arg.dtype}.")
-                    return dtypes[arg.dtype](arg)
+            array_args = []
+            scalar_args = []
+            for i, arg in enumerate(flat_args):
+                if isinstance(arg, bool | int | float):
+                    scalar_args.append((i, get_triton_type(arg), arg))
+                elif isinstance(arg, np.float32):
+                    scalar_args.append((i, get_triton_type(arg), float(arg)))
                 else:
-                    return Pointer(arg)
+                    array_args.append(arg)
 
-            def callback(flat_args, outputs):
-                kernel[lambda meta: normalize_grid(grid, metaparams | meta)](
-                    *map(to_triton_arg, flat_args),
-                    *map(Pointer, outputs),
+            if input_output_aliases is None:
+                input_output_aliases = {}
+
+            if disable_verbose_logging:
+                logging_options = {
+                    "disable_verbose_logging": "1",
+                    "disable_autotune_warnings": "1",
+                    "disable_performance_warnings": "1",
+                }
+
+                metadata_string = ""
+                for key, value in logging_options.items():
+                    metadata_string += f"{key}={value};"
+
+                if serialized_metadata:
+                    serialized_metadata = serialized_metadata + metadata_string.encode()
+                else:
+                    serialized_metadata = metadata_string.encode()
+
+            if triton.runtime.driver.active.get_current_target().backend != "cpu":
+                out_flat = triton_kernel_call_p.bind(
+                    *array_args,
+                    fn=kernel,
+                    scalar_args=tuple(scalar_args),
+                    name=name,
+                    custom_call_target_name=custom_call_target_name,
+                    out_shapes=tuple(flat_out_shapes),
+                    grid=grid,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    num_ctas=num_ctas,
+                    compute_capability=compute_capability,
+                    enable_fp_fusion=enable_fp_fusion,
+                    input_output_aliases=tuple(input_output_aliases.items()),
+                    zeroed_outputs=zeroed_outputs,
+                    debug=debug,
+                    serialized_metadata=serialized_metadata,
+                    device=device,
                     **metaparams,
                 )
-                return outputs
+            else:
+                if isinstance(kernel, autotuner.Autotuner):
+                    for config in kernel.configs:
+                        if config.pre_hook is not None:
+                            raise NotImplementedError("`pre_hook` is not supported")
 
-            config_zeroed_outputs = zeroed_outputs
-            if callable(zeroed_outputs):
-                config_zeroed_outputs = config_zeroed_outputs(metaparams)
+                class Pointer:
+                    def __init__(self, x):
+                        self.x = x
+                        self.dtype = x.dtype
 
-            output_input_aliases = {}
-            for input_idx, output_idx in input_output_aliases.items():
-                if output_idx in output_input_aliases:
-                    raise NotImplementedError("Multiple inputs aliased to the same output is not supported.")
-                output_input_aliases[output_idx] = flat_args[input_idx]
-                if output_idx in config_zeroed_outputs:
-                    flat_args[input_idx] = flat_args[input_idx].at[:].set(0)
-            out_shapes = tuple(flat_out_shapes)
-            outputs = [
-                output_input_aliases.get(i, jnp.zeros(shape.shape, shape.dtype)) for i, shape in enumerate(out_shapes)
-            ]
-            out_flat = jax.pure_callback(callback, out_shapes, flat_args, outputs)
-        result = tree_util.tree_unflatten(out_tree, out_flat)
-        return result
-    except Exception:
-        enable_all_triton_output()
-        raise
+                    def data_ptr(self):
+                        return self.x.unsafe_buffer_pointer()
+
+                def to_triton_arg(arg):
+                    if arg.ndim == 0:
+                        dtypes = {
+                            jnp.bool.dtype: bool,
+                            jnp.int32.dtype: int,
+                            jnp.int64.dtype: int,
+                            jnp.float32.dtype: float,
+                            jnp.float64.dtype: float,
+                        }
+                        if arg.dtype not in dtypes:
+                            raise ValueError(f"Invalid argument {arg} with type {arg.dtype}.")
+                        return dtypes[arg.dtype](arg)
+                    else:
+                        return Pointer(arg)
+
+                def callback(flat_args, outputs):
+                    kernel[lambda meta: normalize_grid(grid, metaparams | meta)](
+                        *map(to_triton_arg, flat_args),
+                        *map(Pointer, outputs),
+                        **metaparams,
+                    )
+                    return outputs
+
+                config_zeroed_outputs = zeroed_outputs
+                if callable(zeroed_outputs):
+                    config_zeroed_outputs = config_zeroed_outputs(metaparams)
+
+                output_input_aliases = {}
+                for input_idx, output_idx in input_output_aliases.items():
+                    if output_idx in output_input_aliases:
+                        raise NotImplementedError("Multiple inputs aliased to the same output is not supported.")
+                    output_input_aliases[output_idx] = flat_args[input_idx]
+                    if output_idx in config_zeroed_outputs:
+                        flat_args[input_idx] = flat_args[input_idx].at[:].set(0)
+                out_shapes = tuple(flat_out_shapes)
+                outputs = [
+                    output_input_aliases.get(i, jnp.zeros(shape.shape, shape.dtype))
+                    for i, shape in enumerate(out_shapes)
+                ]
+                out_flat = jax.pure_callback(callback, out_shapes, flat_args, outputs)
+            result = tree_util.tree_unflatten(out_tree, out_flat)
+            return result
+    except Exception as e:
+        raise e
