@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyright: reportUnsupportedDunderAll=none
+
 __version__ = "0.0.42"
 
 __all__ = (

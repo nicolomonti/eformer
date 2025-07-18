@@ -57,7 +57,7 @@ def _is_non_jax_type(typ: type) -> bool:
         return False
 
     origin = tp.get_origin(typ)
-    if origin is tp.Union:
+    if origin is tp.Union:  # type:ignore
         args = tp.get_args(typ)
         return any(_is_non_jax_type(arg) for arg in args)
 
@@ -127,6 +127,7 @@ def auto_pytree(
     meta_fields: tuple[str, ...] | None = None,
     json_serializable: bool = True,
     frozen: bool = False,
+    max_print_length: int = 500,
 ):
     """
     A class decorator that automatically registers a dataclass as a JAX PyTree.
@@ -206,7 +207,7 @@ def auto_pytree(
                 if not k.startswith("_"):  # Avoid private/internal attributes
                     try:
                         repr_str = str(v).replace("\n", "\n  ")
-                        if len(repr_str) > 200:  # Truncate long representations
+                        if len(repr_str) > max_print_length:  # Truncate long representations
                             repr_str = f"{v.__class__.__name__}(...)"
                         items.append(f"  {k} : {repr_str}")
                     except TypeError:
