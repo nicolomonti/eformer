@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -191,7 +191,7 @@ def with_sharding_constraint(
     else:
         raise TypeError(f"Unsupported sharding type: {type(sharding)}")
 
-    if  mesh.empty:
+    if mesh.empty:
         if LOG_SHARDING_MOVE:
             warnings.warn(
                 "Attempted to apply sharding constraint with an empty mesh. Constraint ignored.",

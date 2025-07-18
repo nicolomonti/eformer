@@ -1,8 +1,9 @@
-git+https://github.com/erfanzar/fjformer.git
+git+https://github.com/erfanzar/eformer.git
 torch
 numpy
 sentencepiece
 accelerate
+triton
 
 sphinx
 sphinx-autobuild

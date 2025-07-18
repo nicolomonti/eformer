@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._cjit import cjit, compile_function, load_cached_functions, lower_function
+from ._ejit import ejit, load_cached_functions
 from ._suppress_triton import disable_cpp_logs
 from ._triton_call import cdiv, get_triton_type, next_power_of_2, normalize_grid, strides_from_shape, triton_call
 
 __all__ = (
     "cdiv",
-    "cjit",
     "compile_function",
     "disable_cpp_logs",
+    "ejit",
     "get_triton_type",
     "load_cached_functions",
     "lower_function",

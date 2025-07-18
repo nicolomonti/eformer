@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
 # Copyright 2023 The Equinox Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
