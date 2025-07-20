@@ -54,7 +54,7 @@ def find_ray_in_current_env() -> pathlib.Path:
     raise FileNotFoundError("ray executable could not be located")
 
 
-RAY_PATH = find_ray_in_current_env()
+RAY_PATH = str(find_ray_in_current_env())
 
 
 def get_external_ip():
