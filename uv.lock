@@ -315,7 +315,7 @@ wheels = [
 
 [[package]]
 name = "eformer"
-version = "0.0.42"
+version = "0.0.43"
 source = { editable = "." }
 dependencies = [
     { name = "chex" },

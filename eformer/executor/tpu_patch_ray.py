@@ -34,7 +34,7 @@ SSH_USER = os.getenv("PATCHER_USER")
 INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
 
-RAY_PATH = f"{pathlib.Path.home()}/.local/bin/ray"
+RAY_PATH = os.getenv("RAY_EXECUTABLE_PATH", f"{pathlib.Path.home()}/.local/bin/ray")
 
 
 def get_external_ip():
