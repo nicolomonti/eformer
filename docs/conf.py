@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, os.path.abspath(".."))
 
 project = "eformer"
-copyright = "2058, Erfan Zare Chavoshi - eformer"  # noqa
+copyright = "2025, Erfan Zare Chavoshi - eformer"  # noqa
 author = "Erfan Zare Chavoshi"
 
 extensions = [
