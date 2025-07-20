@@ -14,7 +14,7 @@
 
 # pyright: reportUnsupportedDunderAll=none
 
-__version__ = "0.0.43"
+__version__ = "0.0.44"
 
 __all__ = (
     "aparser",

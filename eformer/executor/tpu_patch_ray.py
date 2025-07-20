@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -34,7 +35,26 @@ SSH_USER = os.getenv("PATCHER_USER")
 INTERNAL_IPS = ["0.0.0.0"]
 EXTERNAL_IPS = ["0.0.0.0"]
 
-RAY_PATH = os.getenv("RAY_EXECUTABLE_PATH", f"{pathlib.Path.home()}/.local/bin/ray")
+
+def find_ray_in_current_env() -> pathlib.Path:
+    """Return the absolute path to 'ray' inside the current venv (or system)."""
+    if ray := os.getenv("RAY_EXECUTABLE_PATH"):
+        return pathlib.Path(ray).expanduser().resolve()
+
+    bin_dir = pathlib.Path(sys.executable).parent
+    ray_path = bin_dir / "ray"
+
+    if ray_path.is_file():
+        return ray_path
+
+    ray_path = shutil.which("ray")
+    if ray_path:
+        return pathlib.Path(ray_path)
+
+    raise FileNotFoundError("ray executable could not be located")
+
+
+RAY_PATH = find_ray_in_current_env()
 
 
 def get_external_ip():
