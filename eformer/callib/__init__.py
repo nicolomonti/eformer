@@ -18,12 +18,10 @@ from ._triton_call import cdiv, get_triton_type, next_power_of_2, normalize_grid
 
 __all__ = (
     "cdiv",
-    "compile_function",
     "disable_cpp_logs",
     "ejit",
     "get_triton_type",
     "load_cached_functions",
-    "lower_function",
     "next_power_of_2",
     "normalize_grid",
     "strides_from_shape",

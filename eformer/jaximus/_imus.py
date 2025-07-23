@@ -31,6 +31,7 @@ import chex
 import jax
 import jax._src
 import jax._src.lax
+import jax._src.pjit
 import jax.core
 import jax.core as core
 import jax.extend
@@ -751,7 +752,7 @@ def _is_value(x) -> TypeGuard[ImplicitArray]:
     return isinstance(x, ImplicitArray)
 
 
-@register(jax._src.pjit.pjit_p)
+@register(jax._src.pjit.jit_p)
 def _(
     *args: ImplicitArray | ArrayLike,
     jaxpr,
@@ -760,6 +761,7 @@ def _(
 ):
     del kwargs
     fun = use_implicit(jax.extend.core.jaxpr_as_fun(jaxpr))
+    return fun(*args)
     if inline:
         return fun(*args)
     else:

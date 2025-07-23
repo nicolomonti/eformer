@@ -188,3 +188,61 @@ def dequantize_nf4(packed_values, absmax, block_size):
             out_axes=(0,),
         )(packed_values, absmax, block_size)
     return single_dequantize_nf4(packed_values, absmax, block_size)
+
+
+@jax.jit
+def pack_weights_1bit(quantized_weights: jnp.ndarray) -> jnp.ndarray:
+    """
+    Packs a JAX array of quantized weights into a compact format using 2 bits per value.
+
+    Parameters:
+    -----------
+    quantized_weights : jnp.ndarray
+        An array containing ternary quantized weights {-1, 0, 1}. The first dimension must be
+        a multiple of 4.
+
+    Returns:
+    --------
+    jnp.ndarray
+        A packed jnp.uint8 array.
+    """
+    original_shape = quantized_weights.shape
+    if original_shape[0] % 4 != 0:
+        raise ValueError(f"The first dimension must be a multiple of {4}. Got shape {original_shape}.")
+
+    unpacked = (quantized_weights + 1).astype(jnp.uint8)
+    reshaped = unpacked.reshape((4, original_shape[0] // 4, *original_shape[1:]))
+    shifter = jnp.arange(0, 2 * 4, 2, dtype=jnp.uint8)
+    shifter = shifter.reshape((4,) + (1,) * (reshaped.ndim - 1))
+    shifted_values = reshaped << shifter
+    packed = jnp.sum(shifted_values, axis=0, dtype=jnp.uint8)
+
+    return packed
+
+
+@functools.partial(jax.jit, static_argnames="dtype")
+def unpack_weights_1bit(packed: jnp.ndarray, dtype: jnp.dtype) -> jnp.ndarray:
+    """
+    Unpacks a JAX array of quantized weights, matching the logic of the PyTorch original.
+    This function concatenates the unpacked bit groups.
+
+    Parameters:
+    -----------
+    packed : jnp.ndarray
+        A packed jnp.uint8 array.
+    dtype : jnp.dtype
+        The dtype of the returned array (e.g., jnp.int8). This is a static argument for JIT.
+
+    Returns:
+    --------
+    jnp.ndarray
+        An unpacked array with ternary values {-1, 0, 1}.
+    """
+    shifter = jnp.arange(0, 2 * 4, 2, dtype=jnp.uint8)
+    shifter = shifter.reshape((4,) + (1,) * packed.ndim)
+    unpacked_groups = (packed >> shifter) & 3
+    original_row_dim = packed.shape[0] * 4
+    unpacked_shape = (original_row_dim, *packed.shape[1:])
+    unpacked = unpacked_groups.reshape(unpacked_shape)
+
+    return unpacked.astype(dtype) - 1

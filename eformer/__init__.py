@@ -14,17 +14,6 @@
 
 # pyright: reportUnsupportedDunderAll=none
 
-__version__ = "0.0.46"
+__version__ = "0.0.47"
 
-__all__ = (
-    "aparser",
-    "callib",
-    "common_types",
-    "escale",
-    "executor",
-    "jaximus",
-    "mpric",
-    "ops",
-    "optimizers",
-    "pytree",
-)
+__all__ = ("aparser", "callib", "common_types", "escale", "executor", "jaximus", "mpric", "ops", "optimizers", "pytree")

@@ -23,10 +23,7 @@ from jax.extend.core import Primitive
 
 from eformer.jaximus import ImplicitArray, aux_field, register
 
-from .quantization_functions import (
-    dequantize_nf4,
-    quantize_and_pack_nf4,
-)
+from .quantization_functions import dequantize_nf4, quantize_and_pack_nf4
 
 Array = jax.Array
 
@@ -146,7 +143,7 @@ def _(primitive: Primitive, x: Any, **kwargs) -> Any:
 
 
 @register("div")
-def _(primitive: Primitive, x: Any, y: Any) -> Any:
+def _(primitive: Primitive, x: ArrayType, y: ArrayType) -> Any:
     if isinstance(x, ArrayNF4):
         x = x.materialize()
     if isinstance(y, ArrayNF4):
@@ -189,7 +186,7 @@ def convert_element_type_nf4_operand_kw(primitive: Primitive, operand: ArrayType
 
 
 @register("integer_pow")
-def integer_pow_nf4_xy(primitive: Primitive, x: Any, y: Any) -> Any:
+def integer_pow_nf4_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> Any:
     if isinstance(x, ArrayNF4):
         x = x.materialize()
     if isinstance(y, ArrayNF4):
@@ -198,7 +195,7 @@ def integer_pow_nf4_xy(primitive: Primitive, x: Any, y: Any) -> Any:
 
 
 @register("integer_pow")
-def integer_pow_nf4_x(primitive: Primitive, x: Any, **kwargs) -> Any:
+def integer_pow_nf4_x(primitive: Primitive, x: ArrayType, **kwargs) -> Any:
     y = kwargs.get("y", 2)
     if isinstance(x, ArrayNF4):
         x = x.materialize()
@@ -206,7 +203,7 @@ def integer_pow_nf4_x(primitive: Primitive, x: Any, **kwargs) -> Any:
 
 
 @register("div")
-def div_nf4_xy(primitive: Primitive, x: Any, y: Any) -> Any:
+def div_nf4_xy(primitive: Primitive, x: ArrayType, y: ArrayType) -> Any:
     if isinstance(x, ArrayNF4):
         x = x.materialize()
     if isinstance(y, ArrayNF4):

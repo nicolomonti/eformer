@@ -38,8 +38,8 @@ _NODE_NAME = "SLURMD_NODENAME"
 class eRayExecutorSlurmCluster(clusters.SlurmCluster):
     @classmethod
     def get_coordinator_address(cls) -> str:
-        id = os.environ[_JOBID_PARAM]
-        port = _choose_port(id)
+        _id = os.environ[_JOBID_PARAM]
+        port = _choose_port(_id)
         node_list = eRayExecutorSlurmCluster._node_list()
         if node_list is None:
             raise ValueError(
@@ -159,8 +159,8 @@ def _touch(file_path):
         os.utime(file_path, None)
 
 
-def _choose_port(id):
-    port = int(id) % 2**12 + (65535 - 2**12 + 1)
+def _choose_port(_id):
+    port = int(_id) % 2**12 + (65535 - 2**12 + 1)
     return port
 
 

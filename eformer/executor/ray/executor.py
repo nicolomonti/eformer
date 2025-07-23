@@ -399,12 +399,14 @@ class RayExecutor:
                 if "preempted" in str(e).lower():
                     num_preemptions += 1
                     logger.warning(
-                        f"Multislice operation preempted during setup/coordination (RayError). Preemption count: {num_preemptions}. Error: {e}"
+                        f"Multislice operation preempted during setup/coordination (RayError). "
+                        f"Preemption count: {num_preemptions}. Error: {e}"
                     )
                 else:
                     num_failures += 1
                     logger.warning(
-                        f"Multislice operation failed during setup/coordination (RayError). Failure count: {num_failures}.",
+                        f"Multislice operation failed during setup/coordination (RayError)."
+                        f" Failure count: {num_failures}.",
                         exc_info=e,
                     )
                 continue
@@ -465,7 +467,10 @@ class RayExecutor:
                         exc_info=single_slice_status.error,
                     )
                 else:
-                    err_msg = f"Unexpected result type {type(single_slice_status)} from slice {slice_idx}: {single_slice_status}"
+                    err_msg = (
+                        f"Unexpected result type {type(single_slice_status)} "
+                        f"from slice {slice_idx}: {single_slice_status}"
+                    )
                     if not problem:
                         problem = RuntimeError(err_msg)
                     current_attempt_overall_failed = True
@@ -474,14 +479,16 @@ class RayExecutor:
             if current_attempt_overall_failed:
                 num_failures += 1
                 logger.warning(
-                    f"At least one slice failed or reported an error this attempt. Overall failure count: {num_failures}. Last/first error: {problem}",
+                    f"At least one slice failed or reported an error this attempt. Overall failure "
+                    f"count: {num_failures}. Last/first error: {problem}",
                 )
                 continue
 
             if current_attempt_overall_preempted:
                 num_preemptions += 1
                 logger.warning(
-                    f"At least one slice was preempted (and no failures) this attempt. Overall preemption count: {num_preemptions}. Last/first error: {problem}",
+                    f"At least one slice was preempted (and no failures) this attempt. Overall preemption count:"
+                    f" {num_preemptions}. Last/first error: {problem}",
                 )
                 continue
             if (
@@ -493,7 +500,8 @@ class RayExecutor:
                 return aggregated_successful_slice_results
             else:
                 logger.error(
-                    "Inconsistent state in multislice resumable logic after processing slice results. Treating as failure."
+                    "Inconsistent state in multislice resumable logic after "
+                    "processing slice results. Treating as failure."
                 )
                 num_failures += 1
                 problem = problem or RuntimeError("Inconsistent state in multislice resumable after processing results")
