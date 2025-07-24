@@ -309,9 +309,11 @@ def start_ray_worker(head_ip, worker_ip, use_external, worker_count):
         return False
 
 
-def verify_ray_cluster(head_ip, expected_tpu_count):
+def verify_ray_cluster(head_ip, expected_tpu_count, allow_head_only=False):
     """Verify Ray cluster setup."""
     print("Verifying Ray cluster setup...")
+    if allow_head_only and expected_tpu_count == 0:
+        print("Head-only node detected (no TPU resources)")
     create_verification_script()
     env = os.environ.copy()
     env["EXPECTED_TPU_COUNT"] = str(expected_tpu_count)
@@ -461,52 +463,20 @@ def main():
     global TPU_VERSION, TPU_SLICE_SIZE, SSH_USER, INTERNAL_IPS, EXTERNAL_IPS
 
     parser = argparse.ArgumentParser(description="Ray TPU Cluster Setup for TPU Slices")
-    parser.add_argument(
-        "--external",
-        action="store_true",
-        help="Use external IPs instead of internal IPs",
-    )
-    parser.add_argument(
-        "--stop",
-        action="store_true",
-        help="Stop the Ray cluster",
-    )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Verify the Ray cluster setup",
-    )
-    parser.add_argument(
-        "--tpu-version",
-        default=TPU_VERSION,
-        help=f"Set TPU version (default: {TPU_VERSION})",
-    )
+    parser.add_argument("--external", action="store_true", help="Use external IPs instead of internal IPs")
+    parser.add_argument("--stop", action="store_true", help="Stop the Ray cluster")
+    parser.add_argument("--verify", action="store_true", help="Verify the Ray cluster setup")
+    parser.add_argument("--tpu-version", default=TPU_VERSION, help=f"Set TPU version (default: {TPU_VERSION})")
     parser.add_argument(
         "--tpu-slice",
         type=int,
         default=TPU_SLICE_SIZE,
         help=f"Set TPU slice size (default: {TPU_SLICE_SIZE})",
     )
-    parser.add_argument(
-        "--num-slices",
-        type=int,
-        default=1,
-        help="Number of TPU slices to combine (default: 1)",
-    )
-    parser.add_argument(
-        "--ssh-user",
-        default=SSH_USER,
-        help=f"SSH username to use (default: {SSH_USER})",
-    )
-    parser.add_argument(
-        "--config",
-        help="Path to YAML config file with IP addresses",
-    )
-    parser.add_argument(
-        "--test-ssh",
-        action="store_true",
-        help="Test SSH connectivity to all nodes",
-    )
+    parser.add_argument("--num-slices", type=int, default=1, help="Number of TPU slices to combine (default: 1)")
+    parser.add_argument("--ssh-user", default=SSH_USER, help=f"SSH username to use (default: {SSH_USER})")
+    parser.add_argument("--config", help="Path to YAML config file with IP addresses")
+    parser.add_argument("--test-ssh", action="store_true", help="Test SSH connectivity to all nodes")
     parser.add_argument(
         "--internal-ips",
         help="Comma-separated list of internal IPs for all slices (e.g. 10.164.0.3,10.164.0.7,...)",
@@ -515,16 +485,10 @@ def main():
         "--external-ips",
         help="Comma-separated list of external IPs for all slices (e.g. 35.224.1.1,35.224.1.2,...)",
     )
-    parser.add_argument(
-        "--self-job",
-        action="store_true",
-        help="Run only on the current machine (no SSH to other machines)",
-    )
-    parser.add_argument(
-        "--slice-config",
-        help="Path to YAML config file with slice configurations",
-    )
-
+    parser.add_argument("--self-job", action="store_true", help="Run only on the current machine")
+    parser.add_argument("--slice-config", help="Path to YAML config file with slice configurations")
+    parser.add_argument("--head-node-ip", help="IP address of external head node (if not using first IP in list)")
+    parser.add_argument("--head-only", action="store_true", help="Run this node as head only (no TPU resources)")
     args = parser.parse_args()
     using_external = args.external or args.internal_ips is None
     TPU_VERSION = args.tpu_version
@@ -590,8 +554,17 @@ def main():
 
     if args.self_job:
         local_ip = get_external_ip() if using_external else get_local_ip()
+        external_head_ip = args.head_node_ip
+        is_head_only = args.head_only
+
         print(f"Running in self-job mode on {local_ip}")
+        if external_head_ip:
+            print(f"Using external head node at: {external_head_ip}")
+        if is_head_only:
+            print("Running as head-only node (no TPU resources)")
+
         print(f"Using Ray command: {RAY_PATH}")
+
         try:
             subprocess.run([RAY_PATH, "--version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
@@ -608,64 +581,68 @@ def main():
             print("No Ray process was running or could not stop Ray")
 
         time.sleep(3)
-        if not ips_to_use and EXTERNAL_IPS:
-            print("Warning: No internal IPs provided but external IPs exist.")
-            print("For self-job mode, internal IPs are required.")
-            print("Attempting to use local IP as internal IP...")
-            ips_to_use = [local_ip]
-
-        slice_idx = -1
-        host_idx_in_slice = -1
-
-        for i, slice_config in enumerate(slice_configs):
-            if args.self_job:
-                if local_ip in slice_config["ips"]:
-                    slice_idx = i
-                    host_idx_in_slice = slice_config["ips"].index(local_ip)
-                    break
-
-        if slice_idx == -1:
-            if local_ip in ips_to_use:
-                host_idx = ips_to_use.index(local_ip)
-                hosts_per_slice = len(ips_to_use) // num_slices
-                slice_idx = host_idx // hosts_per_slice
-                host_idx_in_slice = host_idx % hosts_per_slice
-            else:
-                print(f"Error: Local IP {local_ip} not found in any slice configuration or IP list")
-                return 1
-
-        if slice_configs:
-            slice_config = slice_configs[slice_idx]
-        else:
-            hosts_per_slice = len(ips_to_use) // num_slices
-            start_idx = slice_idx * hosts_per_slice
-            end_idx = start_idx + hosts_per_slice
-            slice_ips = ips_to_use[start_idx:end_idx]
-            slice_config = {
-                "name": f"slice-{slice_idx + 1}",
-                "ips": slice_ips,
-                "tpu_cores": TPU_SLICE_SIZE,
-            }
-
-        head_ip = ips_to_use[0]
-        slice_head_ip = slice_config["ips"][0]
-        slice_tpu_cores = slice_config.get("tpu_cores", TPU_SLICE_SIZE)
 
         if args.stop:
             run_local_command(f"{RAY_PATH} stop", False)
             return 0
 
-        if local_ip == head_ip:
-            print("This machine is the global head node")
-            resources = {
-                "TPU": TPU_CORES_PER_HOST,
-                f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
-                f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,
-                f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,
-                f"slice-{slice_idx}": 1,
-                f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
-                f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
-            }
+        is_external_head = external_head_ip and local_ip == external_head_ip
+
+        if external_head_ip:
+            head_ip = external_head_ip
+        else:
+            ips_to_use = EXTERNAL_IPS if using_external else INTERNAL_IPS
+            if not ips_to_use:
+                print("Error: No IPs provided")
+                return 1
+            head_ip = ips_to_use[0]
+
+        # Check if current machine is the head
+        is_head_node = is_external_head or (local_ip == head_ip and not external_head_ip)
+
+        if is_head_node:
+            print(f"This machine ({local_ip}) is the HEAD node")
+
+            if is_head_only:
+                resources = {"head-node": 1, "control-plane": 1, "ray-cluster-head": 1}
+                print("Starting as head-only node (no TPU resources)")
+            else:
+                print("Starting as head node with TPU resources")
+
+                slice_idx = -1
+                host_idx_in_slice = -1
+
+                for i, slice_config in enumerate(slice_configs):
+                    if local_ip in slice_config["ips"]:
+                        slice_idx = i
+                        host_idx_in_slice = slice_config["ips"].index(local_ip)
+                        break
+
+                if slice_idx == -1 and not is_head_only:
+                    ips_to_use = EXTERNAL_IPS if using_external else INTERNAL_IPS
+                    if local_ip in ips_to_use:
+                        host_idx = ips_to_use.index(local_ip)
+                        hosts_per_slice = len(ips_to_use) // num_slices
+                        slice_idx = host_idx // hosts_per_slice
+                        host_idx_in_slice = host_idx % hosts_per_slice
+                    else:
+                        print(f"Warning: Local IP {local_ip} not found in slice configuration")
+                        slice_idx = 0
+                        host_idx_in_slice = 0
+
+                resources = {
+                    "TPU": TPU_CORES_PER_HOST,
+                    f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
+                    f"TPU-{TPU_VERSION}-{TPU_SLICE_SIZE}-head": 1,
+                    f"TPU-{TPU_VERSION}-{total_tpu_cores}-global-head": 1,
+                    f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
+                    "head-node": 1,
+                    "ray-cluster-head": 1,
+                }
+
+                if slice_idx >= 0:
+                    resources[f"slice-{slice_idx}"] = 1
+                    resources[f"slice-{slice_idx}-host-{host_idx_in_slice}"] = 1
 
             resources_str = str(resources).replace("'", '"')
             cmd = [
@@ -677,45 +654,92 @@ def main():
                 f"--node-ip-address={local_ip}",
                 "--dashboard-host=0.0.0.0",
             ]
-            run_local_command(cmd, False)
 
-        elif local_ip == slice_head_ip and local_ip != head_ip:
-            print(f"This machine is a slice head node for slice {slice_idx + 1}, connecting to global head at {head_ip}")
-            resources = json.dumps(
-                {
-                    "TPU": TPU_CORES_PER_HOST,
-                    f"TPU-{TPU_VERSION}-{slice_tpu_cores}-head": 1,
-                    f"TPU-{TPU_VERSION}-{slice_tpu_cores}-slice-{slice_idx}-head": 1,
-                    f"slice-{slice_idx}": 1,
-                    f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
-                    f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
-                }
-            )
-            cmd = [
-                RAY_PATH,
-                "start",
-                "--address",
-                f"{head_ip}:6379",
-                f"--resources='{resources}'",
-                f"--node-ip-address={local_ip}",
-            ]
-            run_local_command(cmd, False)
+            print(f"Starting Ray head with command: {' '.join(cmd)}")
+            success = run_local_command(cmd, False)
+
+            if success:
+                print("\nRay head started successfully!")
+                print(f"Dashboard available at: http://{local_ip}:8265")
+                print(f"Ray cluster address: {local_ip}:6379")
+                if is_head_only:
+                    print("\nWaiting for TPU workers to connect...")
+                    print("Run the script on TPU nodes with --head-node-ip " + local_ip)
+            else:
+                print("Failed to start Ray head")
+                return 1
 
         else:
-            print(f"This machine is a worker node in slice {slice_idx + 1}, connecting to global head at {head_ip}")
-            resources = json.dumps(
-                {
-                    "TPU": TPU_CORES_PER_HOST,
-                    f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
-                    f"TPU-{TPU_VERSION}-worker": 1,
-                    f"slice-{slice_idx}": 1,
-                    f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
-                    f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
-                }
-            )
+            print(f"This machine ({local_ip}) is a WORKER node")
+            print(f"Will connect to head node at: {head_ip}")
 
-            cmd = f"{RAY_PATH} start --address={head_ip}:6379 --resources='{resources}' --node-ip-address={local_ip}"
-            run_local_command(cmd, False)
+            ips_to_use = EXTERNAL_IPS if using_external else INTERNAL_IPS
+            if external_head_ip and external_head_ip in ips_to_use:
+                ips_to_use = [ip for ip in ips_to_use if ip != external_head_ip]
+
+            slice_idx = -1
+            host_idx_in_slice = -1
+
+            for i, slice_config in enumerate(slice_configs):
+                if local_ip in slice_config["ips"]:
+                    slice_idx = i
+                    host_idx_in_slice = slice_config["ips"].index(local_ip)
+                    break
+
+            if slice_idx == -1:
+                if local_ip in ips_to_use:
+                    host_idx = ips_to_use.index(local_ip)
+                    hosts_per_slice = len(ips_to_use) // num_slices
+                    slice_idx = host_idx // hosts_per_slice
+                    host_idx_in_slice = host_idx % hosts_per_slice
+                else:
+                    print(f"Error: Local IP {local_ip} not found in worker configuration")
+                    return 1
+
+            is_slice_head = False
+            if slice_configs and slice_idx >= 0:
+                slice_config = slice_configs[slice_idx]
+                is_slice_head = (host_idx_in_slice == 0) and (slice_idx > 0 or external_head_ip)
+
+            resources = {
+                "TPU": TPU_CORES_PER_HOST,
+                f"TPU-{TPU_VERSION}": TPU_CORES_PER_HOST,
+                f"accelerator_type:TPU-{TPU_VERSION.upper()}": 1,
+                f"slice-{slice_idx}": 1,
+                f"slice-{slice_idx}-host-{host_idx_in_slice}": 1,
+            }
+
+            if is_slice_head:
+                resources[f"TPU-{TPU_VERSION}-{TPU_SLICE_SIZE}-slice-{slice_idx}-head"] = 1
+                print(f"This worker is slice head for slice {slice_idx}")
+            else:
+                resources[f"TPU-{TPU_VERSION}-worker"] = 1
+                resources[f"TPU-{TPU_VERSION}-worker-{slice_idx}-{host_idx_in_slice}"] = 1
+
+            resources_str = json.dumps(resources)
+            cmd = f"{RAY_PATH} start --address={head_ip}:6379 --resources='{resources_str}' --node-ip-address={local_ip}"
+
+            print(f"Starting Ray worker with command: {cmd}")
+            success = run_local_command(cmd, False)
+
+            if success:
+                print("\nRay worker started successfully!")
+                print(f"Connected to head at: {head_ip}:6379")
+                print(f"Worker resources: {resources}")
+            else:
+                print("Failed to start Ray worker")
+                return 1
+
+        if is_head_node and args.verify:
+            print("\nWaiting for cluster to stabilize...")
+            time.sleep(10)
+            expected_tpu = total_tpu_cores if not is_head_only else total_tpu_cores - TPU_CORES_PER_HOST
+
+            if verify_ray_cluster(head_ip, expected_tpu):
+                print("Cluster verification successful!")
+            else:
+                print("Cluster verification failed!")
+                return 1
 
         return 0
 
