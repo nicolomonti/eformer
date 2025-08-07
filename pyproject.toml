@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eformer"
-version = "0.0.47"
+version = "0.0.48"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
 readme = "README.md"
@@ -61,12 +61,12 @@ where = ["."]
 
 [tool.black]
 line-length = 121
-target-version = ["py310"]
+target-version = ["py311"]
 preview = true
 
 [tool.ruff]
 line-length = 121
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
@@ -76,7 +76,7 @@ ignore = ["F722", "B008", "UP015", "A005"]
 "__init__.py" = ["E402", "F401"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 ignore_missing_imports = true
 exclude = ["eformer/"]
 
