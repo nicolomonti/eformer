@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,6 @@ COLORS: dict[str, str] = {
     "BLUE_PURPLE": "\033[38;5;99m",
 }
 
-# Mapping log levels to colors
 LEVEL_COLORS: dict[str, str] = {
     "DEBUG": COLORS["ORANGE"],
     "INFO": COLORS["BLUE_PURPLE"],
@@ -81,6 +81,10 @@ _LOGGING_LEVELS: dict[str, int] = {
     "debug": 10,
     "notset": 0,
 }
+
+
+def _resources_json(d: dict) -> str:
+    return json.dumps(d, separators=(",", ":"))
 
 
 class ColorFormatter(logging.Formatter):
@@ -185,10 +189,10 @@ class RayManager:
 
         try:
             if remote_ip:
-                # Run command remotely via SSH
                 if isinstance(full_command, list):
-                    full_command = " ".join(full_command)
-
+                    remote_cmd = shlex.join([str(c) for c in full_command])
+                else:
+                    remote_cmd = full_command
                 ssh_command = [
                     "ssh",
                     "-o",
@@ -196,29 +200,22 @@ class RayManager:
                     "-o",
                     "ConnectTimeout=5",
                     f"{SSH_USER}@{remote_ip}",
-                    full_command,
+                    remote_cmd,
                 ]
-
-                if capture_output:
-                    result = subprocess.run(ssh_command, check=True, capture_output=True, text=True)
-                    self.logger.debug(f"Remote command output: {result.stdout}")
-                    return result.stdout
-                else:
-                    subprocess.run(ssh_command, check=True)
-                    self.logger.debug("Remote command executed successfully")
-                    return True
+                result = subprocess.run(ssh_command, check=check, capture_output=capture_output, text=True)
+                return result.stdout if capture_output else (result.returncode == 0)
             else:
-                # Run command locally
-                if capture_output:
-                    result = subprocess.run(
-                        full_command, shell=isinstance(full_command, str), check=check, capture_output=True, text=True
-                    )
-                    self.logger.debug(f"Local command output: {result.stdout}")
-                    return result.stdout
+                if isinstance(full_command, list):
+                    result = subprocess.run(full_command, check=check, capture_output=capture_output, text=True)
                 else:
-                    subprocess.run(full_command, shell=isinstance(full_command, str), check=check)
-                    self.logger.debug("Local command executed successfully")
-                    return True
+                    result = subprocess.run(
+                        full_command,
+                        shell=True,
+                        check=check,
+                        capture_output=capture_output,
+                        text=True,
+                    )
+                return result.stdout if capture_output else (result.returncode == 0)
         except subprocess.CalledProcessError as e:
             location = f"on {remote_ip}" if remote_ip else "locally"
             self.logger.error(f"Command failed {location}: {cmd_str}. Error: {e.stderr}")
@@ -257,7 +254,7 @@ class RayManager:
             self.stop_node(head_ip)
             time.sleep(3)
 
-        resources_str = json.dumps(resources)
+        resources_str = _resources_json(resources)
         cmd = [
             self.ray_path,
             "start",
@@ -287,8 +284,14 @@ class RayManager:
             self.stop_node(worker_ip)
             time.sleep(3)
 
-        resources_str = json.dumps(resources)
-        cmd = f"{self.ray_path} start --address={head_ip}:6379 --resources={resources_str} --node-ip-address={worker_ip}"
+        resources_str = _resources_json(resources)
+        cmd = [
+            str(self.ray_path),
+            "start",
+            f"--address={head_ip}:6379",
+            f"--resources={resources_str}",
+            f"--node-ip-address={worker_ip}",
+        ]
         success = self.run_command(cmd, remote_ip=None if local_ip == worker_ip else worker_ip)
 
         if success:
