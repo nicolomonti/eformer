@@ -37,6 +37,7 @@ from .types import (
     JobStatus,
     JobSucceeded,
     handle_ray_error,
+    print_remote_raise,
 )
 
 __all__ = (

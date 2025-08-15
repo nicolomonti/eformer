@@ -16,17 +16,13 @@ from __future__ import annotations
 
 import logging
 import sys
+import traceback
 from dataclasses import dataclass
 
 import ray
 import tblib
-from ray.exceptions import (
-    NodeDiedError,
-    RayError,
-    RaySystemError,
-    RayTaskError,
-    WorkerCrashedError,
-)
+from ray.exceptions import NodeDiedError, RayError, RaySystemError, RayTaskError, WorkerCrashedError
+from tblib import Traceback
 
 logger = logging.getLogger("ray")
 
@@ -35,10 +31,7 @@ def handle_ray_error(job_info: JobInfo, e: RayError):
     if isinstance(e, NodeDiedError):
         logger.exception("Node died", exc_info=e)
         return JobPreempted(job_info, e)
-    elif isinstance(
-        e,
-        ray.exceptions.ActorUnavailableError | ray.exceptions.ActorDiedError,
-    ):
+    elif isinstance(e, ray.exceptions.ActorUnavailableError | ray.exceptions.ActorDiedError):
         logger.exception("Actor died", exc_info=e)
         return JobPreempted(job_info, e)
     elif isinstance(e, WorkerCrashedError):
@@ -172,3 +165,13 @@ class JobError(JobStatus):
     """
 
     error: Exception
+
+
+def print_remote_raise(ray_error):
+    """
+    Args:
+        ray_error: The .error attribute from a Ray task output,
+                   containing a pickled exception with tblib.Traceback.
+    """
+    tb: Traceback = ray_error.cause.args[0].tb
+    traceback.print_tb(tb.as_traceback())
