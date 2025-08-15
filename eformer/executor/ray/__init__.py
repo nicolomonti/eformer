@@ -61,4 +61,5 @@ __all__ = (
     "execute_multislice_resumable",
     "execute_resumable",
     "handle_ray_error",
+    "print_remote_raise",
 )
