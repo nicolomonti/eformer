@@ -14,6 +14,6 @@
 
 from .checkpoint_manager import CheckpointManager
 from .host_checkpoint_manager import HostCheckpointManager
-from .loader import Loader
+from .loader import SerializationLoader
 
-__all__ = ("CheckpointManager", "HostCheckpointManager", "Loader")
+__all__ = ("CheckpointManager", "HostCheckpointManager", "SerializationLoader")

@@ -29,7 +29,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import flatten_dict, is_flatten, serialization, unflatten_dict
 
 from .checkpoint_manager import CheckpointManager
-from .loader import Loader
+from .loader import SerializationLoader
 from .utils import (
     apply_gather_functions,
     derive_base_prefix_from_path,
@@ -86,7 +86,7 @@ class HostCheckpointManager(CheckpointManager):
         self.max_concurrent_shards = max_concurrent_shards
         self.use_async_io = use_async_io
         self.optimize_shard_layout = optimize_shard_layout
-        self.loader = Loader(
+        self.loader = SerializationLoader(
             memory_limit_bytes=self.memory_limit_bytes,
             enable_single_replica_loading=enable_single_replica_loading,
             max_workers=max_concurrent_shards,
@@ -116,7 +116,7 @@ class HostCheckpointManager(CheckpointManager):
         3. Memory-aware streaming
         """
         # Create optimized loader instance
-        loader = Loader(
+        loader = SerializationLoader(
             memory_limit_bytes=(memory_limit_mb * 1024 * 1024) if memory_limit_mb else None,
             enable_single_replica_loading=enable_single_replica,
             max_workers=max_concurrent,
@@ -151,7 +151,7 @@ class HostCheckpointManager(CheckpointManager):
     def _load_with_single_replica_broadcast(
         cls,
         path: str,
-        loader: Loader,
+        loader: SerializationLoader,
         shard_fns: dict | None,
         verbose: bool,
         mismatch_allowed: bool,
