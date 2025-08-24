@@ -22,6 +22,7 @@ import jax
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
@@ -167,7 +168,7 @@ class HostCheckpointManager(CheckpointManager):
                 logger.info("Process 0 loading checkpoint for broadcast")
 
             # Load checkpoint metadata and structure
-            state, metadata = cls.load_checkpoint(
+            tree, metadata = cls.load_checkpoint(
                 path=path,
                 shard_fns=shard_fns,
                 verbose=verbose,
@@ -177,15 +178,15 @@ class HostCheckpointManager(CheckpointManager):
                 gcs_client=gcs_client,
             )
 
-            # Prepare state for broadcasting
-            flat_state = flatten_for_broadcast(state)
+            # Prepare tree for broadcasting
+            flat_state = flatten_for_broadcast(tree)
         else:
             if verbose:
                 logger.info(f"Process {jax.process_index()} waiting for broadcast")
             flat_state = None
             metadata = None
 
-        # Broadcast state structure first (lightweight)
+        # Broadcast tree structure first (lightweight)
         if jax.process_index() == 0:
             state_structure = {k: (v.shape, v.dtype) for k, v in flat_state.items()}
         else:
@@ -204,9 +205,9 @@ class HostCheckpointManager(CheckpointManager):
 
             broadcasted_state[key] = loader.broadcast_tensor(tensor)
 
-        state = unflatten_dict(broadcasted_state, sep=".")
+        tree = unflatten_dict(broadcasted_state, sep=".")
 
-        return state, metadata
+        return tree, metadata
 
     @classmethod
     def _load_with_concurrency(
@@ -276,7 +277,7 @@ class HostCheckpointManager(CheckpointManager):
         if shard_fns and not is_flatten(shard_fns):
             shard_fns = flatten_dict(shard_fns, sep=".")
 
-        state = {}
+        tree = {}
         mismatch_count = 0
 
         def load_shard(shard_name: str, keys: list[str]) -> tuple[dict, int]:
@@ -323,7 +324,7 @@ class HostCheckpointManager(CheckpointManager):
                 shard_name = futures[future]
                 try:
                     shard_state, shard_mismatch = future.result()
-                    state.update(shard_state)
+                    tree.update(shard_state)
                     mismatch_count += shard_mismatch
                     pbar.update(1)
                 except Exception as e:
@@ -335,16 +336,17 @@ class HostCheckpointManager(CheckpointManager):
         if verbose and mismatch_count:
             logger.info(f"Total sharding mismatches: {mismatch_count}")
 
-        state = unflatten_dict(state, sep=".")
+        tree = unflatten_dict(tree, sep=".")
         metadata = index_data.get("metadata", {})
 
-        return state, metadata
+        return tree, metadata
 
     @classmethod
     def save_checkpoint_optimized(
         cls,
-        state: dict,
+        tree: dict,
         path: str | os.PathLike,
+        mesh: Mesh,
         gather_fns: dict | bool | None = None,
         float_dtype: str | jnp.dtype | None = None,
         verbose: bool = True,
@@ -363,30 +365,30 @@ class HostCheckpointManager(CheckpointManager):
         3. Direct device-to-disk streaming
         """
 
-        state = serialization.to_state_dict(state)
-        if not is_flatten(state):
-            state = flatten_dict(state, sep=".")
+        tree = serialization.to_state_dict(tree)
+        if not is_flatten(tree):
+            tree = flatten_dict(tree, sep=".")
 
         # Apply gather functions if needed
         if gather_fns:
-            state = apply_gather_functions(state, gather_fns, mismatch_allowed, verbose)
+            tree = apply_gather_functions(tree, gather_fns, mismatch_allowed, verbose)
 
         # Apply dtype conversion
         if float_dtype:
-            state = jax.tree_util.tree_map(
-                lambda x: to_host(x, float_dtype),
-                state,
+            tree = jax.tree_util.tree_map(
+                lambda x: to_host(x, float_dtype, mesh),
+                tree,
                 is_leaf=lambda x: isinstance(x, (jax.Array, np.generic, float, int)),  # noqa
             )
 
         # Optimize shard layout if requested
         if optimize_layout and shard_size_gb:
             max_bytes = int(shard_size_gb * (1024**3))
-            shards = optimize_shard_layout(state, max_bytes)
+            shards = optimize_shard_layout(tree, max_bytes)
         else:
             # Use standard sharding
             max_bytes = int(shard_size_gb * (1024**3)) if shard_size_gb else None
-            shards = group_keys_by_shard_size(state, max_bytes) if max_bytes else [[k for k in state.keys()]]
+            shards = group_keys_by_shard_size(tree, max_bytes) if max_bytes else [[k for k in tree.keys()]]
 
         # Save shards concurrently
         base_prefix = derive_base_prefix_from_path(str(path))
@@ -394,7 +396,7 @@ class HostCheckpointManager(CheckpointManager):
 
         if total_shards > 1:
             cls._save_sharded_concurrent(
-                state=state,
+                tree=tree,
                 base_prefix=base_prefix,
                 shards=shards,
                 total_shards=total_shards,
@@ -419,13 +421,13 @@ class HostCheckpointManager(CheckpointManager):
             return index_path
         else:
             # Single shard - save directly
-            safe_flax.save_file(tensors=state, filename=str(path), metadata=metadata)
+            safe_flax.save_file(tensors=tree, filename=str(path), metadata=metadata)
             return str(path)
 
     @classmethod
     def _save_sharded_concurrent(
         cls,
-        state: dict,
+        tree: dict,
         base_prefix: str,
         shards: list[list[str]],
         total_shards: int,
@@ -438,7 +440,7 @@ class HostCheckpointManager(CheckpointManager):
         def save_shard(shard_idx: int, shard_keys: list[str]):
             """Save a single shard."""
             shard_path = shard_filename(base_prefix, shard_idx, total_shards)
-            shard_tensors = {k: state[k] for k in shard_keys}
+            shard_tensors = {k: tree[k] for k in shard_keys}
             safe_flax.save_file(tensors=shard_tensors, filename=shard_path, metadata=metadata)
             return shard_path
 

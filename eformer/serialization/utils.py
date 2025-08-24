@@ -53,11 +53,9 @@ def estimate_array_nbytes(array: jax.Array) -> int:
         Estimated size in bytes
     """
     try:
-        # Works for most jax dtypes
         itemsize = numpy.dtype(array.dtype).itemsize
         return int(array.size) * int(itemsize)
     except Exception:
-        # Fallback for exotic/4-bit dtypes
         if getattr(array, "dtype", None) in (jnp.int4, jnp.uint4):
             return (int(array.size) + 1) // 2
         v = jnp.asarray(array)
