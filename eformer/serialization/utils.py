@@ -33,10 +33,7 @@ logger = get_logger(__name__)
 def to_host(x: jax.Array, float_dtype: jnp.floating | None, mesh: Mesh):
     """Move array to host with optional dtype conversion."""
     if isinstance(x, jax.Array):
-        x = jax.device_put(
-            jax.device_put(x, NamedSharding(mesh, PartitionSpec())),
-            jax.devices("cpu")[0],
-        )
+        x = jax.device_put(x, NamedSharding(mesh, PartitionSpec()))
 
     if float_dtype:
         dtype = STRING_TO_DTYPE_MAP.get(float_dtype, float_dtype) if isinstance(float_dtype, str) else float_dtype
