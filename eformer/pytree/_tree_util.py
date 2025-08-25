@@ -13,16 +13,20 @@
 # limitations under the License.
 from __future__ import annotations
 
+import dataclasses
+import functools
 import typing as tp
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
-from typing import Any, overload
+from enum import Enum
+from typing import Any, TypeVar, cast, overload
 
 import jax
 import numpy as np
 from jax import Array
 from jax import numpy as jnp
 from jax import tree_util as tu
+from jax._src.tree_util import DictKey, FlattenedIndexKey, GetAttrKey, KeyEntry, PyTreeDef, SequenceKey
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
@@ -30,6 +34,14 @@ from eformer.loggings import get_logger
 
 from ._pytree import PyTree, auto_pytree
 
+
+class NonePolicy(str, Enum):
+    PRESERVE = "preserve"
+    REPLACE = "replace"
+    ERROR = "error"
+
+
+T = TypeVar("T")
 FnDict = dict[tp.Any, tp.Callable[[tp.Any], tp.Any]]
 TreeDict = dict[tp.Any, tp.Any]
 Path = tuple[tp.Any, ...]
@@ -37,7 +49,6 @@ Path = tuple[tp.Any, ...]
 
 logger = get_logger(__name__)
 
-T = tp.TypeVar("T")
 FnDict: tp.TypeAlias = dict[tp.Any, tp.Callable[[tp.Any], tp.Any]]
 TreeDict: tp.TypeAlias = dict[tp.Any, tp.Any]
 Path: tp.TypeAlias = tuple[tp.Any, ...]
@@ -56,6 +67,18 @@ IsLeafCallable = Callable[[tuple[Any, ...], Mapping[Any, Any]], bool]
 
 
 def _array_equal(x, y, npi, rtol, atol):
+    """Helper function to compare arrays with optional tolerance.
+
+    Args:
+        x: First array to compare.
+        y: Second array to compare.
+        npi: NumPy interface (numpy or jax.numpy).
+        rtol: Relative tolerance for floating point comparison.
+        atol: Absolute tolerance for floating point comparison.
+
+    Returns:
+        bool: True if arrays are equal within tolerance.
+    """
     assert x.dtype == y.dtype
     if (
         isinstance(rtol, int | float) and isinstance(atol, int | float) and rtol == 0 and atol == 0
@@ -270,12 +293,23 @@ def tree_map_with_path(
     """Maps a function over a pytree while providing the path to each leaf.
 
     Args:
-        f: Function that takes (path, leaf_value) as arguments
-        tree: Input pytree
-        is_leaf: Optional function to determine if a node is a leaf
+        f: Function that takes (path, leaf_value) as arguments. The path is a
+            tuple of string keys representing the location in the tree.
+        tree: Input pytree to map over.
+        is_leaf: Optional function to determine if a node is a leaf.
 
     Returns:
-        PyTree with mapped values
+        PyTree: New tree with same structure but values transformed by f.
+
+    Examples:
+        >>> tree = {"a": 1, "b": {"c": 2, "d": 3}}
+        >>> result = tree_map_with_path(
+        ...     lambda path, x: f"path={path}, value={x}",
+        ...     tree
+        ... )
+        >>> # Result: {"a": "path=('a',), value=1",
+        >>> #          "b": {"c": "path=('b', 'c'), value=2",
+        >>> #                "d": "path=('b', 'd'), value=3"}}
     """
 
     def _walk(path: tuple[str, ...], x):
@@ -297,12 +331,23 @@ def tree_flatten_with_paths(
 ) -> tuple[list[tuple[tuple, tp.Any]], tu.PyTreeDef]:  # type: ignore
     """Flattens a pytree while keeping track of paths to leaves.
 
+    This function is useful when you need both the flattened values and their
+    locations in the original tree structure.
+
     Args:
-        tree: Input pytree
-        is_leaf: Optional function to determine if a node is a leaf
+        tree: Input pytree to flatten.
+        is_leaf: Optional function to determine if a node is a leaf.
 
     Returns:
-        Tuple of (list of (path, value) pairs, treedef)
+        tuple: A pair of (paths_and_values, treedef) where:
+            - paths_and_values is a list of (path, value) tuples
+            - treedef is the tree structure definition
+
+    Examples:
+        >>> tree = {"weights": jnp.array([1, 2]), "bias": jnp.array([3])}
+        >>> paths_vals, treedef = tree_flatten_with_paths(tree)
+        >>> # paths_vals: [(('weights',), array([1, 2])),
+        >>> #              (('bias',), array([3]))]
     """
     paths_and_vals = []
 
@@ -736,6 +781,18 @@ def string_key_to_int(xs):
 
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
+    """Internal helper to flatten nested dictionaries.
+
+    Args:
+        xs: Dictionary to flatten.
+        keep_empty_nodes: If True, preserve empty dictionaries as special markers.
+        is_leaf: Optional function to determine leaf nodes.
+        sep: Optional separator for joining keys into strings.
+        fumap: If True, skip dictionary type checking.
+
+    Returns:
+        dict: Flattened dictionary with tuple or string keys.
+    """
     if not fumap:
         assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
 
@@ -781,6 +838,15 @@ def is_iterable(obj):
 
 
 def _dict_unflatten_dict(xs, sep=None):
+    """Internal helper to unflatten dictionaries.
+
+    Args:
+        xs: Flattened dictionary with tuple or string keys.
+        sep: Optional separator for string keys.
+
+    Returns:
+        dict: Nested dictionary structure.
+    """
     assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
     result = {}
     for path, value in xs.items():
@@ -1210,15 +1276,20 @@ def tree_norm(tree: PyTree, ord: tp.Any = 2) -> tp.Any:  # noqa: A002
 
 
 def tree_clip(tree: PyTree, min_val: tp.Any = None, max_val: tp.Any = None) -> PyTree:
-    """Clip values in a pytree.
+    """Clip values in a pytree to a specified range.
 
     Args:
-        tree: Input pytree
-        min_val: Minimum value for clipping
-        max_val: Maximum value for clipping
+        tree: Input pytree containing numerical arrays.
+        min_val: Minimum value for clipping (inclusive).
+        max_val: Maximum value for clipping (inclusive).
 
     Returns:
-        Clipped pytree
+        PyTree: New tree with values clipped to [min_val, max_val].
+
+    Examples:
+        >>> tree = {"weights": jnp.array([-2, 0, 5, 10])}
+        >>> clipped = tree_clip(tree, min_val=0, max_val=5)
+        >>> # Result: {"weights": array([0, 0, 5, 5])}
     """
 
     def clip_fn(x):
@@ -1233,11 +1304,17 @@ def tree_add(tree1: PyTree, tree2: PyTree) -> PyTree:
     """Element-wise addition of two pytrees.
 
     Args:
-        tree1: First pytree
-        tree2: Second pytree
+        tree1: First pytree.
+        tree2: Second pytree (must have same structure as tree1).
 
     Returns:
-        Sum of the two pytrees
+        PyTree: New tree with element-wise sum of values.
+
+    Examples:
+        >>> tree1 = {"a": jnp.array([1, 2]), "b": jnp.array([3])}
+        >>> tree2 = {"a": jnp.array([4, 5]), "b": jnp.array([6])}
+        >>> result = tree_add(tree1, tree2)
+        >>> # Result: {"a": array([5, 7]), "b": array([9])}
     """
     return tu.tree_map(lambda x, y: x + y, tree1, tree2)
 
@@ -1246,11 +1323,17 @@ def tree_subtract(tree1: PyTree, tree2: PyTree) -> PyTree:
     """Element-wise subtraction of two pytrees.
 
     Args:
-        tree1: First pytree
-        tree2: Second pytree
+        tree1: First pytree (minuend).
+        tree2: Second pytree (subtrahend, must have same structure).
 
     Returns:
-        Difference of the two pytrees
+        PyTree: New tree with element-wise difference (tree1 - tree2).
+
+    Examples:
+        >>> tree1 = {"a": jnp.array([5, 7]), "b": jnp.array([9])}
+        >>> tree2 = {"a": jnp.array([1, 2]), "b": jnp.array([3])}
+        >>> result = tree_subtract(tree1, tree2)
+        >>> # Result: {"a": array([4, 5]), "b": array([6])}
     """
     return tu.tree_map(lambda x, y: x - y, tree1, tree2)
 
@@ -1259,11 +1342,22 @@ def tree_multiply(tree1: PyTree, tree2: PyTree | tp.Any) -> PyTree:
     """Element-wise multiplication of pytrees or scalar multiplication.
 
     Args:
-        tree1: First pytree
-        tree2: Second pytree or scalar
+        tree1: First pytree.
+        tree2: Second pytree (same structure) or scalar value.
 
     Returns:
-        Product of the inputs
+        PyTree: New tree with element-wise or scalar product.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1, 2]), "b": jnp.array([3])}
+        >>> # Scalar multiplication
+        >>> result1 = tree_multiply(tree, 2)
+        >>> # Result: {"a": array([2, 4]), "b": array([6])}
+        >>>
+        >>> # Element-wise multiplication
+        >>> tree2 = {"a": jnp.array([2, 3]), "b": jnp.array([4])}
+        >>> result2 = tree_multiply(tree, tree2)
+        >>> # Result: {"a": array([2, 6]), "b": array([12])}
     """
     if tu.tree_structure(tree1, is_leaf=lambda x: False) == tu.tree_structure(tree2, is_leaf=lambda x: False):
         return tu.tree_map(lambda x, y: x * y, tree1, tree2)
@@ -1276,11 +1370,22 @@ def tree_divide(tree1: PyTree, tree2: PyTree | tp.Any) -> PyTree:
     """Element-wise division of pytrees or scalar division.
 
     Args:
-        tree1: First pytree
-        tree2: Second pytree or scalar
+        tree1: First pytree (dividend).
+        tree2: Second pytree (same structure) or scalar divisor.
 
     Returns:
-        Quotient of the inputs
+        PyTree: New tree with element-wise or scalar quotient.
+
+    Examples:
+        >>> tree = {"a": jnp.array([4.0, 6.0]), "b": jnp.array([8.0])}
+        >>> # Scalar division
+        >>> result1 = tree_divide(tree, 2.0)
+        >>> # Result: {"a": array([2.0, 3.0]), "b": array([4.0])}
+        >>>
+        >>> # Element-wise division
+        >>> tree2 = {"a": jnp.array([2.0, 3.0]), "b": jnp.array([4.0])}
+        >>> result2 = tree_divide(tree, tree2)
+        >>> # Result: {"a": array([2.0, 2.0]), "b": array([2.0])}
     """
     if tu.tree_structure(tree1, is_leaf=lambda x: False) == tu.tree_structure(tree2, is_leaf=lambda x: False):
         return tu.tree_map(lambda x, y: x / y, tree1, tree2)
@@ -1292,12 +1397,20 @@ def tree_divide(tree1: PyTree, tree2: PyTree | tp.Any) -> PyTree:
 def tree_dot(tree1: PyTree, tree2: PyTree) -> tp.Any:
     """Compute dot product of two pytrees.
 
+    Computes the sum of element-wise products across all arrays in the trees.
+
     Args:
-        tree1: First pytree
-        tree2: Second pytree
+        tree1: First pytree.
+        tree2: Second pytree (must have same structure).
 
     Returns:
-        Dot product value
+        Scalar value representing the dot product.
+
+    Examples:
+        >>> tree1 = {"a": jnp.array([1, 2]), "b": jnp.array([3])}
+        >>> tree2 = {"a": jnp.array([4, 5]), "b": jnp.array([6])}
+        >>> result = tree_dot(tree1, tree2)
+        >>> # Result: (1*4 + 2*5) + (3*6) = 14 + 18 = 32
     """
     products = tu.tree_map(lambda x, y: jnp.sum(x * y) if is_array_like(x) else x * y, tree1, tree2)
     return tree_sum(products)
@@ -1312,13 +1425,29 @@ def tree_random_like(
     """Create a pytree with random values matching the structure of input tree.
 
     Args:
-        tree: Template pytree
-        key: JAX random key
-        distribution: Distribution type ('normal', 'uniform', 'bernoulli')
-        **kwargs: Additional arguments for the distribution
+        tree: Template pytree to match structure and shapes.
+        key: JAX random key for reproducible randomness.
+        distribution: Distribution type ('normal', 'uniform', 'bernoulli').
+        **kwargs: Additional arguments for the distribution:
+            - For 'normal': mean, std
+            - For 'uniform': minval, maxval
+            - For 'bernoulli': p (probability)
 
     Returns:
-        New pytree with random values
+        PyTree: New tree with same structure but random values.
+
+    Examples:
+        >>> key = jax.random.PRNGKey(0)
+        >>> tree = {"weights": jnp.zeros((2, 3))}
+        >>>
+        >>> # Normal distribution
+        >>> result1 = tree_random_like(tree, key, "normal")
+        >>>
+        >>> # Uniform distribution [0, 1)
+        >>> result2 = tree_random_like(tree, key, "uniform")
+        >>>
+        >>> # Uniform distribution [-1, 1]
+        >>> result3 = tree_random_like(tree, key, "uniform", minval=-1, maxval=1)
     """
     leaves = tu.tree_leaves(tree)
     keys = jax.random.split(key, len(leaves))
@@ -1350,24 +1479,37 @@ def tree_cast(tree: PyTree, dtype: tp.Any) -> PyTree:
     """Cast all arrays in a pytree to a specified dtype.
 
     Args:
-        tree: Input pytree
-        dtype: Target dtype
+        tree: Input pytree containing arrays.
+        dtype: Target dtype (e.g., jnp.float32, jnp.int32).
 
     Returns:
-        Pytree with casted arrays
+        PyTree: New tree with arrays cast to the specified dtype.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1, 2], dtype=jnp.int32)}
+        >>> result = tree_cast(tree, jnp.float32)
+        >>> # Result: {"a": array([1.0, 2.0], dtype=float32)}
     """
     return tu.tree_map(lambda x: x.astype(dtype) if is_array_like(x) else x, tree)
 
 
 def tree_round(tree: PyTree, decimals: int = 0) -> PyTree:
-    """Round all values in a pytree.
+    """Round all values in a pytree to a given number of decimals.
 
     Args:
-        tree: Input pytree
-        decimals: Number of decimal places
+        tree: Input pytree containing numerical arrays.
+        decimals: Number of decimal places to round to (default: 0).
 
     Returns:
-        Rounded pytree
+        PyTree: New tree with rounded values.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.234, 5.678])}
+        >>> result = tree_round(tree, decimals=1)
+        >>> # Result: {"a": array([1.2, 5.7])}
+        >>>
+        >>> result2 = tree_round(tree)  # Round to integers
+        >>> # Result: {"a": array([1., 6.])}
     """
     return tu.tree_map(lambda x: jnp.round(x, decimals) if is_array_like(x) else x, tree)
 
@@ -1376,10 +1518,15 @@ def tree_abs(tree: PyTree) -> PyTree:
     """Compute absolute values of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical values.
 
     Returns:
-        Pytree with absolute values
+        PyTree: New tree with absolute values.
+
+    Examples:
+        >>> tree = {"a": jnp.array([-1, 2, -3]), "b": -4.5}
+        >>> result = tree_abs(tree)
+        >>> # Result: {"a": array([1, 2, 3]), "b": 4.5}
     """
     return tu.tree_map(
         lambda x: jnp.abs(x) if is_array_like(x) else abs(x) if isinstance(x, int | float | complex) else x, tree
@@ -1390,10 +1537,15 @@ def tree_sign(tree: PyTree) -> PyTree:
     """Compute sign of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical values.
 
     Returns:
-        Pytree with signs (-1, 0, or 1)
+        PyTree: New tree with sign values (-1, 0, or 1).
+
+    Examples:
+        >>> tree = {"a": jnp.array([-2.5, 0, 3.7])}
+        >>> result = tree_sign(tree)
+        >>> # Result: {"a": array([-1., 0., 1.])}
     """
     return tu.tree_map(lambda x: jnp.sign(x) if is_array_like(x) else x, tree)
 
@@ -1402,10 +1554,15 @@ def tree_reciprocal(tree: PyTree) -> PyTree:
     """Compute reciprocal (1/x) of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical arrays.
 
     Returns:
-        Pytree with reciprocal values
+        PyTree: New tree with reciprocal values (1/x for each element).
+
+    Examples:
+        >>> tree = {"a": jnp.array([2.0, 4.0]), "b": jnp.array([0.5])}
+        >>> result = tree_reciprocal(tree)
+        >>> # Result: {"a": array([0.5, 0.25]), "b": array([2.0])}
     """
     return tu.tree_map(lambda x: 1.0 / x if is_array_like(x) else x, tree)
 
@@ -1414,22 +1571,32 @@ def tree_sqrt(tree: PyTree) -> PyTree:
     """Compute square root of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing non-negative numerical arrays.
 
     Returns:
-        Pytree with square root values
+        PyTree: New tree with square root values.
+
+    Examples:
+        >>> tree = {"a": jnp.array([4.0, 9.0]), "b": jnp.array([16.0])}
+        >>> result = tree_sqrt(tree)
+        >>> # Result: {"a": array([2.0, 3.0]), "b": array([4.0])}
     """
     return tu.tree_map(lambda x: jnp.sqrt(x) if is_array_like(x) else x, tree)
 
 
 def tree_exp(tree: PyTree) -> PyTree:
-    """Compute exponential of all elements in a pytree.
+    """Compute exponential (e^x) of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical arrays.
 
     Returns:
-        Pytree with exponential values
+        PyTree: New tree with exponential values.
+
+    Examples:
+        >>> tree = {"a": jnp.array([0.0, 1.0]), "b": jnp.array([2.0])}
+        >>> result = tree_exp(tree)
+        >>> # Result: {"a": array([1.0, 2.718...]), "b": array([7.389...])}
     """
     return tu.tree_map(lambda x: jnp.exp(x) if is_array_like(x) else x, tree)
 
@@ -1438,10 +1605,15 @@ def tree_log(tree: PyTree) -> PyTree:
     """Compute natural logarithm of all elements in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing positive numerical arrays.
 
     Returns:
-        Pytree with logarithm values
+        PyTree: New tree with natural logarithm values.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.e]), "b": jnp.array([jnp.e**2])}
+        >>> result = tree_log(tree)
+        >>> # Result: {"a": array([0.0, 1.0]), "b": array([2.0])}
     """
     return tu.tree_map(lambda x: jnp.log(x) if is_array_like(x) else x, tree)
 
@@ -1450,24 +1622,43 @@ def tree_transpose(tree: PyTree, axes: tuple[int, ...] | None = None) -> PyTree:
     """Transpose arrays in a pytree.
 
     Args:
-        tree: Input pytree
-        axes: Permutation of axes
+        tree: Input pytree containing arrays.
+        axes: Permutation of axes. If None, reverses axis order.
 
     Returns:
-        Pytree with transposed arrays
+        PyTree: New tree with transposed arrays.
+
+    Examples:
+        >>> tree = {"matrix": jnp.array([[1, 2], [3, 4]])}
+        >>> result = tree_transpose(tree)
+        >>> # Result: {"matrix": array([[1, 3], [2, 4]])}
+        >>>
+        >>> # With specific axes
+        >>> tensor = {"data": jnp.ones((2, 3, 4))}
+        >>> result = tree_transpose(tensor, axes=(2, 0, 1))
+        >>> # Result shape: {"data": array with shape (4, 2, 3)}
     """
     return tu.tree_map(lambda x: jnp.transpose(x, axes) if is_array_like(x) else x, tree)
 
 
 def tree_reshape(tree: PyTree, shape: tuple[int, ...]) -> PyTree:
-    """Reshape arrays in a pytree.
+    """Reshape arrays in a pytree to a new shape.
 
     Args:
-        tree: Input pytree
-        shape: New shape for arrays
+        tree: Input pytree containing arrays.
+        shape: New shape for arrays. Use -1 for automatic dimension.
 
     Returns:
-        Pytree with reshaped arrays
+        PyTree: New tree with reshaped arrays.
+
+    Examples:
+        >>> tree = {"a": jnp.array([[1, 2], [3, 4]])}
+        >>> result = tree_reshape(tree, (4,))
+        >>> # Result: {"a": array([1, 2, 3, 4])}
+        >>>
+        >>> # Using -1 for automatic dimension
+        >>> result2 = tree_reshape(tree, (-1, 1))
+        >>> # Result: {"a": array([[1], [2], [3], [4]])}
     """
     return tu.tree_map(lambda x: jnp.reshape(x, shape) if is_array_like(x) else x, tree)
 
@@ -1476,11 +1667,21 @@ def tree_squeeze(tree: PyTree, axis: int | tuple[int, ...] | None = None) -> PyT
     """Remove single-dimensional entries from arrays in a pytree.
 
     Args:
-        tree: Input pytree
-        axis: Axis or axes to squeeze
+        tree: Input pytree containing arrays.
+        axis: Axis or axes to squeeze. If None, all axes of size 1 are removed.
 
     Returns:
-        Pytree with squeezed arrays
+        PyTree: New tree with squeezed arrays.
+
+    Examples:
+        >>> tree = {"a": jnp.array([[[1], [2]]])}
+        >>> result = tree_squeeze(tree, axis=2)
+        >>> # Result: {"a": array([[1, 2]])}
+        >>>
+        >>> # Squeeze all single dimensions
+        >>> tree2 = {"b": jnp.array([[[3]]])}
+        >>> result2 = tree_squeeze(tree2)
+        >>> # Result: {"b": array(3)}
     """
     return tu.tree_map(lambda x: jnp.squeeze(x, axis) if is_array_like(x) else x, tree)
 
@@ -1489,11 +1690,19 @@ def tree_expand_dims(tree: PyTree, axis: int) -> PyTree:
     """Expand dimensions of arrays in a pytree.
 
     Args:
-        tree: Input pytree
-        axis: Position to insert new axis
+        tree: Input pytree containing arrays.
+        axis: Position in the expanded axes where the new axis is placed.
 
     Returns:
-        Pytree with expanded arrays
+        PyTree: New tree with arrays having an additional dimension.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1, 2, 3])}
+        >>> result = tree_expand_dims(tree, axis=0)
+        >>> # Result: {"a": array([[1, 2, 3]])} with shape (1, 3)
+        >>>
+        >>> result2 = tree_expand_dims(tree, axis=1)
+        >>> # Result: {"a": array([[1], [2], [3]])} with shape (3, 1)
     """
     return tu.tree_map(lambda x: jnp.expand_dims(x, axis) if is_array_like(x) else x, tree)
 
@@ -1502,10 +1711,19 @@ def tree_any(tree: PyTree) -> bool:
     """Check if any value in the pytree is True.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing boolean or numerical values.
 
     Returns:
-        True if any value is True
+        bool: True if any element in any array is True/non-zero.
+
+    Examples:
+        >>> tree = {"a": jnp.array([False, False]), "b": jnp.array([True])}
+        >>> tree_any(tree)
+        >>> # Result: True
+        >>>
+        >>> tree2 = {"x": jnp.array([0, 0]), "y": jnp.array([0])}
+        >>> tree_any(tree2)
+        >>> # Result: False
     """
     leaves = tu.tree_leaves(tree)
     for leaf in leaves:
@@ -1521,10 +1739,19 @@ def tree_all(tree: PyTree) -> bool:
     """Check if all values in the pytree are True.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing boolean or numerical values.
 
     Returns:
-        True if all values are True
+        bool: True if all elements in all arrays are True/non-zero.
+
+    Examples:
+        >>> tree = {"a": jnp.array([True, True]), "b": jnp.array([True])}
+        >>> tree_all(tree)
+        >>> # Result: True
+        >>>
+        >>> tree2 = {"x": jnp.array([1, 2]), "y": jnp.array([0])}
+        >>> tree_all(tree2)
+        >>> # Result: False (because of the 0)
     """
     leaves = tu.tree_leaves(tree)
     for leaf in leaves:
@@ -1540,10 +1767,15 @@ def tree_isnan(tree: PyTree) -> PyTree:
     """Check for NaN values in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical arrays.
 
     Returns:
-        Pytree with boolean values indicating NaN
+        PyTree: New tree with boolean arrays indicating NaN locations.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.nan, 3.0])}
+        >>> result = tree_isnan(tree)
+        >>> # Result: {"a": array([False, True, False])}
     """
     return tu.tree_map(lambda x: jnp.isnan(x) if is_array_like(x) else False, tree)
 
@@ -1552,10 +1784,15 @@ def tree_isinf(tree: PyTree) -> PyTree:
     """Check for infinite values in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical arrays.
 
     Returns:
-        Pytree with boolean values indicating infinity
+        PyTree: New tree with boolean arrays indicating infinity locations.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.inf, -jnp.inf])}
+        >>> result = tree_isinf(tree)
+        >>> # Result: {"a": array([False, True, True])}
     """
     return tu.tree_map(lambda x: jnp.isinf(x) if is_array_like(x) else False, tree)
 
@@ -1564,10 +1801,16 @@ def tree_isfinite(tree: PyTree) -> PyTree:
     """Check for finite values in a pytree.
 
     Args:
-        tree: Input pytree
+        tree: Input pytree containing numerical arrays.
 
     Returns:
-        Pytree with boolean values indicating finite values
+        PyTree: New tree with boolean arrays indicating finite values
+            (not NaN or infinity).
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.nan, jnp.inf, 2.0])}
+        >>> result = tree_isfinite(tree)
+        >>> # Result: {"a": array([True, False, False, True])}
     """
     return tu.tree_map(lambda x: jnp.isfinite(x) if is_array_like(x) else True, tree)
 
@@ -1576,11 +1819,16 @@ def tree_replace_nans(tree: PyTree, value: tp.Any = 0.0) -> PyTree:
     """Replace NaN values in a pytree.
 
     Args:
-        tree: Input pytree
-        value: Value to replace NaNs with
+        tree: Input pytree containing numerical arrays.
+        value: Value to replace NaNs with (default: 0.0).
 
     Returns:
-        Pytree with NaNs replaced
+        PyTree: New tree with NaN values replaced.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.nan, 3.0])}
+        >>> result = tree_replace_nans(tree, value=-1.0)
+        >>> # Result: {"a": array([1.0, -1.0, 3.0])}
     """
 
     def replace_nan(x):
@@ -1595,11 +1843,16 @@ def tree_replace_infs(tree: PyTree, value: tp.Any = 0.0) -> PyTree:
     """Replace infinite values in a pytree.
 
     Args:
-        tree: Input pytree
-        value: Value to replace infinities with
+        tree: Input pytree containing numerical arrays.
+        value: Value to replace infinities with (default: 0.0).
 
     Returns:
-        Pytree with infinities replaced
+        PyTree: New tree with infinite values replaced.
+
+    Examples:
+        >>> tree = {"a": jnp.array([1.0, jnp.inf, -jnp.inf, 2.0])}
+        >>> result = tree_replace_infs(tree, value=999.0)
+        >>> # Result: {"a": array([1.0, 999.0, 999.0, 2.0])}
     """
 
     def replace_inf(x):
@@ -1608,3 +1861,122 @@ def tree_replace_infs(tree: PyTree, value: tp.Any = 0.0) -> PyTree:
         return x
 
     return tu.tree_map(replace_inf, tree)
+
+
+def tree_flatten_one_level_with_keys(pytree: PyTree) -> tuple[list[tuple[KeyEntry | None, PyTree]], PyTreeDef]:  # type:ignore
+    """
+    Adapted form equinox.tree_flatten_one_level to return keys
+
+    If the passed in PyTree is a leaf, it will return a single-element list with None as
+    the key and the PyTree as the value.
+    """
+    seen_pytree = False
+
+    def is_leaf(node):
+        nonlocal seen_pytree
+        if node is pytree:
+            if seen_pytree:
+                try:
+                    type_string = type(pytree).__name__
+                except AttributeError:
+                    type_string = "<unknown>"
+                raise ValueError(f"PyTree node of type `{type_string}` is immediately self-referential")
+            else:
+                seen_pytree = True
+            return False
+        else:
+            return True
+
+    out_paths, out_treedef = jax.tree_util.tree_flatten_with_path(pytree, is_leaf=is_leaf)
+
+    out = []
+    for path, value in out_paths:
+        if not path:
+            return [(None, value)], out_treedef
+
+        assert len(path) == 1, "Only one level of flattening is supported"
+        out.append((path[0], value))
+
+    return out, out_treedef
+
+
+def key_path_to_str(path: Sequence) -> str:
+    """Helper method to format optimizer state keys."""
+    if not path:
+        return ""
+    path_elem = path[-1]
+    match path_elem:
+        case SequenceKey(idx):  # type: ignore
+            out = f"{idx}"
+        case DictKey(key):  # type: ignore
+            out = f"{key}"
+        case GetAttrKey():  # type: ignore
+            out = str(path_elem)
+        case FlattenedIndexKey(idx):  # type: ignore
+            out = f"{idx}"
+        case _:
+            path_elem = str(path_elem)
+            out = f"{path_elem}"
+
+    if out.startswith("."):
+        out = out[1:]
+
+    return out
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
+class PackedLeaf:
+    """Metadata describing the location and shape of a packed leaf."""
+
+    offset: int = dataclasses.field(metadata={"static": True})
+    shape: tuple[int, ...] = dataclasses.field(metadata={"static": True})
+
+
+def pack_pytree(tree: PyTree, dtype=jnp.float32) -> tuple[PyTree, jnp.ndarray]:
+    """Pack all leaves of ``tree`` into a single 1-D array.
+
+    Args:
+        tree: Pytree of array-like objects.
+        dtype: Desired dtype of the packed array.
+
+    Returns:
+        A pair ``(offset_tree, flat_array)`` where ``offset_tree`` mirrors the
+        structure of ``tree`` but each leaf contains a :class:`PackedLeaf`
+        indicating where that leaf's data is stored in ``flat_array``.
+    """
+
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+
+    flat_leaves = []
+    offset_leaves = []
+    current = 0
+    for leaf in leaves:
+        arr = jnp.asarray(leaf, dtype=dtype)
+        flat = arr.reshape(-1)
+        flat_leaves.append(flat)
+        offset_leaves.append(PackedLeaf(offset=current, shape=arr.shape))  # type: ignore[call-arg]
+        current += flat.size
+
+    if flat_leaves:
+        packed = jnp.concatenate(flat_leaves)
+    else:
+        packed = jnp.array([], dtype=dtype)
+
+    offset_tree = jax.tree_util.tree_unflatten(treedef, offset_leaves)
+    return offset_tree, packed
+
+
+def unpack_pytree(offset_tree: PyTree, packed: jnp.ndarray) -> PyTree:
+    """Reconstruct a pytree packed with :func:`pack_pytree`."""
+
+    offset_leaves, treedef = jax.tree_util.tree_flatten(offset_tree)
+    offset_leaves = [cast(PackedLeaf, x) for x in offset_leaves]
+
+    leaves = []
+    for off in offset_leaves:
+        size = functools.reduce(int.__mul__, off.shape, 1)
+        leaf = packed[off.offset : off.offset + size].reshape(off.shape)
+        leaves.append(leaf)
+
+    return jax.tree_util.tree_unflatten(treedef, leaves)

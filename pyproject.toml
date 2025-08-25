@@ -43,6 +43,8 @@ dependencies = [
 	"tqdm>=4.67.1",
 	"psutil>=7.0.0",
 	"google-cloud-storage>=3.3.0",
+	"tensorstore>=0.1.76",
+	"braceexpand>=0.1.7",
 ]
 
 [project.urls]
