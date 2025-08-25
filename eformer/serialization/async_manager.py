@@ -28,6 +28,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.distributed import is_initialized
 from jax.sharding import Mesh
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
@@ -129,10 +130,12 @@ class AsyncCheckpointManager:
         gcs_bucket: str | None = None,
         gcs_credentials_path: str | None = None,
         max_workers: int = 4,
-        enable_validation: bool = True,
+        enable_validation: bool = False,
         enable_compression: bool = False,
         use_tensorstore: bool = True,
     ):
+        assert is_initialized(), "you should call jax distribution init before running process."
+
         self.float_dtype = float_dtype
         self.enable = enable
         self.verbose = verbose
