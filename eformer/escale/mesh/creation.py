@@ -16,13 +16,14 @@ import functools
 import os
 import typing as tp
 
+import contextlib2
 import jax
 import numpy as np
 from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
 from jax.sharding import Mesh
 
 DEFAULT_SHARDING_STG = (1, -1, 1, 1, 1)
-DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp", "ep")
+DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "ep", "tp", "sp")
 
 
 def calculate_host_mesh_shape(
@@ -168,6 +169,27 @@ def parse_mesh_from_string(
 
     mesh_shape = np.arange(jax.device_count()).reshape(dims).shape
     return create_mesh(mesh_shape, dim_names)
+
+
+def create_cpu_mesh(
+    axis_dims: tp.Sequence[int] = DEFAULT_SHARDING_STG,
+    axis_names: tp.Sequence[str] = DEFAULT_NAMED_SHARDING_STG,
+):
+    return jax.sharding.Mesh(np.array([jax.local_devices(backend="cpu")[0]]).reshape(*axis_dims), axis_names)
+
+
+@contextlib2.contextmanager
+def force_cpu():
+    cpu = jax.local_devices(backend="cpu")[0]
+    with jax.default_device(cpu):
+        yield cpu
+
+
+@contextlib2.contextmanager
+def cpu_context():
+    mesh = create_cpu_mesh()
+    with force_cpu(), mesh:
+        yield mesh
 
 
 if __name__ == "__main__":

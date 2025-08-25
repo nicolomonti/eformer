@@ -32,28 +32,18 @@ from jax.sharding import Mesh
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
+from eformer.escale import create_cpu_mesh
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import PyTree, flatten_dict, is_flatten, serialization, unflatten_dict
 
 from .base_manager import CheckpointManager
-from .serialization import (
-    tree_deserialize_leaves,
-    tree_serialize_leaves,
-)
-from .utils import derive_base_prefix_from_path, group_keys_by_shard_size, index_filename, shard_filename
+from .serialization import tree_deserialize_leaves, tree_serialize_leaves
+from .utils import derive_base_prefix_from_path, index_filename
 from .utils import read_process_array as _read_process_array
 from .utils import to_host as _to_host
 
 logger = get_logger(__name__)
-
-try:
-    import tensorstore as ts
-
-    TENSORSTORE_AVAILABLE = True
-except ImportError:
-    TENSORSTORE_AVAILABLE = False
-    logger.warning("Tensorstore not available. Install with: pip install tensorstore")
 
 
 @dataclass
@@ -150,7 +140,7 @@ class AsyncCheckpointManager:
         self.max_workers = max_workers
         self.enable_validation = enable_validation
         self.enable_compression = enable_compression
-        self.use_tensorstore = use_tensorstore and TENSORSTORE_AVAILABLE
+        self.use_tensorstore = use_tensorstore
 
         self.gcs_client = None
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -300,13 +290,11 @@ class AsyncCheckpointManager:
         self,
         tree: PyTree,
         path: ePathLike | str | os.PathLike,
-        mesh: Mesh = None,
+        mesh: Mesh | None = None,
         gather_fns: dict[tp.Callable] | bool | None = None,
         float_dtype: str | jnp.dtype | None = None,
         metadata: dict[str, str] | None = None,
-        shard_size_gb: float | None = 5.00,
         callback: tp.Callable[[str], None] | None = None,
-        shard_prefix: str | None = None,
         prefix: str | None = None,
         do_all_gather: bool = False,
     ) -> str:
@@ -321,9 +309,7 @@ class AsyncCheckpointManager:
             gather_fns: Dictionary of gather functions or bool for device gathering.
             float_dtype: Data type for floating point arrays.
             metadata: Additional metadata to save with checkpoint.
-            shard_size_gb: Maximum size of each shard in GB.
             callback: Optional callback function called after save.
-            shard_prefix: Custom prefix for shard files.
             prefix: Optional prefix for saving specific tree (e.g., 'model', 'optimizer').
             do_all_gather: Whether to gather all arrays to host.
 
@@ -338,9 +324,7 @@ class AsyncCheckpointManager:
                 gather_fns=gather_fns,
                 float_dtype=float_dtype,
                 metadata=metadata,
-                shard_size_gb=shard_size_gb,
                 callback=callback,
-                shard_prefix=shard_prefix,
                 prefix=prefix,
                 do_all_gather=do_all_gather,
             )
@@ -350,13 +334,11 @@ class AsyncCheckpointManager:
         self,
         tree: PyTree,
         path: ePathLike | str | os.PathLike,
-        mesh: Mesh,
+        mesh: Mesh | None = None,
         gather_fns: dict[tp.Callable] | bool | None = None,
         float_dtype: str | jnp.dtype | None = None,
         metadata: dict[str, str] | None = None,
-        shard_size_gb: float | None = 5.00,
         callback: tp.Callable[[str], None] | None = None,
-        shard_prefix: str | None = None,
         prefix: str | None = None,
         do_all_gather: bool = False,
     ) -> str:
@@ -373,10 +355,7 @@ class AsyncCheckpointManager:
                 If True, uses jax.device_get for all arrays.
             float_dtype: Data type for floating point arrays. Defaults to self.float_dtype.
             metadata: Additional metadata to save with checkpoint.
-            shard_size_gb: Maximum size of each shard in GB. If total size exceeds this,
-                checkpoint is split into multiple files.
             callback: Optional callback function called after save completes.
-            shard_prefix: Custom prefix for shard files (default: 'easystore').
             prefix: Optional prefix for saving specific tree (e.g., 'model', 'optimizer').
                 Used for organizing multiple trees in same directory.
             do_all_gather: Whether to gather all arrays to host before saving.
@@ -394,7 +373,8 @@ class AsyncCheckpointManager:
         tree = serialization.to_state_dict(tree)
         if not is_flatten(tree):
             tree = flatten_dict(tree, sep=".")
-
+        if mesh is None:
+            mesh = create_cpu_mesh()
         if gather_fns:
             tree = await self._gather_async(tree, gather_fns)
         if do_all_gather:
@@ -414,29 +394,15 @@ class AsyncCheckpointManager:
 
         path_str = str(path)
 
-        total_size_gb = sum(self._estimate_nbytes(arr) / (1024**3) for arr in jax.tree_util.tree_leaves(tree))
-
         if self.use_tensorstore:
-            if shard_size_gb and total_size_gb > shard_size_gb:
-                return await self._save_tensorstore_sharded_async(
-                    tree,
-                    path_str,
-                    checkpoint_meta,
-                    shard_size_gb,
-                    shard_prefix,
-                    prefix,
-                )
-            return await self._save_tensorstore_async(tree, path_str, checkpoint_meta, prefix)
-
-        if shard_size_gb and shard_size_gb > 0:
-            return await self._save_sharded_async(tree, path_str, checkpoint_meta, shard_size_gb)
-
-        await self._save_single_async(tree, path_str, checkpoint_meta.to_dict())
+            out = await self._save_tensorstore_async(tree, path_str, checkpoint_meta, prefix)
+        else:
+            out = await self._save_single_async(tree, path_str, checkpoint_meta.to_dict())
 
         if callback:
             callback(path_str)
 
-        return path_str
+        return out
 
     async def _gather_async(self, tree: dict, gather_fns: dict[tp.Callable] | bool) -> dict:
         """Asynchronously gather distributed arrays.
@@ -487,55 +453,6 @@ class AsyncCheckpointManager:
 
         return results
 
-    async def _save_sharded_async(
-        self,
-        flat_state: dict,
-        base_path: str,
-        metadata: CheckpointMetadata,
-        shard_size_gb: float,
-    ) -> str:
-        """Save sharded checkpoint with parallel writes.
-
-        Args:
-            flat_state: Flattened state dictionary to save.
-            base_path: Base path for shard files.
-            metadata: Checkpoint metadata.
-            shard_size_gb: Maximum size of each shard in GB.
-
-        Returns:
-            Path to the index file.
-        """
-        max_bytes = int(shard_size_gb * (1024**3))
-        shards = group_keys_by_shard_size(flat_state, max_bytes)
-        base_prefix = derive_base_prefix_from_path(base_path)
-
-        loop = asyncio.get_event_loop()
-        shard_futures = []
-
-        for i, shard_keys in enumerate(shards, start=1):
-            shard_path = shard_filename(base_prefix, i, len(shards))
-            shard_tensors = {k: flat_state[k] for k in shard_keys}
-
-            meta_dict = {k: json.dumps(v) if not isinstance(v, str) else v for k, v in metadata.to_dict().items()}
-
-            future = loop.run_in_executor(self.executor, safe_flax.save_file, shard_tensors, shard_path, meta_dict)
-            shard_futures.append(future)
-
-        await asyncio.gather(*shard_futures)
-
-        weight_map = {}
-        for i, shard_keys in enumerate(shards, start=1):
-            shard_name = os.path.basename(shard_filename(base_prefix, i, len(shards)))
-            for k in shard_keys:
-                weight_map[k] = shard_name
-
-        index_data = {"metadata": metadata.to_dict(), "weight_map": weight_map}
-
-        index_path = index_filename(base_prefix)
-        ePath(index_path).write_text(json.dumps(index_data, ensure_ascii=False))
-
-        return index_path
-
     async def _save_single_async(self, tree: dict, path: str, metadata: dict):
         """Save single checkpoint file asynchronously.
 
@@ -552,7 +469,11 @@ class AsyncCheckpointManager:
         await loop.run_in_executor(self.executor, safe_flax.save_file, tree, path, metadata)
 
     async def _save_tensorstore_async(
-        self, tree: dict, path: str, metadata: CheckpointMetadata, prefix: str | None = None
+        self,
+        tree: dict,
+        path: str,
+        metadata: CheckpointMetadata,
+        prefix: str | None = None,
     ) -> str:
         """Save using tensorstore via the core serialization module.
 
@@ -603,244 +524,6 @@ class AsyncCheckpointManager:
         await loop.run_in_executor(self.executor, commit_with_metadata)
 
         return path
-
-    async def _save_tensorstore_sharded_async(
-        self,
-        tree: dict,
-        path: str,
-        metadata: CheckpointMetadata,
-        shard_size_gb: float,
-        shard_prefix: str | None = None,
-        prefix: str | None = None,
-    ) -> str:
-        """Save large checkpoint as multiple SafeTensors files with custom prefix.
-
-        Args:
-            tree: Dictionary of arrays to save.
-            path: Path where the checkpoint will be saved.
-            metadata: Checkpoint metadata.
-            shard_size_gb: Maximum size of each shard in GB (typically 3-5GB).
-            shard_prefix: Custom prefix for shard files (default: "easystore").
-            prefix: Optional prefix for saving specific tree.
-
-        Returns:
-            Path where the checkpoint was saved.
-        """
-        ePath(path).mkdir(parents=True, exist_ok=True)
-
-        shard_size_bytes = shard_size_gb * (1024**3)
-        shards = []
-        current_shard = {}
-        current_size = 0
-
-        for key, array in tree.items():
-            array_size = self._estimate_nbytes(array)
-
-            if array_size > shard_size_bytes:
-                if current_shard:
-                    shards.append(current_shard)
-                    current_shard = {}
-                    current_size = 0
-                shards.append({key: array})
-
-            elif current_size + array_size > shard_size_bytes:
-                if current_shard:
-                    shards.append(current_shard)
-                current_shard = {key: array}
-                current_size = array_size
-            else:
-                current_shard[key] = array
-                current_size += array_size
-
-        if current_shard:
-            shards.append(current_shard)
-
-        write_futures = []
-        shard_info = {}
-        total_shards = len(shards)
-
-        shard_pref = shard_prefix or "easystore"
-        if prefix:
-            shard_pref = f"{prefix}_{shard_pref}"
-
-        loop = asyncio.get_event_loop()
-
-        for i, shard_data in enumerate(shards, 1):
-            shard_filename = str(ePath(path) / f"{shard_pref}-{i:05d}-{total_shards:05d}.params")
-
-            shard_metadata = {
-                "shard_index": str(i),
-                "total_shards": str(total_shards),
-                "prefix": shard_pref,
-                "tree_prefix": prefix,
-                "timestamp": metadata.timestamp,
-            }
-
-            if metadata.custom_metadata:
-                for k, v in metadata.custom_metadata.items():
-                    shard_metadata[f"custom_{k}"] = json.dumps(v) if not isinstance(v, str) else v
-
-            future = loop.run_in_executor(self.executor, safe_flax.save_file, shard_data, shard_filename, shard_metadata)
-            write_futures.append(future)
-
-            for key in shard_data.keys():
-                shard_info[key] = f"{shard_pref}-{i:05d}-{total_shards:05d}.params"
-
-        await asyncio.gather(*write_futures)
-
-        meta_path = ePath(path) / "metadata.json"
-        metadata.custom_metadata = metadata.custom_metadata or {}
-        metadata.custom_metadata["shard_info"] = shard_info
-        metadata.custom_metadata["num_shards"] = total_shards
-        metadata.custom_metadata["shard_size_gb"] = shard_size_gb
-
-        meta_path.write_text(json.dumps(metadata.to_dict()))
-
-        index_file = f"{prefix}_index.json" if prefix else f"{shard_pref}-index.json"
-        prefix_index_path = ePath(path) / index_file
-        index_data = {
-            "format": "tensorstore_sharded",
-            "num_shards": total_shards,
-            "shard_size_gb": shard_size_gb,
-            "shard_map": shard_info,
-            "total_size_gb": sum(self._estimate_nbytes(arr) / (1024**3) for arr in tree.values()),
-            "shard_prefix": shard_pref,
-            "tree_prefix": prefix,
-        }
-
-        prefix_index_path.write_text(json.dumps(index_data, indent=2))
-
-        master_index_path = ePath(path) / "index.json"
-        if master_index_path.exists():
-            master_index = json.loads(master_index_path.read_text())
-        else:
-            master_index = {
-                "format": "tensorstore_multi_sharded",
-                "prefixes": {},
-            }
-
-        index_key = prefix or shard_pref
-        master_index["prefixes"][index_key] = {
-            "index_file": index_file,
-            "num_shards": total_shards,
-            "total_size_gb": index_data["total_size_gb"],
-        }
-
-        master_index_path.write_text(json.dumps(master_index, indent=2))
-
-        return path
-
-    async def _load_tensorstore_sharded_async(
-        self,
-        path: str,
-        prefix: str | None = None,
-        shard_fns: dict[tp.Callable] | None = None,
-    ) -> tuple[dict, dict]:
-        """Load sharded tensorstore checkpoint with optional filtering.
-
-        Args:
-            path: Path to the checkpoint or index file.
-            prefix: Optional prefix to filter shards.
-            shard_fns: Dictionary of functions to apply to shards.
-
-        Returns:
-            Tuple of (loaded tree dictionary, metadata dictionary).
-
-        Raises:
-            ImportError: If tensorstore is not available.
-            FileNotFoundError: If index file is not found.
-            ValueError: If format is unknown or prefix not found.
-        """
-        if not TENSORSTORE_AVAILABLE:
-            raise ImportError("Tensorstore not available")
-
-        if path.endswith(".json"):
-            index_path = path
-            base_path = str(ePath(path).parent)
-        else:
-            base_path = path
-            index_path = str(ePath(path) / "index.json")
-
-        index_path_obj = ePath(index_path)
-        if not index_path_obj.exists():
-            raise FileNotFoundError(f"Index file not found: {index_path}")
-
-        index_data = json.loads(index_path_obj.read_text())
-
-        format_type = index_data.get("format")
-
-        if format_type == "tensorstore_multi_sharded":
-            if not prefix:
-                prefixes = list(index_data.get("prefixes", {}).keys())
-                raise ValueError(
-                    f"Multiple checkpoints found. Specify prefix_filter or load specific index. Available: {prefixes}"
-                )
-
-            prefix_info = index_data["prefixes"].get(prefix)
-            if not prefix_info:
-                available = list(index_data.get("prefixes", {}).keys())
-                raise ValueError(f"Prefix '{prefix}' not found. Available: {available}")
-
-            prefix_index_path = ePath(base_path) / prefix_info["index_file"]
-            index_data = json.loads(prefix_index_path.read_text())
-
-        if index_data.get("format") != "tensorstore_sharded":
-            raise ValueError(f"Unknown format: {index_data.get('format')}")
-
-        shard_map = index_data.get("shard_map", {})
-
-        if prefix:
-            matching_shards = set()
-            filtered_keys = {}
-            for key, shard_file in shard_map.items():
-                if shard_file.startswith(prefix):
-                    matching_shards.add(shard_file)
-                    filtered_keys[key] = shard_file
-
-            if not matching_shards:
-                raise ValueError(f"No shards found with prefix: {prefix}")
-
-            shard_map = filtered_keys
-
-        if shard_fns and not is_flatten(shard_fns):
-            shard_fns = flatten_dict(shard_fns, sep=".")
-
-        tree = {}
-        loaded_shards = set()
-
-        for key, shard_file in shard_map.items():
-            if shard_file not in loaded_shards:
-                loaded_shards.add(shard_file)
-
-            shard_path = str(ePath(base_path) / shard_file)
-            clean_key = key.replace("/", "_").replace(".", "_")
-            array_path = str(ePath(shard_path) / clean_key)
-
-            spec = {
-                "driver": "zarr",
-                "kvstore": {"driver": "file", "path": array_path},
-            }
-
-            store = await ts.open(spec)
-            array = await store.read()
-            array = jnp.array(array)
-
-            if shard_fns and key in shard_fns:
-                array = shard_fns[key](array)
-
-            tree[key] = array
-
-        meta_path = ePath(base_path) / "metadata.json"
-        if meta_path.exists():
-            metadata = json.loads(meta_path.read_text())
-        else:
-            metadata = {}
-
-        print(f"✓ Loaded {len(loaded_shards)} shards, {len(tree)} arrays")
-        if prefix:
-            print(f"  Filtered by prefix: {prefix}")
-
-        return tree, metadata
 
     async def _load_tensorstore_async(
         self, path: str, shard_fns: dict[tp.Callable] | None = None, prefix: str | None = None

@@ -297,25 +297,6 @@ class ProgressLogger:
 logger = get_logger("eformerLoggings")
 
 
-def barrier_sync(timeout: float = 200):
-    """
-    Uses jax's unpublished distributed api to wait for all processes to reach a barrier. This is useful for ensuring
-    that all processes have reached a certain point in the code before continuing.
-    """
-    global _sync_counter
-    if jax.process_count() == 1:
-        return
-    import jax._src.distributed as distributed
-
-    client = distributed.global_state.client
-
-    if client is None:
-        raise RuntimeError("barrier_sync requires jax distributed client to be initialized")
-
-    _sync_counter += 1
-    client.wait_at_barrier(f"efm_barrier_sync_{_sync_counter}", timeout_in_ms=int(timeout * 1000.0))
-
-
 def create_step_profiler(
     profile_path: str,
     start_step: int,
@@ -334,6 +315,7 @@ def create_step_profiler(
     Returns:
         A callback function for training step profiling
     """
+    from eformer.escale import barrier_sync
 
     class ProfilerState:
         def __init__(self):
