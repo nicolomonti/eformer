@@ -296,7 +296,8 @@ class AsyncCheckpointManager:
         metadata: dict[str, str] | None = None,
         callback: tp.Callable[[str], None] | None = None,
         prefix: str | None = None,
-        do_all_gather: bool = False,
+        do_all_gather: bool = True,
+        cpu_offload: bool = True,
     ) -> str:
         """Synchronous wrapper for save_tree_async.
 
@@ -305,13 +306,17 @@ class AsyncCheckpointManager:
         Args:
             tree: PyTree structure to save.
             path: Path where the checkpoint will be saved.
-            mesh: JAX mesh for distributed computation.
+            mesh: JAX mesh for distributed computation. If None, creates a CPU mesh
+                with a warning.
             gather_fns: Dictionary of gather functions or bool for device gathering.
             float_dtype: Data type for floating point arrays.
             metadata: Additional metadata to save with checkpoint.
             callback: Optional callback function called after save.
             prefix: Optional prefix for saving specific tree (e.g., 'model', 'optimizer').
-            do_all_gather: Whether to gather all arrays to host.
+            do_all_gather: Whether to gather all arrays to host. Defaults to True for
+                safer checkpoint saving.
+            cpu_offload: Whether to offload arrays to CPU during gathering. Defaults to
+                True to reduce memory pressure on accelerators.
 
         Returns:
             Path where the checkpoint was saved.
@@ -327,6 +332,7 @@ class AsyncCheckpointManager:
                 callback=callback,
                 prefix=prefix,
                 do_all_gather=do_all_gather,
+                cpu_offload=cpu_offload,
             )
         )
 
@@ -340,7 +346,8 @@ class AsyncCheckpointManager:
         metadata: dict[str, str] | None = None,
         callback: tp.Callable[[str], None] | None = None,
         prefix: str | None = None,
-        do_all_gather: bool = False,
+        do_all_gather: bool = True,
+        cpu_offload: bool = True,
     ) -> str:
         """Asynchronously save checkpoint with parallel shard writing.
 
@@ -350,7 +357,8 @@ class AsyncCheckpointManager:
         Args:
             tree: PyTree structure to save.
             path: Path where the checkpoint will be saved.
-            mesh: JAX mesh for distributed computation.
+            mesh: JAX mesh for distributed computation. If None, creates a CPU mesh
+                with a warning about potential sharding issues.
             gather_fns: Dictionary of gather functions or bool for device gathering.
                 If True, uses jax.device_get for all arrays.
             float_dtype: Data type for floating point arrays. Defaults to self.float_dtype.
@@ -358,14 +366,19 @@ class AsyncCheckpointManager:
             callback: Optional callback function called after save completes.
             prefix: Optional prefix for saving specific tree (e.g., 'model', 'optimizer').
                 Used for organizing multiple trees in same directory.
-            do_all_gather: Whether to gather all arrays to host before saving.
+            do_all_gather: Whether to gather all arrays to host before saving. Defaults
+                to True for safer and more consistent checkpoint saving.
+            cpu_offload: Whether to offload arrays to CPU during gathering. Defaults to
+                True to reduce memory pressure on accelerators and prevent OOM errors.
 
         Returns:
             Path where the checkpoint was saved.
 
         Note:
-            Automatically chooses between TensorStore (if available and enabled) or
-            SafeTensors format based on configuration and checkpoint size.
+            - Automatically chooses between TensorStore (if available and enabled) or
+              SafeTensors format based on configuration.
+            - When mesh is not provided, a warning is logged and CPU mesh is used as fallback.
+            - CPU offloading helps prevent out-of-memory errors on GPUs/TPUs during checkpointing.
         """
         if float_dtype is None:
             float_dtype = self.float_dtype
@@ -374,12 +387,13 @@ class AsyncCheckpointManager:
         if not is_flatten(tree):
             tree = flatten_dict(tree, sep=".")
         if mesh is None:
+            logger.warn("`mesh` should be provided otherwise you will face some sharding issues.")
             mesh = create_cpu_mesh()
         if gather_fns:
             tree = await self._gather_async(tree, gather_fns)
         if do_all_gather:
             tree = jax.tree_util.tree_map(
-                lambda x: _to_host(x, float_dtype, mesh),
+                lambda x: _to_host(x, float_dtype, mesh, cpu_offload),
                 tree,
                 is_leaf=lambda x: isinstance(x, jax.Array | np.generic | float | int),
             )

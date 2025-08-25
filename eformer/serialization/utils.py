@@ -23,6 +23,7 @@ import psutil
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from tqdm.autonotebook import tqdm
 
+from eformer.escale import create_cpu_mesh
 from eformer.loggings import get_logger
 from eformer.mpric import STRING_TO_DTYPE_MAP, put_dtype
 from eformer.pytree import flatten_dict, is_flatten
@@ -30,11 +31,12 @@ from eformer.pytree import flatten_dict, is_flatten
 logger = get_logger(__name__)
 
 
-def to_host(x: jax.Array, float_dtype: jnp.floating | None, mesh: Mesh):
+def to_host(x: jax.Array, float_dtype: jnp.floating | None, mesh: Mesh, cpu_offload: bool):
     """Move array to host with optional dtype conversion."""
     if isinstance(x, jax.Array):
         x = jax.device_put(x, NamedSharding(mesh, PartitionSpec()))
-
+        if cpu_offload:
+            x = jax.device_put(x, NamedSharding(create_cpu_mesh(), PartitionSpec()))
     if float_dtype:
         dtype = STRING_TO_DTYPE_MAP.get(float_dtype, float_dtype) if isinstance(float_dtype, str) else float_dtype
         if jnp.issubdtype(x.dtype, jnp.floating):
