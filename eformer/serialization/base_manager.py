@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import io
 import json
 import os
@@ -30,7 +31,7 @@ from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
 from eformer.loggings import get_logger
-from eformer.paths import ePathLike
+from eformer.paths import ePath, ePathLike
 from eformer.pytree import PyTree, flatten_dict, is_flatten, serialization, unflatten_dict
 
 from .utils import (
@@ -68,6 +69,21 @@ ALLOWED_DATA_TYPES = [
 
 
 class CheckpointManager:
+    """Base checkpoint manager for saving and loading PyTree structures.
+
+    This manager provides functionality for saving and loading checkpoints
+    with support for sharding, Google Cloud Storage, and various data formats.
+
+    Attributes:
+        float_dtype: Default data type for floating point arrays.
+        save_optimizer_state: Whether to save optimizer state.
+        checkpoint_dir: Directory for saving checkpoints.
+        enable: Whether checkpointing is enabled.
+        verbose: Enable verbose output.
+        gcs_bucket: Google Cloud Storage bucket name.
+        gcs_client: GCS client instance.
+    """
+
     def __init__(
         self,
         checkpoint_dir: ePathLike | str | os.PathLike,
@@ -100,6 +116,14 @@ class CheckpointManager:
 
     @staticmethod
     def create_gcs_client(gcs_credentials_path: str | None = None):
+        """Create a Google Cloud Storage client.
+
+        Args:
+            gcs_credentials_path: Optional path to service account credentials.
+
+        Returns:
+            Google Cloud Storage client instance.
+        """
         if gcs_credentials_path:
             from google.oauth2 import service_account
 
@@ -119,11 +143,23 @@ class CheckpointManager:
         dtype: str | jnp.dtype | None = None,
         gcs_client: storage.Client | None = None,
     ) -> tuple[PyTree | dict, dict]:
-        """
-        Load a checkpoint from local path or GCS.
+        """Load a checkpoint from local path or GCS.
+
         Supports:
           - Single safetensors file
           - Sharded safetensors with index (prefix.safetensors.index.json)
+
+        Args:
+            path: Path to the checkpoint file or directory.
+            shard_fns: Dictionary of functions to apply to specific shards.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing shard functions.
+            callback: Optional callback to process arrays after loading.
+            dtype: Data type to cast arrays to.
+            gcs_client: Optional GCS client instance.
+
+        Returns:
+            Tuple of (loaded PyTree or dict, metadata dict).
         """
         path_str = str(path)
         base_prefix = CheckpointManager._derive_base_prefix_from_path(path_str)
@@ -212,6 +248,19 @@ class CheckpointManager:
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         dtype: str | jnp.dtype | None = None,
     ) -> tuple[PyTree | dict, dict]:
+        """Load sharded checkpoint from local index file.
+
+        Args:
+            index_path: Path to the index JSON file.
+            shard_fns: Dictionary of functions to apply to specific shards.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing shard functions.
+            callback: Optional callback to process arrays after loading.
+            dtype: Data type to cast arrays to.
+
+        Returns:
+            Tuple of (loaded PyTree or dict, metadata dict).
+        """
         with open(index_path, "r") as f:
             index_data = json.load(f)
 
@@ -264,6 +313,20 @@ class CheckpointManager:
         dtype: str | jnp.dtype | None = None,
         gcs_client: storage.Client | None = None,
     ) -> tuple[PyTree | dict, dict]:
+        """Load sharded checkpoint from GCS index file.
+
+        Args:
+            index_gcs_path: GCS path to the index JSON file.
+            shard_fns: Dictionary of functions to apply to specific shards.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing shard functions.
+            callback: Optional callback to process arrays after loading.
+            dtype: Data type to cast arrays to.
+            gcs_client: Optional GCS client instance.
+
+        Returns:
+            Tuple of (loaded PyTree or dict, metadata dict).
+        """
         if gcs_client is None:
             gcs_client = storage.Client()
 
@@ -292,7 +355,6 @@ class CheckpointManager:
             shard_blob_path = shard_name if not shard_dir else f"{shard_dir}/{shard_name}"
             shard_blob = bucket.blob(shard_blob_path)
 
-            # Download shard to temp and read via safetensors
             with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as temp_file:
                 shard_blob.download_to_filename(temp_file.name)
                 temp_path = temp_file.name
@@ -338,12 +400,27 @@ class CheckpointManager:
         shard_size_gb: float | None = 5.00,
         write_index_file: bool = True,
     ) -> ePathLike | str | os.PathLike:
-        """
-        Save a checkpoint to local path or GCS using SafeTensors.
+        """Save a checkpoint to local path or GCS using SafeTensors.
 
         If shard_size_gb is provided, the tree is saved as multiple shards of up to that size
         (except the last shard, which may be smaller). An index file 'prefix.safetensors.index.json'
         is also written mapping every tensor name to a shard file.
+
+        Args:
+            tree: PyTree structure to save.
+            path: Path where the checkpoint will be saved.
+            mesh: JAX mesh for distributed computation.
+            gather_fns: Dictionary of gather functions or bool for device gathering.
+            float_dtype: Data type for floating point arrays.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing gather functions.
+            metadata: Additional metadata to save with checkpoint.
+            enable: Whether checkpointing is enabled (None = auto-detect process 0).
+            shard_size_gb: Maximum size of each shard in GB.
+            write_index_file: Whether to write the index file for sharded saves.
+
+        Returns:
+            Path where the checkpoint was saved.
         """
         if enable is None:
             enable = jax.process_index() == 0
@@ -419,9 +496,8 @@ class CheckpointManager:
                     verbose=verbose,
                 )
 
-            # Create weight_map
             for i, shard_keys in enumerate(shards, start=1):
-                shard_name = os.path.basename(cls._shard_filename(base_prefix, i, total_shards))
+                shard_name = ePath(cls._shard_filename(base_prefix, i, total_shards)).name
                 for k in shard_keys:
                     weight_map[k] = shard_name
 
@@ -459,6 +535,16 @@ class CheckpointManager:
         metadata: dict[str, str] | None,
         verbose: bool = True,
     ) -> None:
+        """Save sharded checkpoint to local filesystem.
+
+        Args:
+            flat_state: Flattened state dictionary to save.
+            base_prefix: Base prefix for shard filenames.
+            shards: List of lists containing keys for each shard.
+            total_shards: Total number of shards.
+            metadata: Optional metadata to save with each shard.
+            verbose: Enable verbose output.
+        """
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not verbose), start=1):
             shard_path = cls._shard_filename(base_prefix, i, total_shards)
             shard_tensors = {k: flat_state[k] for k in shard_keys}
@@ -474,13 +560,23 @@ class CheckpointManager:
         metadata: dict[str, str] | None,
         verbose: bool = True,
     ) -> None:
+        """Save sharded checkpoint to Google Cloud Storage.
+
+        Args:
+            flat_state: Flattened state dictionary to save.
+            base_prefix: Base prefix for shard filenames.
+            shards: List of lists containing keys for each shard.
+            total_shards: Total number of shards.
+            metadata: Optional metadata to save with each shard.
+            verbose: Enable verbose output.
+        """
         gcs_client = cls.create_gcs_client()
-        bucket_name, base_blob_name = cls._parse_gcs_path(base_prefix + ".txt")  # hack to reuse parser
+        bucket_name, base_blob_name = cls._parse_gcs_path(base_prefix + ".txt")
         base_dir = os.path.dirname(base_blob_name)
         bucket = gcs_client.bucket(bucket_name)
 
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards to GCS", disable=not verbose), start=1):
-            shard_name = os.path.basename(cls._shard_filename(base_prefix, i, total_shards))
+            shard_name = ePath(cls._shard_filename(base_prefix, i, total_shards)).name
             shard_blob_name = f"{base_dir}/{shard_name}" if base_dir else shard_name
             shard_blob = bucket.blob(shard_blob_name)
 
@@ -503,7 +599,19 @@ class CheckpointManager:
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         dtype: str | jnp.dtype | None = None,
     ) -> tuple[PyTree | dict, dict]:
-        """Original load_checkpoint logic for local files"""
+        """Load checkpoint from a single local file.
+
+        Args:
+            path: Path to the checkpoint file.
+            shard_fns: Dictionary of functions to apply to specific shards.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing shard functions.
+            callback: Optional callback to process arrays after loading.
+            dtype: Data type to cast arrays to.
+
+        Returns:
+            Tuple of (loaded PyTree or dict, metadata dict).
+        """
         with safe_flax.safe_open(str(path), framework="flax") as f:
             metadata = f.metadata()
             keys = list(f.keys())
@@ -538,7 +646,17 @@ class CheckpointManager:
         metadata: dict[str, str] | None = None,
         verbose: bool = True,
     ) -> str:
-        """Save tree to GCS using temporary file"""
+        """Save tree to GCS using temporary file.
+
+        Args:
+            tree: Dictionary to save.
+            gcs_path: GCS path where the checkpoint will be saved.
+            metadata: Optional metadata to save with checkpoint.
+            verbose: Enable verbose output.
+
+        Returns:
+            GCS path where the checkpoint was saved.
+        """
         gcs_client = cls.create_gcs_client()
 
         bucket_name, blob_name = cls._parse_gcs_path(gcs_path)
@@ -565,7 +683,20 @@ class CheckpointManager:
         verbose: bool = False,
         mismatch_allowed: bool = True,
     ):
-        """Save tree to GCS using msgpack format (streaming)"""
+        """Save tree to GCS using msgpack format (streaming).
+
+        Args:
+            tree: PyTree structure to save.
+            gcs_path: GCS path where the checkpoint will be saved.
+            gather_fns: Dictionary of gather functions.
+            float_dtype: Data type for floating point arrays.
+            verbose: Enable verbose output.
+            mismatch_allowed: Whether to allow missing gather functions.
+
+        Raises:
+            ValueError: If GCS client is not initialized.
+            KeyError: If gather function is missing and mismatch not allowed.
+        """
         if not self.gcs_client:
             raise ValueError("GCS client not initialized.")
 
@@ -603,7 +734,6 @@ class CheckpointManager:
             value = put_dtype(value, float_dtype)
             buffer.write(packer.pack((key, serialization.to_bytes(value))))
 
-        # Upload buffer to GCS
         buffer.seek(0)
         blob.upload_from_file(buffer, content_type="application/octet-stream")
 
@@ -612,7 +742,18 @@ class CheckpointManager:
         gcs_path: str,
         verbose: bool = False,
     ) -> dict:
-        """Load tree from GCS msgpack format"""
+        """Load tree from GCS msgpack format.
+
+        Args:
+            gcs_path: GCS path to the msgpack checkpoint.
+            verbose: Enable verbose output.
+
+        Returns:
+            Dictionary containing the loaded checkpoint.
+
+        Raises:
+            ValueError: If GCS client is not initialized.
+        """
         if not self.gcs_client:
             raise ValueError("GCS client not initialized.")
 
@@ -620,7 +761,6 @@ class CheckpointManager:
         bucket = self.gcs_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
 
-        # Download to buffer
         buffer = io.BytesIO()
         blob.download_to_file(buffer)
         buffer.seek(0)

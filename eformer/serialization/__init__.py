@@ -12,8 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .checkpoint_manager import CheckpointManager
-from .host_checkpoint_manager import HostCheckpointManager
-from .loader import SerializationLoader
+"""Serialization module for eFormer.
 
-__all__ = ("CheckpointManager", "HostCheckpointManager", "SerializationLoader")
+This module provides efficient checkpoint saving and loading with support for:
+- TensorStore backend for large-scale storage
+- Async operations for parallel I/O
+- Sharding for distributed arrays
+- Google Cloud Storage support
+- SafeTensors format compatibility
+"""
+
+from .async_manager import AsyncCheckpointManager
+from .base_manager import CheckpointManager
+from .serialization import tree_deserialize_leaves, tree_serialize_leaves
+
+__all__ = (
+    "AsyncCheckpointManager",
+    "CheckpointManager",
+    "tree_deserialize_leaves",
+    "tree_serialize_leaves",
+)
