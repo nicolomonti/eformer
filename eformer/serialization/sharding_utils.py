@@ -16,6 +16,7 @@
 
 import json
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import jax
@@ -226,6 +227,12 @@ def validate_sharding_tree(sharding_tree: dict, expected_structure: dict) -> boo
 def make_itsharded(xs, mesh):
     def _procss(x):
         if isinstance(x, jax.Array) and x.is_fully_addressable:
-            return jax.device_put(x, NamedSharding(mesh, PartitionSpec()))
+
+            @partial(jax.jit, out_shardings=NamedSharding(mesh, PartitionSpec()))
+            def _move(x_):
+                return x_
+
+            return _move(x)
         return x
+
     return jax.tree_util.tree_map(_procss, xs)
