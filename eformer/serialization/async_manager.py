@@ -40,6 +40,7 @@ from eformer.pytree import PyTree, flatten_dict, is_flatten, serialization, unfl
 
 from .base_manager import CheckpointManager
 from .serialization import tree_deserialize_leaves, tree_serialize_leaves
+from .sharding_utils import make_itsharded
 from .utils import derive_base_prefix_from_path, index_filename
 from .utils import read_process_array as _read_process_array
 from .utils import to_host as _to_host
@@ -322,8 +323,8 @@ class AsyncCheckpointManager:
         metadata: dict[str, str] | None = None,
         callback: tp.Callable[[str], None] | None = None,
         prefix: str | None = None,
-        do_all_gather: bool = True,
-        cpu_offload: bool = True,
+        do_all_gather: bool = False,
+        cpu_offload: bool = False,
     ) -> str:
         """Synchronous wrapper for save_tree_async.
 
@@ -372,8 +373,8 @@ class AsyncCheckpointManager:
         metadata: dict[str, str] | None = None,
         callback: tp.Callable[[str], None] | None = None,
         prefix: str | None = None,
-        do_all_gather: bool = True,
-        cpu_offload: bool = True,
+        do_all_gather: bool = False,
+        cpu_offload: bool = False,
     ) -> str:
         """Asynchronously save checkpoint with parallel shard writing.
 
@@ -435,6 +436,9 @@ class AsyncCheckpointManager:
                 tree,
                 is_leaf=lambda x: isinstance(x, jax.Array | np.generic | float | int),
             )
+
+        if jax.process_count() > 1:
+            tree = make_itsharded(tree, mesh)
 
         checkpoint_meta = CheckpointMetadata(timestamp=datetime.now().isoformat(), custom_metadata=metadata)
 

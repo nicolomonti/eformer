@@ -221,3 +221,11 @@ def validate_sharding_tree(sharding_tree: dict, expected_structure: dict) -> boo
     except Exception as e:
         logger.warning(f"Error validating sharding tree: {e}")
         return False
+
+
+def make_itsharded(xs, mesh):
+    def _procss(x):
+        if isinstance(x, jax.Array) and x.is_fully_addressable:
+            return jax.device_put(x, NamedSharding(mesh, PartitionSpec()))
+        return x
+    return jax.tree_util.tree_map(_procss, xs)
