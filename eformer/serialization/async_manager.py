@@ -778,7 +778,13 @@ class AsyncCheckpointManager:
             )
 
         tree, metadata = CheckpointManager.load_checkpoint(
-            path, shardings, self.verbose, mismatch_allowed, callback, dtype, self.gcs_client
+            path,
+            shardings,
+            self.verbose,
+            mismatch_allowed,
+            callback,
+            dtype,
+            self.gcs_client,
         )
 
         if validate and metadata:
@@ -846,12 +852,21 @@ class AsyncCheckpointManager:
             for shard_name, keys in file_to_keys.items():
                 shard_path = str(ePath(directory) / shard_name)
                 future = executor.submit(
-                    self._load_shard_file, shard_path, keys, shard_fns, mismatch_allowed, callback, dtype
+                    self._load_shard_file,
+                    shard_path,
+                    keys,
+                    shard_fns,
+                    mismatch_allowed,
+                    callback,
+                    dtype,
                 )
                 futures.append(future)
 
             for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Loading shards (parallel)", disable=not self.verbose
+                as_completed(futures),
+                total=len(futures),
+                desc="Loading shards (parallel)",
+                disable=not self.verbose,
             ):
                 shard_tree = future.result()
                 tree.update(shard_tree)
@@ -916,3 +931,16 @@ class AsyncCheckpointManager:
         if self._pending_saves:
             await asyncio.gather(*self._pending_saves)
             self._pending_saves.clear()
+
+    @staticmethod
+    def is_tensorstore(path) -> bool:
+        if str(path).endswith("tensorstore_index.json"):
+            return True
+        return (ePath(path) / "tensorstore_index.json").exists()
+
+    @staticmethod
+    def safe_loadpath(path) -> ePathLike:
+        if AsyncCheckpointManager.is_tensorstore:
+            if str(path).endswith("tensorstore_index.json"):
+                return ePath(str(path)[: -len("tensorstore_index.json")])
+        return ePath(path)
