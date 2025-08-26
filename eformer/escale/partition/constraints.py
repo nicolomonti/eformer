@@ -165,10 +165,12 @@ def with_sharding_constraint(arr: jnp.ndarray | tp.Any, sharding: PartitionSpec 
 
     If an axis specified in the PartitionSpec:
       - Does not exist in the mesh,
-      - Corresponds to a mesh axis of size 1, or
       - Is incompatible with the array's dimension size (not divisible),
     then that part of the PartitionSpec is automatically corrected to None, effectively
     preventing sharding along that dimension.
+
+    Note: Mesh axes of size 1 are allowed if divisibility holds, enabling logical
+    sharding even on single-device axes.
 
     Args:
         arr: The JAX array or PyTree to apply sharding constraints to.
@@ -444,6 +446,7 @@ def match_partition_rules(
     rules: list[tuple[str, PartitionSpec]],
     tree: dict,
     min_size: int | None = 0,
+    strict: bool = True,
 ) -> dict:
     """
     Match partition rules to parameters based on their names.
@@ -451,16 +454,32 @@ def match_partition_rules(
     This function takes a list of partition rules (regular expressions and
     corresponding `PartitionSpec`) and applies them to a dictionary of parameters
     based on their names. It's useful for automatically defining sharding strategies.
+    The order of keys in the output dictionary matches the input tree's key order.
 
     Args:
-            rules: A list of tuples, where each tuple contains:
-                             - A regular expression to match parameter names.
-                             - A `PartitionSpec` to apply if the name matches.
-            tree: A dictionary of parameters, where keys are parameter names.
+        rules: A list of tuples, where each tuple contains:
+            - A regular expression to match parameter names.
+            - A `PartitionSpec` to apply if the name matches.
+        tree: A dictionary of parameters, where keys are parameter names
+            and values are the parameters (arrays) or indices.
+        min_size: Minimum size for applying sharding. Parameters smaller than
+            this will use PartitionSpec() for efficiency. Defaults to MIN_SHARDING_SIZE.
+        strict: If True, validates array shapes and applies min_size checks.
+            If False, applies rules without validation.
 
     Returns:
-            A dictionary with the same keys as `tree`, but values are replaced
-            with the corresponding `PartitionSpec` based on matching rules.
+        A dictionary with the same keys as `tree`, maintaining the original key order,
+        but with values replaced by the corresponding `PartitionSpec` based on
+        matching rules.
+
+    Raises:
+        ValueError: If no matching rule is found for a parameter.
+
+    Example:
+        >>> rules = [(".*weight", PartitionSpec("model", None))]
+        >>> tree = {"layer/weight": 0, "layer/bias": 1}
+        >>> match_partition_rules(rules, tree)
+        {"layer/weight": PartitionSpec("model", None), "layer/bias": PartitionSpec()}
     """
 
     min_size = min_size if min_size is not None else MIN_SHARDING_SIZE
@@ -468,32 +487,40 @@ def match_partition_rules(
     def get_partition_spec(name: str, leaf: jnp.ndarray) -> PartitionSpec:
         """
         Determine the partition spec for a parameter based on its name.
+
+        Matches the parameter name against rules in order and returns the first
+        matching PartitionSpec. Applies safety checks for array size and dimensions
+        when strict mode is enabled.
         """
+        if strict:
+            if not hasattr(leaf, "shape"):
+                return PartitionSpec()
+            size = np.prod(leaf.shape)
+            if len(leaf.shape) == 0:
+                """ Don't partition scalar values. """
+                return PartitionSpec()
 
-        if not hasattr(leaf, "shape"):
-            return PartitionSpec()
-        size = np.prod(leaf.shape)
-        if len(leaf.shape) == 0:
-            """ Don't partition scalar values. """
-            return PartitionSpec()
-
-        for rule, ps in rules:
-            if re.search(rule, name) is not None:
-                if size < min_size:
-                    if LOG_SHARDING_MOVE:
-                        warnings.warn(
-                            f"PartitionSpec Related to {name} was safer and faster being local array.",
-                            stacklevel=1,
-                        )
-                    return PartitionSpec()
-                if len(ps) > leaf.ndim:
-                    ps = PartitionSpec(*tuple(ps[: leaf.ndim]))
-                    if LOG_SHARDING_MOVE:
-                        warnings.warn(
-                            f"PartitionSpec Related to {name} went out of range (will be auto trimed to {ps}).",
-                            stacklevel=1,
-                        )
-                return ps
+            for rule, ps in rules:
+                if re.search(rule, name) is not None:
+                    if size < min_size:
+                        if LOG_SHARDING_MOVE:
+                            warnings.warn(
+                                f"PartitionSpec Related to {name} was safer and faster being local array.",
+                                stacklevel=1,
+                            )
+                        return PartitionSpec()
+                    if len(ps) > leaf.ndim:
+                        ps = PartitionSpec(*tuple(ps[: leaf.ndim]))
+                        if LOG_SHARDING_MOVE:
+                            warnings.warn(
+                                f"PartitionSpec Related to {name} went out of range (will be auto trimed to {ps}).",
+                                stacklevel=1,
+                            )
+                    return ps
+        else:
+            for rule, ps in rules:
+                if re.search(rule, name) is not None:
+                    return ps
         raise ValueError(f"Partition rule not found for param: {name}")
 
     return named_tree_map(get_partition_spec, tree, sep="/")

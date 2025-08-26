@@ -84,16 +84,6 @@ def put_dtype(
     return array
 
 
-# Enable float8 types
-try:
-    a = jnp.array(1.0, dtype=jnp.float8_e5m2)  # Test FP8 dtype
-    b = jnp.array(2.0, dtype=jnp.float8_e5m2)
-    c = a + b  # Perform an operation
-    c.block_until_ready()  # Force execution on device
-    HAS_FLOAT8 = True
-except (RuntimeError, TypeError):
-    HAS_FLOAT8 = False
-
 DTYPE_MAPPING = {
     # Standard types
     "bf16": jnp.bfloat16,
@@ -104,24 +94,14 @@ DTYPE_MAPPING = {
     "float16": jnp.float16,
     "float32": jnp.float32,
     "float64": jnp.float64,
+    "f8_e4m3": jnp.float8_e4m3fn,
+    "f8_e5m2": jnp.float8_e5m2,
+    "float8_e4m3": jnp.float8_e4m3fn,
+    "float8_e5m2": jnp.float8_e5m2,
 }
-
-# Add float8 types if available
-if HAS_FLOAT8:
-    DTYPE_MAPPING.update(
-        {
-            "f8_e4m3": jnp.float8_e4m3fn,
-            "f8_e5m2": jnp.float8_e5m2,
-            "float8_e4m3": jnp.float8_e4m3fn,
-            "float8_e5m2": jnp.float8_e5m2,
-        }
-    )
 
 
 def get_platform_default_half() -> jnp.dtype:
     """Returns platform-specific half precision type."""
     platform = jax.extend.backend.get_backend().platform
     return jnp.bfloat16 if platform == "tpu" else jnp.float16
-
-
-DTYPE_MAPPING["half"] = get_platform_default_half()

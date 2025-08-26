@@ -16,7 +16,6 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import jax
@@ -28,10 +27,9 @@ from jax.experimental.array_serialization import serialization as array_ser
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding, SingleDeviceSharding
 from jaxtyping import PyTree
 
+from eformer.escale import match_partition_rules
 from eformer.loggings import get_logger
 from eformer.paths import ePath
-
-from . import fsspec_utils
 
 logger = get_logger(__name__)
 
@@ -319,14 +317,12 @@ def _sharding_from_leaf(leaf, mesh) -> Sharding | None:
 
 def tree_deserialize_leaves(
     checkpoint_dir,
-    pytree=None,
-    mesh: Mesh | None = None,
+    mesh: Mesh,
     manager: array_ser.GlobalAsyncCheckpointManager | None = None,
     *,
     prefix: str | None = None,
-    shard_fns: dict[Callable] | None = None,
-    allow_missing: bool = False,
-    mismatch_allowed: bool = True,
+    partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
+    shardings: PyTree | dict[Callable] | None = None,
 ):
     """Deserialize a PyTree of arrays from a TensorStore checkpoint.
 
@@ -335,21 +331,16 @@ def tree_deserialize_leaves(
 
     Args:
         checkpoint_dir: Directory containing the TensorStore checkpoint.
-        pytree: Optional pytree template for structure. If None, structure is discovered
-            from the checkpoint.
         mesh: Optional JAX mesh for distributed arrays.
         manager: Optional GlobalAsyncCheckpointManager. If None, creates a new one.
         prefix: Optional prefix to filter/load specific tree (e.g., 'model', 'optimizer').
-        shard_fns: Dictionary mapping array paths to sharding functions.
-        allow_missing: Whether to allow missing arrays in checkpoint.
-        mismatch_allowed: Whether to allow missing shard functions without error.
+        shardings: sharding specifications matching checkpoint structure.
 
     Returns:
         Deserialized pytree structure with loaded arrays.
 
     Raises:
         ValueError: If checkpoint format is unsupported or prefix not found.
-        FileNotFoundError: If required arrays are missing and allow_missing is False.
 
     Note:
         Supports both v1.0 (single prefix) and v2.0 (multi-prefix) index formats.
@@ -359,206 +350,71 @@ def tree_deserialize_leaves(
     if manager is None:
         manager = array_ser.GlobalAsyncCheckpointManager()
 
-    if pytree is None:
-        index_path = ePath(checkpoint_dir) / "tensorstore_index.json"
+    index_path = ePath(checkpoint_dir) / "tensorstore_index.json"
 
-        if index_path.exists():
-            index_data = json.loads(index_path.read_text())
+    if index_path.exists():
+        index_data = json.loads(index_path.read_text())
 
-            if index_data.get("format") != "tensorstore":
-                raise ValueError(f"Unsupported index format: {index_data.get('format')}")
+        if index_data.get("format") != "tensorstore":
+            raise ValueError(f"Unsupported index format: {index_data.get('format')}")
 
-            version = index_data.get("version", "1.0")
-
-            if version == "2.0" and "prefixes" in index_data:
-                if prefix:
-                    if prefix not in index_data["prefixes"]:
-                        available = list(index_data["prefixes"].keys())
-                        raise ValueError(f"Prefix '{prefix}' not found. Available: {available}")
-                    array_info = index_data["prefixes"][prefix]
-                else:
-                    if "arrays" in index_data:
-                        array_info = index_data["arrays"]
-                    else:
-                        available = list(index_data["prefixes"].keys())
-                        raise ValueError(f"No prefix specified. Available prefixes: {available}")
-            else:
-                array_info = index_data.get("arrays", [])
-            paths_to_load = []
-            keys = []
-
-            for info in array_info:
-                rel_path = info["path"]
-                abs_path = str(ePath(checkpoint_dir) / rel_path)
-                paths_to_load.append(abs_path)
-
-                key = rel_path.replace("/", ".").replace("\\\\", ".")
-
-                if prefix and key.startswith(f"{prefix}."):
-                    key = key[len(prefix) + 1 :]
-                keys.append(key)
-
-            shardings_to_load = [_fully_replicated_sharding(mesh) for _ in paths_to_load]
-
-            if paths_to_load:
-                deser_leaves = manager.deserialize_with_paths(shardings=shardings_to_load, paths=paths_to_load)
-            else:
-                deser_leaves = []
-
-            if shard_fns:
-                from eformer.pytree import flatten_dict, is_flatten
-
-                if not is_flatten(shard_fns):
-                    shard_fns = flatten_dict(shard_fns, sep=".")
-
-                processed_leaves = []
-                for key, array in zip(keys, deser_leaves, strict=False):
-                    if key in shard_fns:
-                        array = shard_fns[key](array)
-                    elif not mismatch_allowed:
-                        logger.warning(f"No shard function found for key: {key}")
-                    processed_leaves.append(array)
-                deser_leaves = processed_leaves
-
-            result = {}
-            for key, array in zip(keys, deser_leaves, strict=False):
-                parts = key.split(".")
-                current = result
-                for part in parts[:-1]:
-                    if part not in current:
-                        current[part] = {}
-                    current = current[part]
-                current[parts[-1]] = array
-
-            return result
-        else:
-            import glob
-
-            logger.warning(f"No tensorstore_index.json found in {checkpoint_dir}, attempting filesystem discovery")
-
-            checkpoint_path = ePath(checkpoint_dir)
+        if "prefixes" in index_data:
             if prefix:
-                pattern = str(checkpoint_path / prefix / "**" / ".zarray")
+                if prefix not in index_data["prefixes"]:
+                    available = list(index_data["prefixes"].keys())
+                    raise ValueError(f"Prefix '{prefix}' not found. Available: {available}")
+                array_info = index_data["prefixes"][prefix]
             else:
-                pattern = str(checkpoint_path / "**" / ".zarray")
-            zarray_paths = glob.glob(pattern, recursive=True)
-
-            array_paths = [str(ePath(p).parent) for p in zarray_paths]
-
-            paths_to_load = []
-            keys = []
-            for path in array_paths:
-                path_obj = ePath(path)
-                checkpoint_obj = ePath(checkpoint_dir)
-                try:
-                    rel_path = str(path_obj.relative_to(checkpoint_obj))
-                except (ValueError, TypeError):
-                    rel_path = os.path.relpath(path, checkpoint_dir)
-
-                key = rel_path.replace("/", ".").replace("\\\\", ".")
-
-                if prefix and key.startswith(f"{prefix}."):
-                    key = key[len(prefix) + 1 :]
-                keys.append(key)
-                paths_to_load.append(path)
-
-            shardings_to_load = [_fully_replicated_sharding(mesh) for _ in paths_to_load]
-
-            if paths_to_load:
-                deser_leaves = manager.deserialize_with_paths(shardings=shardings_to_load, paths=paths_to_load)
-            else:
-                deser_leaves = []
-
-            if shard_fns:
-                from eformer.pytree import flatten_dict, is_flatten
-
-                if not is_flatten(shard_fns):
-                    shard_fns = flatten_dict(shard_fns, sep=".")
-
-                processed_leaves = []
-                for key, array in zip(keys, deser_leaves, strict=False):
-                    if key in shard_fns:
-                        array = shard_fns[key](array)
-                    elif not mismatch_allowed:
-                        logger.warning(f"No shard function found for key: {key}")
-                    processed_leaves.append(array)
-                deser_leaves = processed_leaves
-
-            result = {}
-            for key, array in zip(keys, deser_leaves, strict=False):
-                parts = key.split(".")
-                current = result
-                for part in parts[:-1]:
-                    if part not in current:
-                        current[part] = {}
-                    current = current[part]
-                current[parts[-1]] = array
-
-            return result
-
-    shardings: PyTree[Sharding | None] = jtu.tree_map(partial(_sharding_from_leaf, mesh=mesh), pytree, is_leaf=_is_none)
-
-    leaf_path = leaf_key_paths(shardings, prefix=prefix, is_leaf=_is_none)
-    paths = _fs_paths_from_key_paths(checkpoint_dir, leaf_path)
-    paths = jtu.tree_leaves(paths, is_leaf=_is_none)
-
-    shardings_leaves, shardings_structure = jtu.tree_flatten(shardings, is_leaf=_is_none)
-    assert len(shardings_leaves) == len(paths)
-
-    real_indices = [i for i, x in enumerate(shardings_leaves) if x is not None]
-    paths_to_load = []
-    indices_to_load = []
-    shardings_to_load = []
-
-    missing_paths = []
-    missing_indices = []
-
-    for i in real_indices:
-        path = paths[i]
-
-        if not fsspec_utils.exists(path):
-            missing_paths.append(path)
-            missing_indices.append(i)
-            continue
-
-        paths_to_load.append(path)
-        indices_to_load.append(i)
-        shardings_to_load.append(shardings_leaves[i])
-
-    if missing_paths:
-        if not allow_missing:
-            raise FileNotFoundError(f"Missing paths: {missing_paths}")
+                if "arrays" in index_data:
+                    array_info = index_data["arrays"]
+                else:
+                    available = list(index_data["prefixes"].keys())
+                    raise ValueError(f"No prefix specified. Available prefixes: {available}")
         else:
-            to_log = f"Several keys were missing from the checkpoint directory {checkpoint_dir}:"
-            leaf_paths = jtu.tree_leaves(leaf_path, is_leaf=_is_none)
-            for i in missing_indices:
-                to_log += f"\n  - {leaf_paths[i]}"
-            logger.warning(to_log)
+            array_info = index_data.get("arrays", [])
 
-    deser_leaves = manager.deserialize_with_paths(shardings=shardings_to_load, paths=paths_to_load)
+        paths_to_load = []
+        keys = []
+        apply_tree_shardings = []
+        if shardings is None:
+            shardings = {}
+        for info in array_info:
+            rel_path = info["path"]
+            abs_path = str(ePath(checkpoint_dir) / rel_path)
+            paths_to_load.append(abs_path)
+            key = rel_path.replace("/", ".").replace("\\\\", ".")
 
-    if shard_fns:
-        from eformer.pytree import flatten_dict, is_flatten
+            if prefix and key.startswith(f"{prefix}."):
+                key = key[len(prefix) + 1 :]
+            keys.append(key)
+            if key in shardings:
+                apply_tree_shardings.append(shardings[key])
+            else:
+                apply_tree_shardings.append(NamedSharding(mesh=mesh, spec=PartitionSpec()))
+        if partition_rules is not None:
+            partition_rules = match_partition_rules(
+                partition_rules,
+                {k.replace(".", "/"): i for i, k in enumerate(keys)},
+                strict=False,
+            )
+            partition_rules = [
+                NamedSharding(mesh=mesh, spec=partition_rules[k.replace(".", "/")])
+                for k in keys
+            ]
+            apply_tree_shardings = partition_rules
+        if paths_to_load:
+            deser_leaves = manager.deserialize_with_paths(shardings=apply_tree_shardings, paths=paths_to_load)
+        else:
+            deser_leaves = []
 
-        if not is_flatten(shard_fns):
-            shard_fns = flatten_dict(shard_fns, sep=".")
+        result = {}
+        for key, array in zip(keys, deser_leaves, strict=False):
+            parts = key.split(".")
+            current = result
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = array
 
-        leaf_paths = jtu.tree_leaves(leaf_path, is_leaf=_is_none)
-        processed_leaves = []
-
-        for idx, array in zip(indices_to_load, deser_leaves, strict=False):
-            key = leaf_paths[idx]
-            if key in shard_fns:
-                array = shard_fns[key](array)
-            elif not mismatch_allowed:
-                logger.warning(f"No shard function found for key: {key}")
-            processed_leaves.append(array)
-        deser_leaves = processed_leaves
-
-    out_leaves = jax.tree.leaves(pytree, is_leaf=_is_none)
-    assert len(out_leaves) == len(shardings_leaves)
-    for i, x in zip(indices_to_load, deser_leaves, strict=False):
-        out_leaves[i] = x
-
-    deser_arrays = jtu.tree_unflatten(shardings_structure, out_leaves)
-    return deser_arrays
+        return result

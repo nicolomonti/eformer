@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.distributed import is_initialized
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
@@ -110,6 +110,16 @@ class AsyncCheckpointManager:
 
     This manager provides asynchronous checkpoint saving and loading with support
     for parallel operations, tensorstore backend, validation, and compression.
+    Supports both TensorStore (for large-scale distributed checkpoints) and
+    SafeTensors (for smaller, single-file checkpoints) formats.
+
+    Key Features:
+        - Automatic format detection (TensorStore vs SafeTensors)
+        - Parallel I/O operations for faster loading/saving
+        - CPU offloading to prevent OOM on accelerators
+        - Checksum validation for data integrity
+        - Support for sharded checkpoints across multiple files
+        - Pattern-based partition rules with preserved ordering
 
     Attributes:
         float_dtype: Default data type for floating point arrays.
@@ -120,6 +130,18 @@ class AsyncCheckpointManager:
         enable_validation: Enable checksum validation.
         enable_compression: Enable compression for tensorstore.
         use_tensorstore: Use tensorstore backend when available.
+
+    Example:
+        >>> manager = AsyncCheckpointManager(
+        ...     enable_validation=True,
+        ...     max_workers=8,
+        ...     use_tensorstore=True
+        ... )
+        >>> # Save checkpoint
+        >>> manager.save(model_state, "checkpoint", mesh=mesh)
+        >>> # Load checkpoint with partition rules
+        >>> rules = [(".*kernel", PartitionSpec("model", None))]
+        >>> state, meta = manager.load("checkpoint", mesh, partition_rules=rules)
     """
 
     def __init__(
@@ -134,7 +156,8 @@ class AsyncCheckpointManager:
         enable_compression: bool = False,
         use_tensorstore: bool = True,
     ):
-        assert is_initialized(), "you should call jax distribution init before running process."
+        if jax.process_count() > 1:
+            assert is_initialized(), "you should call jax distribution init before running process."
 
         self.float_dtype = float_dtype
         self.enable = enable
@@ -382,6 +405,18 @@ class AsyncCheckpointManager:
               SafeTensors format based on configuration.
             - When mesh is not provided, a warning is logged and CPU mesh is used as fallback.
             - CPU offloading helps prevent out-of-memory errors on GPUs/TPUs during checkpointing.
+            - Arrays are automatically flattened before saving and unflattened when loading.
+
+        Example:
+            >>> async def save():
+            ...     manager = AsyncCheckpointManager()
+            ...     await manager.save_tree_async(
+            ...         tree=model_state,
+            ...         path="checkpoint",
+            ...         mesh=mesh,
+            ...         prefix="model",
+            ...         cpu_offload=True
+            ...     )
         """
         if float_dtype is None:
             float_dtype = self.float_dtype
@@ -543,13 +578,18 @@ class AsyncCheckpointManager:
         return path
 
     async def _load_tensorstore_async(
-        self, path: str, shard_fns: dict[tp.Callable] | None = None, prefix: str | None = None
+        self,
+        path: str,
+        shardings: dict[NamedSharding] | None = None,
+        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
+        mesh: Mesh | None = None,
+        prefix: str | None = None,
     ) -> tuple[dict, dict]:
         """Load checkpoint saved with tensorstore using core deserialization.
 
         Args:
             path: Path to the tensorstore checkpoint.
-            shard_fns: Dictionary of functions to apply to shards.
+            shardings: PyTree of sharding specifications or dict of functions.
             prefix: Optional prefix for loading specific tree.
 
         Returns:
@@ -564,13 +604,11 @@ class AsyncCheckpointManager:
             self.executor,
             lambda: tree_deserialize_leaves(
                 checkpoint_dir=path,
-                pytree=None,
-                mesh=None,
+                mesh=mesh,
+                partition_rules=partition_rules,
                 manager=manager,
                 prefix=prefix,
-                shard_fns=shard_fns,
-                allow_missing=False,
-                mismatch_allowed=True,
+                shardings=shardings,
             ),
         )
 
@@ -588,9 +626,11 @@ class AsyncCheckpointManager:
     def load(
         self,
         path: ePathLike | str | os.PathLike,
-        shard_fns: dict[tp.Callable] | None = None,
+        mesh: Mesh,
+        shardings: dict[NamedSharding] | None | dict[tp.Callable] = None,
         mismatch_allowed: bool = True,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
+        partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         dtype: str | jnp.dtype | None = None,
         validate: bool | None = None,
         prefix_filter: str | None = None,
@@ -604,11 +644,15 @@ class AsyncCheckpointManager:
 
         Args:
             path: Path to the checkpoint directory or file.
-            shard_fns: Dictionary mapping keys to functions that process/reshard arrays
-                after loading.
+            mesh: JAX mesh for distributed computation. Required for proper sharding.
+            shardings: PyTree of sharding specifications matching checkpoint structure,
+                or dict mapping keys to functions that process/reshard arrays after loading.
             mismatch_allowed: Whether to allow missing shard functions without error.
             callback: Optional callback to process each array after loading.
                 Receives (array, key) and returns processed array.
+            partition_rules: List of (regex, PartitionSpec) tuples for pattern-based
+                sharding. Applied to arrays matching the regex patterns. Preserves
+                order of arrays during loading.
             dtype: Data type to cast arrays to after loading.
             validate: Whether to validate checksums. If None, uses self.enable_validation.
             prefix_filter: Deprecated. Use 'prefix' instead.
@@ -625,8 +669,15 @@ class AsyncCheckpointManager:
             FileNotFoundError: If checkpoint doesn't exist.
 
         Note:
-            Automatically detects TensorStore format by checking for .zarray files
-            or tensorstore_index.json.
+            - Automatically detects TensorStore format by checking for .zarray files
+              or tensorstore_index.json.
+            - When using partition_rules, the order of loaded arrays is preserved
+              to ensure consistent sharding application.
+
+        Example:
+            >>> manager = AsyncCheckpointManager()
+            >>> rules = [(".*weight", PartitionSpec("model", None))]
+            >>> tree, meta = manager.load("checkpoint", mesh, partition_rules=rules)
         """
         path_str = str(path)
 
@@ -640,20 +691,26 @@ class AsyncCheckpointManager:
 
         if is_tensorstore:
             if use_async:
-                tree, metadata = self._run_async(self._load_tensorstore_async(path_str, shard_fns, prefix))
+                tree, metadata = self._run_async(
+                    self._load_tensorstore_async(
+                        path=path_str,
+                        mesh=mesh,
+                        partition_rules=partition_rules,
+                        shardings=shardings,
+                        prefix=prefix,
+                    )
+                )
             else:
                 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 
                 manager = GlobalAsyncCheckpointManager()
                 tree = tree_deserialize_leaves(
                     checkpoint_dir=path_str,
-                    pytree=None,
-                    mesh=None,
+                    mesh=mesh,
+                    partition_rules=partition_rules,
                     manager=manager,
                     prefix=prefix,
-                    shard_fns=shard_fns,
-                    allow_missing=False,
-                    mismatch_allowed=mismatch_allowed,
+                    shardings=shardings,
                 )
                 meta_path = path_obj / "checkpoint_metadata.json"
                 if meta_path.exists():
@@ -668,7 +725,7 @@ class AsyncCheckpointManager:
         else:
             return self.load_tree_parallel(
                 path=path,
-                shard_fns=shard_fns,
+                shardings=shardings,
                 mismatch_allowed=mismatch_allowed,
                 callback=callback,
                 dtype=dtype,
@@ -679,7 +736,7 @@ class AsyncCheckpointManager:
     def load_tree_parallel(
         self,
         path: ePathLike | str | os.PathLike,
-        shard_fns: dict[tp.Callable] | None = None,
+        shardings: None | dict[tp.Callable] = None,
         mismatch_allowed: bool = True,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         dtype: str | jnp.dtype | None = None,
@@ -690,7 +747,7 @@ class AsyncCheckpointManager:
 
         Args:
             path: Path to the checkpoint.
-            shard_fns: Dictionary of functions to apply to shards.
+            shardings: PyTree of sharding specifications or dict of functions.
             mismatch_allowed: Whether to allow missing shard functions.
             callback: Optional callback to process arrays.
             dtype: Data type to cast arrays to.
@@ -710,10 +767,18 @@ class AsyncCheckpointManager:
         index_path_str = index_filename(base_prefix)
 
         if ePath(index_path_str).exists():
-            return self._load_sharded_parallel(index_path_str, shard_fns, mismatch_allowed, callback, dtype, validate)
+            return self._load_sharded_parallel(
+                index_path_str,
+                shardings,
+                mismatch_allowed,
+                callback,
+                dtype,
+                validate,
+                prefix_filter,
+            )
 
         tree, metadata = CheckpointManager.load_checkpoint(
-            path, shard_fns, self.verbose, mismatch_allowed, callback, dtype, self.gcs_client
+            path, shardings, self.verbose, mismatch_allowed, callback, dtype, self.gcs_client
         )
 
         if validate and metadata:
@@ -726,21 +791,23 @@ class AsyncCheckpointManager:
     def _load_sharded_parallel(
         self,
         index_path: str,
-        shard_fns: dict[tp.Callable] | None,
+        shardings: PyTree | dict[tp.Callable] | None,
         mismatch_allowed: bool,
         callback: tp.Callable | None,
         dtype: str | jnp.dtype | None,
         validate: bool,
+        prefix_filter: str | None = None,
     ) -> tuple[PyTree | dict, dict]:
         """Load sharded checkpoint with parallel reads.
 
         Args:
             index_path: Path to the index file.
-            shard_fns: Dictionary of functions to apply to shards.
+            shardings: PyTree of sharding specifications or dict of functions.
             mismatch_allowed: Whether to allow missing shard functions.
             callback: Optional callback to process arrays.
             dtype: Data type to cast arrays to.
             validate: Whether to validate checksums.
+            prefix_filter: Optional prefix to filter loaded keys (deprecated).
 
         Returns:
             Tuple of (loaded tree, metadata dictionary).
@@ -757,8 +824,20 @@ class AsyncCheckpointManager:
         for k, shard_name in weight_map.items():
             file_to_keys[shard_name].append(k)
 
-        if shard_fns and not is_flatten(shard_fns):
-            shard_fns = flatten_dict(shard_fns, sep=".")
+        # Convert shardings to flat dict if needed for SafeTensors format
+        shard_fns = None
+        if shardings:
+            if isinstance(shardings, dict) and not any(isinstance(v, dict) for v in shardings.values()):
+                # Already flat dict format
+                shard_fns = shardings
+            else:
+                # PyTree format - flatten it
+                from eformer.pytree import flatten_dict, is_flatten
+
+                if not is_flatten(shardings):
+                    shard_fns = flatten_dict(shardings, sep=".")
+                else:
+                    shard_fns = shardings
 
         tree = {}
         futures = []
@@ -801,7 +880,7 @@ class AsyncCheckpointManager:
         Args:
             shard_path: Path to the shard file.
             keys: List of keys to load from the shard.
-            shard_fns: Dictionary of functions to apply to shards.
+            shard_fns: Flat dictionary of functions to apply to shards.
             mismatch_allowed: Whether to allow missing shard functions.
             callback: Optional callback to process arrays.
             dtype: Data type to cast arrays to.
