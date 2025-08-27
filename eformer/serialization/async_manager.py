@@ -152,7 +152,7 @@ class AsyncCheckpointManager:
         verbose: bool = False,
         gcs_bucket: str | None = None,
         gcs_credentials_path: str | None = None,
-        max_workers: int = 4,
+        max_workers: int = 1,
         enable_validation: bool = False,
         enable_compression: bool = False,
         use_tensorstore: bool = True,
