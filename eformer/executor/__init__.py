@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from . import ray
+from .cluster_util import DistributedConfig, RayClusterConfig, auto_ray_cluster, eSlurmCluster
 
-__all__ = ("ray",)
+__all__ = ("DistributedConfig", "RayClusterConfig", "auto_ray_cluster", "eSlurmCluster", "ray")

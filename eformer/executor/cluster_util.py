@@ -49,7 +49,7 @@ _VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 _NODE_NAME = "SLURMD_NODENAME"
 
 
-class eRayExecutorSlurmCluster(clusters.SlurmCluster):
+class eSlurmCluster(clusters.SlurmCluster):
     """Extended SLURM cluster implementation for Ray executor.
 
     This class extends JAX's SlurmCluster to provide additional functionality
@@ -77,7 +77,7 @@ class eRayExecutorSlurmCluster(clusters.SlurmCluster):
         """
         _id = os.environ[_JOBID_PARAM]
         port = _choose_port(_id)
-        node_list = eRayExecutorSlurmCluster._node_list()
+        node_list = eSlurmCluster._node_list()
         if node_list is None:
             raise ValueError(
                 "Could not find node list in environment variables. You must set coordinator_address manually."
@@ -157,7 +157,7 @@ class eRayExecutorSlurmCluster(clusters.SlurmCluster):
         Raises:
             ValueError: If node list cannot be found in environment variables.
         """
-        node_list = eRayExecutorSlurmCluster._node_list()
+        node_list = eSlurmCluster._node_list()
         if node_list is None:
             raise ValueError(
                 "Could not find node list in environment variables. You must set coordinator_address manually."
@@ -507,12 +507,12 @@ class DistributedConfig:
             device_ids = self.local_device_ids
             coordinator_address = self.coordinator_address
 
-            if eRayExecutorSlurmCluster.is_env_present():
+            if eSlurmCluster.is_env_present():
                 if device_ids is None:
-                    device_ids = eRayExecutorSlurmCluster.get_local_device_ids_for_process()
+                    device_ids = eSlurmCluster.get_local_device_ids_for_process()
 
                 if coordinator_address is None:
-                    coordinator_address = eRayExecutorSlurmCluster.get_coordinator_address()
+                    coordinator_address = eSlurmCluster.get_coordinator_address()
 
             jax.distributed.initialize(
                 coordinator_address,
@@ -534,7 +534,7 @@ class DistributedConfig:
 
 
 @dataclass
-class RayConfig:
+class RayClusterConfig:
     """Configuration for Ray cluster initialization.
 
     Controls how Ray clusters are started and connected to.
