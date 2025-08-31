@@ -60,6 +60,7 @@ Example:
 
 import functools
 import logging
+import os
 
 import ray
 from ray.exceptions import RayError
@@ -83,8 +84,6 @@ from .types import (
 
 ENV_CALL_INDEX = "EXECUTOR_CALL_INDEX"
 ENV_CALL_SLICE = "EXECUTOR_CALL_SLICE"
-
-
 MEGASCALE_DEFAULT_PORT = 8081
 
 logger = logging.getLogger("ray")
@@ -152,13 +151,20 @@ class RayExecutor:
         ) -> JobStatus:
             """Internal function to run the remote function with proper resource allocation.
 
+            This function handles the actual execution of the remote function,
+            managing multiple workers if specified in the configuration and
+            capturing any errors that occur during execution.
+
             Args:
                 remote_fn: The remote function to execute.
-                accelerator_config: Accelerator configuration.
-                kwargs: Arguments for the remote function.
+                accelerator_config: Accelerator configuration specifying resources.
+                kwargs: Keyword arguments to pass to the remote function.
 
             Returns:
-                JobStatus: Status object indicating success, failure, or preemption.
+                JobStatus: Status object indicating:
+                    - JobSucceeded: Execution completed successfully
+                    - JobFailed: Execution failed with an error
+                    - JobPreempted: Execution was preempted (for preemptible instances)
             """
             info = JobInfo(
                 accelerator_config.runtime_name,
@@ -202,7 +208,9 @@ class RayExecutor:
         """Execute a Ray remote function across multiple TPU slices.
 
         Distributes execution of a remote function across multiple TPU slices
-        for large-scale parallel processing.
+        for large-scale parallel processing. This method sets up the necessary
+        infrastructure including slice actors, placement groups, and MegaScale
+        coordination environment variables.
 
         Args:
             remote_fn (RemoteFunction): The Ray remote function to execute
@@ -222,6 +230,11 @@ class RayExecutor:
             RayError: If slice actor creation fails, coordinator IP cannot
                 be determined, or remote function calls fail.
 
+        Note:
+            The method automatically sets up MegaScale environment variables
+            for multi-slice coordination including coordinator address, slice IDs,
+            and port configuration.
+
         Example:
             >>> @ray.remote
             >>> def train_on_slice(data, slice_id):
@@ -236,22 +249,43 @@ class RayExecutor:
             ... )
             >>> results = ray.get(futures)  # List of JobStatus objects
         """
-        num_slices = getattr(accelerator_config, "pod_count", 1)
-        pool_manager = SlicePoolManager(accelerator_config.tpu_version)
-        pool_manager.scale_multislice(num_slices)
+        pool_manager = SlicePoolManager(tpu_type=accelerator_config.tpu_version)
+        pool_manager.scale_multislice(accelerator_config.pod_count)
+        pool_manager.prepare_all_slices()
         pool_members = pool_manager.get_all_pool_members()
         if not pool_members:
             raise RayError("Failed to create slice actors in pool")
+        slice_infos = ray.get([m.actor.get_info.remote() for m in pool_members])
+        coord_ip = slice_infos[0].ip_address if slice_infos else None
+
+        if not coord_ip:
+            raise RayError("Failed to determine coordinator IP from slice info")
+
+        port = int(os.getenv("COORD_PORT", MEGASCALE_DEFAULT_PORT))
+        base_env = dict(
+            TPU_NAME=os.getenv("TPU_NAME", "EMPTY"),
+            TPU_VERSION=accelerator_config.tpu_version,
+            TPU_ZONE=os.getenv("TPU_ZONE", "EMPTY"),
+            TPU_POD_COUNT=str(accelerator_config.pod_count),
+        )
+
         futures = []
-        for member in pool_members:
-            slice_actor = member.actor
-            future = slice_actor.run_task.remote(
-                remote_fn=remote_fn,
-                runtime_env=accelerator_config.execution_env,
-                **kwargs,
+        for slice_id, member in enumerate(pool_members):
+            megascale_env = dict(
+                MEGASCALE_COORDINATOR_ADDRESS=coord_ip,
+                MEGASCALE_NUM_SLICES=str(accelerator_config.pod_count),
+                MEGASCALE_PORT=str(port),
+                MEGASCALE_SLICE_ID=str(slice_id),
             )
+            env = dict(**base_env, EXECUTOR_CALL_INDEX=str(0), EXECUTOR_CALL_SLICE=str(slice_id))
+
+            if accelerator_config.pod_count > 1:
+                env.update(**megascale_env)
+            future = member.actor.execute_function.remote(remote_fn, use_host_actors=True, env=env, **kwargs)
             futures.append(future)
 
+        # NOTE (erfanzar): pool_manager.drain_actor_pool() can be called after getting results
+        # to clean up resources, but is left to the caller for flexibility
         return futures
 
     @classmethod
@@ -500,8 +534,10 @@ class RayExecutor:
                 problem = problem or RuntimeError("Empty job statuses from execute_multislice after ray.get()")
                 continue
 
+            # Process results from each slice to determine overall status
             for slice_idx, single_slice_status in enumerate(all_slice_job_statuses):
                 if isinstance(single_slice_status, JobSucceeded):
+                    # Slice succeeded - store its result
                     aggregated_successful_slice_results[slice_idx] = single_slice_status.result
                 elif isinstance(single_slice_status, JobPreempted):
                     if not problem:
@@ -537,6 +573,7 @@ class RayExecutor:
                     current_attempt_overall_failed = True
                     logger.error(err_msg)
 
+            # Handle overall attempt status based on individual slice results
             if current_attempt_overall_failed:
                 num_failures += 1
                 logger.warning(
@@ -552,6 +589,7 @@ class RayExecutor:
                     f" {num_preemptions}. Last/first error: {problem}",
                 )
                 continue
+            # Check if all slices succeeded
             if (
                 not current_attempt_overall_failed
                 and not current_attempt_overall_preempted
@@ -560,6 +598,7 @@ class RayExecutor:
                 logger.info("All slices succeeded in this attempt.")
                 return aggregated_successful_slice_results
             else:
+                # Inconsistent state - some slices may have unknown status
                 logger.error(
                     "Inconsistent state in multislice resumable logic after "
                     "processing slice results. Treating as failure."
@@ -584,14 +623,22 @@ def execute_resumable(accelerator_config: AcceleratorConfigType):
     """Decorator for fault-tolerant single-pod execution.
 
     Wraps a Ray remote function to automatically use RayExecutor.execute_resumable
-    with the specified accelerator configuration.
+    with the specified accelerator configuration. The decorated function will
+    automatically retry on preemption or failure according to the default retry
+    policies (1,000,000 retries for preemption, 10 for failures).
 
     Args:
         accelerator_config (AcceleratorConfigType): Configuration for accelerator
-            resources to use for execution.
+            resources to use for execution. Should have pod_count=1 for
+            single-pod execution.
 
     Returns:
-        Callable: Decorator function that wraps the remote function.
+        Callable: Decorator function that wraps the remote function and adds
+            automatic retry logic.
+
+    Note:
+        To customize retry behavior, use RayExecutor.execute_resumable directly
+        with max_retries_preemption and max_retries_failure parameters.
 
     Example:
         >>> tpu_config = TpuAcceleratorConfig(type="v4-8")
@@ -623,14 +670,22 @@ def execute(accelerator_config: AcceleratorConfigType):
 
     Wraps a Ray remote function to automatically use RayExecutor.execute
     with the specified accelerator configuration. Results are automatically
-    retrieved with ray.get().
+    retrieved with ray.get(). This decorator is suitable for tasks that
+    don't require fault tolerance or where failures should be handled
+    by the caller.
 
     Args:
         accelerator_config (AcceleratorConfigType): Configuration for accelerator
-            resources to use for execution.
+            resources to use for execution. Should have pod_count=1 for
+            single-pod execution.
 
     Returns:
-        Callable: Decorator function that wraps the remote function.
+        Callable: Decorator function that wraps the remote function and
+            automatically retrieves results.
+
+    Note:
+        Unlike execute_resumable, this decorator does not retry on failure.
+        Use this for quick tasks or when you want to handle failures yourself.
 
     Example:
         >>> gpu_config = GpuAcceleratorConfig(count=2, type="a100")
@@ -664,14 +719,21 @@ def execute_multislice(accelerator_config: AcceleratorConfigType):
 
     Wraps a Ray remote function to automatically use RayExecutor.execute_multislice
     with the specified accelerator configuration. Results from all slices are
-    automatically retrieved with ray.get().
+    automatically retrieved with ray.get(). The function will be executed
+    across multiple TPU slices in parallel, with MegaScale coordination
+    automatically configured.
 
     Args:
         accelerator_config (AcceleratorConfigType): Configuration for accelerator
-            resources with multi-slice support (pod_count > 1).
+            resources with multi-slice support. Must have pod_count > 1.
 
     Returns:
-        Callable: Decorator function that wraps the remote function.
+        Callable: Decorator function that wraps the remote function and returns
+            a list of results, one from each slice.
+
+    Note:
+        The decorator handles slice actor creation, placement group setup,
+        and MegaScale environment configuration automatically.
 
     Example:
         >>> tpu_config = TpuAcceleratorConfig(type="v4-32", pod_count=4)
@@ -705,14 +767,21 @@ def execute_multislice_resumable(accelerator_config: AcceleratorConfigType):
 
     Wraps a Ray remote function to automatically use RayExecutor.execute_multislice_resumable
     with the specified accelerator configuration. Provides automatic retry on
-    preemption or failure of any slice.
+    preemption or failure of any slice. Uses an all-or-nothing retry policy:
+    if any slice fails, the entire multi-slice execution is retried.
 
     Args:
         accelerator_config (AcceleratorConfigType): Configuration for accelerator
-            resources with multi-slice support (pod_count > 1).
+            resources with multi-slice support. Must have pod_count > 1.
 
     Returns:
-        Callable: Decorator function that wraps the remote function.
+        Callable: Decorator function that wraps the remote function and adds
+            automatic retry logic for all slices.
+
+    Note:
+        Default retry limits are 1,000,000 for preemptions and 10 for failures.
+        To customize these limits, use RayExecutor.execute_multislice_resumable
+        directly with max_retries_preemption and max_retries_failure parameters.
 
     Example:
         >>> tpu_config = TpuAcceleratorConfig(type="v4-32", pod_count=4, preemptible=True)

@@ -23,624 +23,934 @@ Key Components:
     - **ActorPoolMember**: Wrapper for actor handles with metadata
     - **ResourcePoolManager**: Abstract base for managing actor pools
     - **SlicePoolManager**: Specialized manager for TPU/GPU slices
-    - **_SliceActor**: Ray actor for managing individual compute slices
+    - **SliceActor**: Ray actor for managing individual compute slices
 
 Example:
     Managing a multi-slice TPU configuration:
 
     >>> from eformer.executor.ray import SlicePoolManager
     >>>
-    >>> # Create a pool manager for TPU v4 slices
     >>> manager = SlicePoolManager(tpu_type="v4-8")
-    >>>
-    >>> # Scale to 4 slices
     >>> manager.scale_multislice(num_slices=4)
-    >>>
-    >>> # Get all slice actors
     >>> actors = manager.get_all_actors_in_pool()
-    >>>
-    >>> # Clean up when done
     >>> manager.drain_actor_pool()
 """
 
 from __future__ import annotations
 
 import logging
-import socket
-from abc import ABC, abstractmethod
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 import ray
-from ray._private.accelerators import TPUAcceleratorManager
+import requests
 from ray.actor import ActorHandle
+from ray.autoscaler.sdk import request_resources
 from ray.exceptions import ActorDiedError, ActorUnavailableError, GetTimeoutError
-from ray.remote_function import RemoteFunction
-from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
-from .types import MultisliceInfo, SliceInfo
+from .types import SliceInfo
 
 logger = logging.getLogger("ray")
 
-_HEALTH_CHECK_TIMEOUT = 60
+HEALTH_CHECK_TIMEOUT_S = 60
 ActorInfoT = TypeVar("ActorInfoT")
 
 
 @dataclass(frozen=True)
-class ActorPoolMember(Generic[ActorInfoT]):
-    """Wrapper for Ray actor handles with associated metadata.
-
-    Provides a typed container for pairing Ray actors with their
-    configuration and runtime information.
+class HostInfo:
+    """Information about a TPU host within a slice.
 
     Attributes:
-        actor (ActorHandle): The Ray actor handle for remote execution.
-        actor_info (ActorInfoT): Generic metadata about the actor,
-            typically containing configuration and identification information.
+        host_id: Unique identifier for the host within its slice.
+        slice_name: Name of the TPU slice this host belongs to.
+        num_devices: Number of TPU devices available on this host.
+        healthy: Whether the host is currently healthy and operational.
+        failed: Whether the host has encountered a failure.
+    """
 
-    Type Parameters:
-        ActorInfoT: Type of the actor information/metadata.
+    host_id: int
+    slice_name: str
+    num_devices: int | None
+    healthy: bool
+    failed: bool
 
-    Example:
-        >>> from dataclasses import dataclass
-        >>>
-        >>> @dataclass
-        >>> class WorkerInfo:
-        ...     worker_id: int
-        ...     resource_type: str
-        >>>
-        >>> worker = ray.remote(MyWorker).remote()
-        >>> info = WorkerInfo(worker_id=1, resource_type="gpu")
-        >>> member = ActorPoolMember(actor=worker, actor_info=info)
+
+@dataclass(frozen=True)
+class ActorPoolMember(Generic[ActorInfoT]):
+    """Container for an actor handle and its associated metadata.
+
+    Attributes:
+        actor: Ray actor handle for remote execution.
+        actor_info: Metadata about the actor (type depends on ActorInfoT).
     """
 
     actor: ActorHandle
     actor_info: ActorInfoT
 
 
-class ResourcePoolManager(ABC, Generic[ActorInfoT]):
+class ResourcePoolManager(Generic[ActorInfoT]):
     """Abstract base class for managing pools of Ray actors.
 
-    Provides a framework for managing distributed resources with automatic
-    health monitoring, scaling, and lifecycle management. Subclasses must
-    implement specific actor creation and naming strategies.
-
-    This class handles:
-        - Actor pool scaling (up and down)
-        - Health monitoring and automatic cleanup
-        - Placement group management
-        - Resource lifecycle management
-
-    Type Parameters:
-        ActorInfoT: Type of metadata associated with each actor.
+    Provides common functionality for scaling, health monitoring, and
+    lifecycle management of actor pools. Subclasses should implement
+    create_actor() to define how actors are created.
 
     Attributes:
-        _actor_pool (list[ActorPoolMember[ActorInfoT]]): Current pool members.
-        _placement_groups (dict[str, PlacementGroup]): Placement groups by name.
+        _actor_pool: List of active actor pool members.
     """
 
-    def __init__(self):
-        """Initialize an empty resource pool."""
+    def __init__(self) -> None:
+        """Initialize an empty actor pool."""
         self._actor_pool: list[ActorPoolMember[ActorInfoT]] = []
-        self._placement_groups: dict[str, PlacementGroup] = {}
-
-    @abstractmethod
-    def get_actor_pool_name(self) -> str:
-        """Get the unique name identifying this actor pool.
-
-        Returns:
-            str: Unique pool identifier.
-        """
-        pass
-
-    @abstractmethod
-    def get_actor_name_from_actor_info(self, actor_info: ActorInfoT) -> str:
-        """Generate a unique name for an actor based on its metadata.
-
-        Args:
-            actor_info (ActorInfoT): Actor metadata.
-
-        Returns:
-            str: Unique actor name.
-        """
-        pass
-
-    @abstractmethod
-    def create_actor(self, actor_info: ActorInfoT) -> ActorHandle:
-        """Create a new Ray actor with the specified configuration.
-
-        Args:
-            actor_info (ActorInfoT): Configuration and metadata for the actor.
-
-        Returns:
-            ActorHandle: Handle to the newly created Ray actor.
-        """
-        pass
 
     def get_all_actors_in_pool(self) -> list[ActorHandle]:
-        """Get all Ray actor handles currently in the pool.
+        """Get all actor handles in the pool.
 
         Returns:
-            list[ActorHandle]: List of all active actor handles.
+            List of Ray actor handles.
         """
-        return [member.actor for member in self._actor_pool]
+        return [m.actor for m in self._actor_pool]
 
     def get_all_pool_members(self) -> list[ActorPoolMember[ActorInfoT]]:
-        """Get all pool members including actors and their metadata.
+        """Get a copy of all pool members with their metadata.
 
         Returns:
-            list[ActorPoolMember[ActorInfoT]]: List of all pool members
-                with both actor handles and associated metadata.
+            List of ActorPoolMember objects containing actors and their info.
         """
-        return self._actor_pool
+        return self._actor_pool.copy()
+
+    def get_actor_pool_name(self) -> str:
+        """Get a human-readable name for this actor pool.
+
+        Returns:
+            String identifier for the pool, defaults to class name.
+        """
+        return self.__class__.__name__
+
+    def get_actor_name_from_actor_info(self, actor_info: ActorInfoT) -> str:
+        """Generate a human-readable name from actor info.
+
+        Args:
+            actor_info: Metadata about the actor.
+
+        Returns:
+            String representation of the actor for logging.
+        """
+        return str(actor_info)
+
+    def create_actor(self) -> ActorHandle:
+        """Create a new actor instance.
+
+        Must be implemented by subclasses to define actor creation logic.
+
+        Returns:
+            Ray actor handle for the newly created actor.
+
+        Raises:
+            NotImplementedError: If not overridden by subclass.
+        """
+        raise NotImplementedError
 
     def _remove_unhealthy_members_from_actor_pool(self) -> None:
-        """Remove unhealthy or unresponsive actors from the pool.
+        """Remove unhealthy actors from the pool.
 
-        Performs health checks on all actors and removes those that:
-            - Have died (ActorDiedError)
-            - Are unavailable (ActorUnavailableError)
-            - Don't respond within the timeout period
-
-        Also cleans up associated placement groups for removed actors.
+        Performs health checks on all actors and removes those that are
+        unresponsive, dead, or unhealthy. Attempts to kill removed actors.
         """
-        healthy_members = []
+        healthy: list[ActorPoolMember[ActorInfoT]] = []
         for member in self._actor_pool:
             try:
-                # Check if actor is still alive
-                ray.get(member.actor.healthy.remote(), timeout=_HEALTH_CHECK_TIMEOUT)
-                healthy_members.append(member)
+                ray.get(member.actor.healthy.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
+                healthy.append(member)
             except (ActorDiedError, ActorUnavailableError, GetTimeoutError) as e:
-                logger.warning(f"Removing unhealthy actor {self.get_actor_name_from_actor_info(member.actor_info)}: {e}")
-                # Clean up placement group if exists
-                actor_name = self.get_actor_name_from_actor_info(member.actor_info)
-                if actor_name in self._placement_groups:
-                    try:
-                        remove_placement_group(self._placement_groups[actor_name])
-                    except Exception as cleanup_error:
-                        logger.error(f"Failed to remove placement group for {actor_name}: {cleanup_error}")
-                    del self._placement_groups[actor_name]
+                name = self.get_actor_name_from_actor_info(member.actor_info)
+                logger.warning(f"Removing unhealthy actor {name}: {e}")
+                try:
+                    ray.kill(member.actor)
+                except Exception:
+                    pass
+        self._actor_pool = healthy
 
-        self._actor_pool = healthy_members
-
-    def _add_members_to_actor_pool(self, desired_num_actors: int, actor_infos: list[ActorInfoT]) -> None:
-        """Add new actors to the pool to reach the desired count.
-
-        Creates and adds new actors until the pool size matches the desired
-        number. Actors are created based on the provided configurations.
+    def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
+        """Add new actors to reach the desired pool size.
 
         Args:
-            desired_num_actors (int): Target number of actors in the pool.
-            actor_infos (list[ActorInfoT]): Configurations for creating new actors.
-                Should contain at least (desired_num_actors - current_count) items.
+            desired_num_actors: Target number of actors in the pool.
         """
-        current_count = len(self._actor_pool)
-        if current_count >= desired_num_actors:
+        current = len(self._actor_pool)
+        if current >= desired_num_actors:
             return
-
-        num_to_add = desired_num_actors - current_count
-        for i in range(num_to_add):
-            if i < len(actor_infos):
-                actor_info = actor_infos[i]
+        num_to_add = desired_num_actors - current
+        logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
+        actors = [self.create_actor() for _ in range(num_to_add)]
+        for actor in actors:
+            try:
+                info = ray.get(actor.get_info.remote())
+                self._actor_pool.append(ActorPoolMember(actor, info))
+                logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
+            except Exception as e:
+                logger.error(f"Failed to start actor: {e}")
                 try:
-                    actor = self.create_actor(actor_info)
-                    self._actor_pool.append(ActorPoolMember(actor, actor_info))
-                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(actor_info)} to pool")
-                except Exception as e:
-                    logger.error(f"Failed to create actor: {e}")
+                    ray.kill(actor)
+                except Exception:
+                    pass
 
     def _remove_members_from_actor_pool(self, desired_num_actors: int) -> None:
-        """Remove excess actors from the pool to reach the desired count.
-
-        Removes actors from the end of the pool (LIFO) until the pool size
-        matches the desired number. Also cleans up associated resources.
+        """Remove actors to reach the desired pool size.
 
         Args:
-            desired_num_actors (int): Target number of actors in the pool.
+            desired_num_actors: Target number of actors in the pool.
         """
         while len(self._actor_pool) > desired_num_actors:
             member = self._actor_pool.pop()
-            actor_name = self.get_actor_name_from_actor_info(member.actor_info)
+            name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
-                ray.kill(member.actor)
-            except Exception as e:
-                logger.error(f"Failed to kill actor {actor_name}: {e}")
-
-            # Clean up placement group
-            if actor_name in self._placement_groups:
                 try:
-                    remove_placement_group(self._placement_groups[actor_name])
-                except Exception as e:
-                    logger.error(f"Failed to remove placement group for {actor_name}: {e}")
-                del self._placement_groups[actor_name]
+                    ray.get(member.actor.shutdown.remote(), timeout=5)
+                except Exception:
+                    pass
+                ray.kill(member.actor)
+                logger.info(f"Removed actor {name}")
+            except Exception as e:
+                logger.error(f"Failed to kill actor {name}: {e}")
 
-    def _scale_actor_pool(self, desired_num_actors: int, actor_infos: list[ActorInfoT]) -> None:
+    def _scale_actor_pool(self, desired_num_actors: int) -> None:
         """Scale the actor pool to the desired size.
 
-        Adjusts the pool size by:
-            1. Removing unhealthy actors
-            2. Adding new actors if below target
-            3. Removing excess actors if above target
+        First removes unhealthy actors, then adds or removes actors
+        as needed to reach the target size.
 
         Args:
-            desired_num_actors (int): Target number of actors.
-            actor_infos (list[ActorInfoT]): Configurations for new actors if scaling up.
+            desired_num_actors: Target number of actors in the pool.
         """
         self._remove_unhealthy_members_from_actor_pool()
-        current_count = len(self._actor_pool)
-
-        if current_count < desired_num_actors:
-            self._add_members_to_actor_pool(desired_num_actors, actor_infos)
-        elif current_count > desired_num_actors:
+        current = len(self._actor_pool)
+        if current < desired_num_actors:
+            self._add_members_to_actor_pool(desired_num_actors)
+        elif current > desired_num_actors:
             self._remove_members_from_actor_pool(desired_num_actors)
 
     def drain_actor_pool(self) -> None:
-        """Remove all actors from the pool and clean up resources.
+        """Shut down and remove all actors from the pool.
 
-        Completely empties the actor pool by:
-            1. Killing all actors
-            2. Removing all placement groups
-            3. Clearing internal data structures
-
-        This method is typically called during shutdown or reset.
+        Attempts graceful shutdown first, then forcefully kills actors.
+        Clears the actor pool after draining.
         """
         for member in self._actor_pool:
-            actor_name = self.get_actor_name_from_actor_info(member.actor_info)
+            name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
+                try:
+                    ray.get(member.actor.shutdown.remote(), timeout=5)
+                except Exception:
+                    pass
                 ray.kill(member.actor)
+                logger.info(f"Killed actor {name}")
             except Exception as e:
-                logger.error(f"Failed to kill actor {actor_name}: {e}")
-
-        # Clean up all placement groups
-        for pg_name, pg in self._placement_groups.items():
-            try:
-                remove_placement_group(pg)
-            except Exception as e:
-                logger.error(f"Failed to remove placement group {pg_name}: {e}")
-
+                logger.error(f"Failed to kill actor {name}: {e}")
         self._actor_pool = []
-        self._placement_groups = {}
-
-
-class SlicePoolManager(ResourcePoolManager[SliceInfo]):
-    """Manager for TPU/GPU slice actors in multi-slice configurations.
-
-    Specialized resource pool manager for handling distributed TPU/GPU slices,
-    providing coordination for multi-slice workloads and automatic scaling.
-
-    This manager handles:
-        - TPU/GPU slice creation and configuration
-        - Multi-slice coordination setup
-        - Automatic resource discovery and allocation
-        - Health monitoring across slices
-
-    Attributes:
-        tpu_type (str): Type of TPU being managed (e.g., "v4-8", "v4-32").
-        _last_scale_check_time (float): Timestamp of last scaling check.
-        _last_scale_up_time (float): Timestamp of last scale-up operation.
-
-    Example:
-        >>> manager = SlicePoolManager("v4-32")
-        >>> manager.scale_multislice(4)  # Create 4 TPU slices
-        >>> actors = manager.get_all_actors_in_pool()
-    """
-
-    def __init__(self, tpu_type: str):
-        """Initialize the slice pool manager.
-
-        Args:
-            tpu_type (str): TPU type identifier (e.g., "v4-8", "v4-32").
-        """
-        super().__init__()
-        self.tpu_type = tpu_type
-        self._last_scale_check_time = 0
-        self._last_scale_up_time = 0
-
-    def get_actor_pool_name(self) -> str:
-        """Get the unique name for this slice pool.
-
-        Returns:
-            str: Pool name in format "slice_pool_{tpu_type}".
-        """
-        return f"slice_pool_{self.tpu_type}"
-
-    def get_actor_name_from_actor_info(self, actor_info: SliceInfo) -> str:
-        """Get the unique name for a slice actor.
-
-        Args:
-            actor_info (SliceInfo): Slice information.
-
-        Returns:
-            str: The slice name from the SliceInfo.
-        """
-        return actor_info.slice_name
-
-    def create_actor(self, actor_info: SliceInfo) -> ActorHandle:
-        """Create a SliceActor for managing a TPU/GPU slice.
-
-        Creates a Ray actor with appropriate resource requirements and
-        placement group for the slice. The actor is scheduled with
-        strict spread strategy across hosts.
-
-        Args:
-            actor_info (SliceInfo): Configuration for the slice.
-
-        Returns:
-            ActorHandle: Handle to the created SliceActor.
-        """
-        # Create placement group for the slice
-        bundles = []
-        for _ in range(actor_info.num_hosts):
-            bundles.append(
-                {
-                    "CPU": 1,
-                    self.tpu_type: actor_info.num_accelerators_per_host,
-                }
-            )
-
-        pg = placement_group(bundles, strategy="STRICT_SPREAD")
-        self._placement_groups[actor_info.slice_name] = pg
-
-        # Create the slice actor with placement group scheduling
-        SliceActor = ray.remote(
-            num_cpus=0,
-            resources={f"{actor_info.slice_name}-head": 1},
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=0,
-            ),
-        )(_SliceActor)
-
-        return SliceActor.remote(actor_info, self.tpu_type, pg)
-
-    def scale_multislice(self, num_slices: int | Sequence[int]) -> None:
-        """Scale the multi-slice configuration to the desired number.
-
-        Adjusts the number of active slices in the pool, creating or removing
-        slices as needed. Also sets up multi-slice coordination if needed.
-
-        Args:
-            num_slices (int | Sequence[int]): Either a specific target number
-                of slices, or a sequence of acceptable slice counts (will choose
-                the maximum feasible value).
-
-        Example:
-            >>> manager.scale_multislice(4)  # Scale to exactly 4 slices
-            >>> manager.scale_multislice([2, 4, 8])  # Use best available option
-        """
-        if isinstance(num_slices, Sequence):
-            # Find the optimal slice count based on available resources
-            available_slices = self._get_available_slice_count()
-            target_slices = max(n for n in num_slices if n <= available_slices)
-        else:
-            target_slices = num_slices
-
-        # Generate slice infos for the target configuration
-        slice_infos = self._generate_slice_infos(target_slices)
-
-        # Scale the actor pool
-        self._scale_actor_pool(target_slices, slice_infos)
-
-        # Update coordination information for multi-slice setup
-        if target_slices > 1:
-            self._setup_multislice_coordination()
-
-    def _generate_slice_infos(self, num_slices: int) -> list[SliceInfo]:
-        """Generate SliceInfo configurations for the specified number of slices.
-
-        Creates slice configurations based on available TPU/GPU resources,
-        with the first slice using current pod information.
-
-        Args:
-            num_slices (int): Number of slices to generate info for.
-
-        Returns:
-            list[SliceInfo]: List of slice configurations.
-        """
-        slice_infos = []
-        for i in range(num_slices):
-            slice_name = ray.util.accelerators.tpu.get_current_pod_name() if i == 0 else f"tpu-{self.tpu_type}-{i}"
-            num_hosts = ray.util.accelerators.tpu.get_current_pod_worker_count()
-            ip_address = socket.gethostbyname(socket.gethostname()) if i == 0 else None
-            num_accelerators = TPUAcceleratorManager.get_current_node_num_accelerators()
-
-            slice_infos.append(
-                SliceInfo(
-                    slice_name=slice_name,
-                    num_hosts=num_hosts,
-                    ip_address=ip_address or "unknown",
-                    num_accelerators_per_host=num_accelerators // num_hosts if num_hosts > 0 else num_accelerators,
-                )
-            )
-
-        return slice_infos
-
-    def _get_available_slice_count(self) -> int:
-        """Determine the number of slices available in the cluster.
-
-        Returns:
-            int: Number of available slices (current pool size + 1).
-        """
-        return len(self._actor_pool) + 1
-
-    def _setup_multislice_coordination(self) -> None:
-        """Configure coordination between multiple slices.
-
-        Sets up the multi-slice communication by:
-            1. Designating the first slice as coordinator
-            2. Distributing coordinator information to all slices
-            3. Assigning slice IDs and port configurations
-
-        The coordinator slice handles cross-slice synchronization.
-        """
-        if not self._actor_pool:
-            return
-
-        coordinator_member = self._actor_pool[0]
-        coordinator_info = coordinator_member.actor_info
-
-        for i, member in enumerate(self._actor_pool):
-            multislice_info = MultisliceInfo(
-                coordinator_ip=coordinator_info.ip_address,
-                slice_id=i,
-                num_slices=len(self._actor_pool),
-                port=8081,
-            )
-            try:
-                ray.get(member.actor.configure_multislice.remote(multislice_info))
-            except Exception as e:
-                logger.error(f"Failed to configure multislice for {member.actor_info.slice_name}: {e}")
 
 
 @ray.remote
-class _SliceActor:
-    """Ray actor managing a single TPU/GPU compute slice.
+class DeviceHostActor:
+    """Ray actor for managing a single Device-Comp host.
 
-    Handles resource allocation, health monitoring, task execution, and
-    multi-slice coordination for a single slice in a distributed setup.
-    Each slice actor manages its own placement group and can execute
-    tasks with slice-specific environment variables.
+    Runs on a specific TPU host and executes tasks with proper environment
+    configuration. Monitors host health and preemption status.
 
     Attributes:
-        slice_info (SliceInfo): Configuration and metadata for this slice.
-        resource_type (str): Type of accelerator resource (e.g., "v4-8").
-        placement_group (PlacementGroup): Ray placement group for this slice.
-        multislice_info (MultisliceInfo | None): Multi-slice coordination info.
-        _is_healthy (bool): Current health status of the actor.
-        _tasks (list): List of running tasks on this slice.
-
-    Note:
-        This class is decorated with @ray.remote and should not be
-        instantiated directly. Use through SlicePoolManager instead.
+        host_id: Unique identifier for this host.
+        slice_name: Name of the TPU slice.
+        num_devices: Number of TPU devices on this host.
+        _failed: Whether this host has encountered a failure.
     """
 
-    def __init__(self, slice_info: SliceInfo, resource_type: str, placement_group: PlacementGroup):
-        """Initialize the slice actor.
+    def __init__(self, host_id: int, slice_name: str, num_devices: int | None = None):
+        """Initialize a TPU host actor.
 
         Args:
-            slice_info (SliceInfo): Configuration for this slice.
-            resource_type (str): Type of accelerator resource.
-            placement_group (PlacementGroup): Placement group for resource allocation.
+            host_id: Unique identifier for this host within the slice.
+            slice_name: Name of the TPU slice this host belongs to.
+            num_devices: Optional number of TPU devices available on this host.
         """
-        self.slice_info = slice_info
-        self.resource_type = resource_type
-        self.placement_group = placement_group
-        self.multislice_info: MultisliceInfo | None = None
-        self._is_healthy = True
-        self._tasks = []
+        self.host_id = host_id
+        self.slice_name = slice_name
+        self.num_devices = num_devices
+        self._failed = False
+        logger.info(f"DeviceHostActor[{slice_name}#{host_id}] init; num_devices={num_devices}")
 
     def healthy(self) -> bool:
-        """Check the health status of this slice actor.
+        """Check if the host is healthy and operational.
 
         Returns:
-            bool: True if the actor is healthy, False otherwise.
+            True if host is not failed and not being preempted.
         """
-        return self._is_healthy
+        return not self._failed and not self.is_being_preempted()
 
     def is_being_preempted(self) -> bool:
-        """Check if this slice is being preempted.
+        """Check if this GCP instance is being preempted.
+
+        Queries GCP metadata server to determine preemption status.
 
         Returns:
-            bool: True if preemption is detected, False otherwise.
-
-        Note:
-            Currently returns False. Override for preemption detection.
+            True if instance is being preempted, False otherwise.
         """
-        # This would check for preemption signals
-        # For now, return False
-        return False
+        try:
+            r = requests.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=1.0,
+            )
+            return r.status_code == 200 and r.text.strip().upper() == "TRUE"
+        except requests.RequestException:
+            return False
 
-    def configure_multislice(self, multislice_info: MultisliceInfo) -> None:
-        """Configure this slice for multi-slice coordination.
-
-        Sets up the necessary information for this slice to participate
-        in a multi-slice execution, including coordinator address and
-        slice ID assignment.
-
-        Args:
-            multislice_info (MultisliceInfo): Coordination information including
-                coordinator IP, slice ID, and port configuration.
-        """
-        self.multislice_info = multislice_info
-
-    def get_slice_info(self) -> tuple[str, int, str]:
-        """Get slice information for multi-slice coordination.
+    def get_info(self) -> HostInfo:
+        """Get current information about this host.
 
         Returns:
-            tuple[str, int, str]: Tuple containing:
-                - slice_name: Unique identifier for this slice
-                - num_hosts: Number of hosts in this slice
-                - ip_address: IP address of this slice
+            HostInfo object with current host status and metadata.
         """
-        return (
-            self.slice_info.slice_name,
-            self.slice_info.num_hosts,
-            self.slice_info.ip_address,
+        return HostInfo(
+            host_id=self.host_id,
+            slice_name=self.slice_name,
+            num_devices=self.num_devices,
+            healthy=self.healthy(),
+            failed=self._failed,
         )
 
-    def run_task(self, remote_fn: RemoteFunction, runtime_env: dict, **kwargs) -> ray.ObjectRef:
-        """Execute a Ray task on this slice.
+    def run_task(self, task_fn, *args, env: dict | None = None, **kwargs):
+        """Execute a task on this TPU host.
 
-        Runs the provided remote function with slice-specific environment
-        variables and placement group scheduling. Automatically adds
-        multi-slice coordination environment variables if configured.
+        Sets up proper environment variables and executes the given function.
+        Marks host as failed if task execution fails.
 
         Args:
-            remote_fn (RemoteFunction): Ray remote function to execute.
-            runtime_env (dict): Runtime environment configuration.
-            **kwargs: Arguments to pass to the remote function.
+            task_fn: Function to execute.
+            *args: Positional arguments for task_fn.
+            env: Optional environment variables to set.
+            **kwargs: Keyword arguments for task_fn.
 
         Returns:
-            ray.ObjectRef: Future representing the task result.
+            Result of task_fn execution.
 
-        Example:
-            >>> future = slice_actor.run_task.remote(
-            ...     my_remote_fn,
-            ...     runtime_env={"pip": ["numpy"]},
-            ...     data=training_data
-            ... )
-            >>> result = ray.get(future)
+        Raises:
+            RuntimeError: If host is unhealthy or preempted.
         """
-        env_vars = {}
-        if self.multislice_info:
-            env_vars.update(
-                {
-                    "MEGASCALE_COORDINATOR_ADDRESS": f"{self.multislice_info.coordinator_ip}:"
-                    f"{self.multislice_info.port}",
-                    "MEGASCALE_NUM_SLICES": str(self.multislice_info.num_slices),
-                    "MEGASCALE_PORT": str(self.multislice_info.port),
-                    "MEGASCALE_SLICE_ID": str(self.multislice_info.slice_id),
-                }
-            )
+        if not self.healthy():
+            raise RuntimeError(f"Host {self.host_id} unhealthy or preempted")
+        import os
 
-        final_runtime_env = {**runtime_env}
-        if env_vars:
-            final_runtime_env["env_vars"] = {**final_runtime_env.get("env_vars", {}), **env_vars}
+        if env:
+            for k, v in env.items():
+                if v is not None:
+                    os.environ[str(k)] = str(v)
+        os.environ["TPU_HOST_ID"] = str(self.host_id)
+        os.environ["TPU_SLICE_NAME"] = self.slice_name
+        if self.num_devices is not None:
+            os.environ["TPU_NUM_DEVICES"] = str(self.num_devices)
+        try:
+            return task_fn(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Task failed on host {self.host_id}: {e}")
+            self._failed = True
+            raise
 
-        task_options = {
-            "runtime_env": final_runtime_env,
-            "scheduling_strategy": PlacementGroupSchedulingStrategy(placement_group=self.placement_group),
+    def shutdown(self) -> None:
+        """Gracefully shut down this host actor.
+
+        Marks the host as failed to prevent new task execution.
+        """
+        logger.info(f"Shutting down DeviceHostActor {self.host_id}")
+        self._failed = True
+
+
+@ray.remote
+class SliceActor:
+    """Ray actor for managing a TPU slice with multiple hosts.
+
+    Coordinates multiple TPU hosts within a single slice, handling
+    placement groups, resource allocation, and distributed task execution.
+
+    Attributes:
+        _actor_pool: List of active actor pool members.
+        _failed: Whether this slice has failed.
+        _slice_info: Information about the TPU slice.
+        _host_placement_group: Ray placement group for host distribution.
+        _host_infos: Information about each host in the slice.
+    """
+
+    def __init__(self):
+        """Initialize a slice actor.
+
+        Creates an empty actor pool and prepares to manage TPU hosts
+        within a single slice. Discovers slice information from the
+        TPU environment during initialization.
+        """
+        self._actor_pool: list[ActorPoolMember[HostInfo]] = []
+        self._failed = False
+        self._slice_info: SliceInfo | None = None
+        self._host_placement_group = None
+        self._host_infos: list[dict] | None = None
+        self._initialize_slice_info()
+
+    @staticmethod
+    @ray.remote(num_cpus=0)
+    def discover_node_info():
+        """Discover information about the current Ray node.
+
+        Static remote function to gather node metadata including IP,
+        node ID, pod name, and TPU count.
+
+        Returns:
+            Dictionary with node information.
+        """
+        import ray
+
+        pod_name = None
+        try:
+            from ray.util.accelerators import tpu as ray_tpu
+
+            pod_name = ray_tpu.get_current_pod_name()
+        except Exception:
+            pass
+        num_devices = None
+        try:
+            from ray._private.accelerators import TPUAcceleratorManager
+
+            num_devices = TPUAcceleratorManager.get_current_node_num_accelerators()
+        except Exception:
+            pass
+        return {
+            "ip": ray.util.get_node_ip_address(),
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "pod_name": pod_name,
+            "num_devices": num_devices,
         }
 
-        if isinstance(remote_fn, RemoteFunction):
-            task = remote_fn.options(**task_options).remote(**kwargs)
-        else:
-            task = ray.remote(remote_fn).options(**task_options).remote(**kwargs)
+    def _initialize_slice_info(self) -> None:
+        """Initialize slice information from TPU environment.
 
-        self._tasks.append(task)
-        return task
-
-    def cancel_tasks(self) -> None:
-        """Cancel all running tasks on this slice.
-
-        Attempts to cancel all tasks that were started through run_task().
-        Errors during cancellation are logged but not raised.
+        Discovers slice name, host count, and TPU configuration.
+        Sets _failed flag if initialization fails.
         """
-        for task in self._tasks:
+        try:
+            from ray.util.accelerators import tpu as ray_tpu
+
+            slice_name = ray_tpu.get_current_pod_name()
+            num_hosts = int(ray_tpu.get_current_pod_worker_count())
+            ip_address = ray.util.get_node_ip_address()
+
+            num_accelerators_per_host = None
             try:
-                ray.cancel(task)
+                from ray._private.accelerators import TPUAcceleratorManager
+
+                num_accelerators_per_host = TPUAcceleratorManager.get_current_node_num_accelerators()
+            except Exception:
+                pass
+
+            self._slice_info = SliceInfo(
+                slice_name=slice_name,
+                num_hosts=num_hosts,
+                ip_address=ip_address,
+                num_accelerators_per_host=num_accelerators_per_host or 0,
+            )
+            logger.info(f"Initialized SliceActor: {self._slice_info}")
+        except Exception as e:
+            logger.error(f"Failed to initialize slice info: {e}")
+            self._failed = True
+
+    def healthy(self) -> bool:
+        """Check if the slice is healthy and operational.
+
+        Verifies that the slice has not failed and is not being preempted
+        by the cloud provider.
+
+        Returns:
+            True if slice is healthy and available for task execution,
+            False if failed or being preempted.
+        """
+        if self._failed:
+            return False
+        return not self.is_being_preempted()
+
+    def is_being_preempted(self) -> bool:
+        """Check if this GCP instance is being preempted.
+
+        Queries GCP metadata server to determine preemption status.
+
+        Returns:
+            True if instance is being preempted, False otherwise.
+        """
+        try:
+            r = requests.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/preempted",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=1.0,
+            )
+            return r.status_code == 200 and r.text.strip().upper() == "TRUE"
+        except requests.RequestException:
+            return False
+
+    def get_info(self) -> SliceInfo:
+        """Get current information about this slice.
+
+        Returns:
+            SliceInfo object containing slice configuration, host count,
+            IP addresses, and TPU device information.
+
+        Raises:
+            RuntimeError: If slice information has not been initialized.
+        """
+        if not self._slice_info:
+            raise RuntimeError("Slice info not initialized")
+        return self._slice_info
+
+    def get_all_actors_in_pool(self) -> list[ActorHandle]:
+        """Get all actor handles in the pool.
+
+        Returns:
+            List of Ray actor handles.
+        """
+        return [m.actor for m in self._actor_pool]
+
+    def get_all_pool_members(self) -> list[ActorPoolMember[HostInfo]]:
+        """Get a copy of all pool members with their metadata.
+
+        Returns:
+            List of ActorPoolMember objects containing actors and their info.
+        """
+        return self._actor_pool.copy()
+
+    def get_actor_pool_name(self) -> str:
+        """Get a human-readable name for this actor pool.
+
+        Returns:
+            String identifier for the pool, defaults to class name.
+        """
+        if self._slice_info:
+            return f"SliceActor({self._slice_info.slice_name})"
+        return "SliceActor(uninitialized)"
+
+    def get_actor_name_from_actor_info(self, actor_info: HostInfo) -> str:
+        """Generate a human-readable name from actor info.
+
+        Args:
+            actor_info: Metadata about the actor.
+
+        Returns:
+            String representation of the actor for logging.
+        """
+        return f"{actor_info.slice_name}-host-{actor_info.host_id}"
+
+    def _ensure_host_placement_group(self) -> None:
+        """Ensure placement group exists for distributing hosts.
+
+        Creates a placement group with STRICT_SPREAD strategy to ensure
+        hosts are distributed across different nodes. Also discovers
+        host information for each placement group bundle.
+
+        Raises:
+            RuntimeError: If slice info is not initialized.
+        """
+        if not self._slice_info:
+            raise RuntimeError("Slice info not initialized")
+        if self._host_placement_group is not None:
+            return
+
+        slice_label = self._slice_info.slice_name
+        bundles = [{"CPU": 0, slice_label: 1} for _ in range(self._slice_info.num_hosts)]
+        request_resources(bundles=bundles)
+        self._host_placement_group = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(self._host_placement_group.ready())
+
+        futures = [
+            SliceActor.discover_node_info.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    self._host_placement_group,
+                    placement_group_bundle_index=i,
+                    placement_group_capture_child_tasks=True,
+                )
+            ).remote()
+            for i in range(self._slice_info.num_hosts)
+        ]
+        self._host_infos = ray.get(futures)
+        self._slice_info = SliceInfo(
+            slice_name=self._slice_info.slice_name,
+            num_hosts=self._slice_info.num_hosts,
+            ip_address=self._slice_info.ip_address,
+            num_accelerators_per_host=self._slice_info.num_accelerators_per_host,
+            node_ids=[h.get("node_id") for h in self._host_infos],
+            host_infos=self._host_infos,
+        )
+        logger.info(f"Prepared host placement group for slice {self._slice_info.slice_name}; hosts: {self._host_infos}")
+
+    def prepare_hosts(self) -> None:
+        """Prepare host placement group for this slice.
+
+        Ensures the placement group is created and ready for host actors.
+        """
+        self._ensure_host_placement_group()
+
+    def create_actor(self) -> ActorHandle:
+        """Create a new TPU host actor within this slice.
+
+        Creates a DeviceHostActor with proper node affinity to ensure it runs
+        on the correct host within the slice. Assigns TPU resources if
+        available on the target node.
+
+        Returns:
+            Ray actor handle for the newly created DeviceHostActor.
+
+        Raises:
+            RuntimeError: If slice is not initialized or host info is missing.
+        """
+        if not self._slice_info:
+            raise RuntimeError("Cannot create host actor: slice not initialized")
+        self._ensure_host_placement_group()
+
+        host_id = len(self._actor_pool)
+        if not self._host_infos or host_id >= len(self._host_infos):
+            raise RuntimeError(f"Missing host info for host_id={host_id}")
+
+        info = self._host_infos[host_id]
+        node_id = info["node_id"]
+        num_devices_for_host = info.get("num_devices")
+
+        resource_kwargs = {}
+        if num_devices_for_host:
+            resource_kwargs["resources"] = {"TPU": num_devices_for_host}
+
+        return DeviceHostActor.options(
+            num_cpus=0,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,
+            ),
+            **resource_kwargs,
+        ).remote(
+            host_id,
+            self._slice_info.slice_name,
+            num_devices_for_host,
+        )
+
+    def ensure_host_pool(self, desired_hosts: int | None = None) -> None:
+        """Ensure the host actor pool has the desired number of hosts.
+
+        Args:
+            desired_hosts: Target number of hosts, defaults to slice's host count.
+
+        Raises:
+            RuntimeError: If slice info is not initialized.
+        """
+        if not self._slice_info:
+            raise RuntimeError("Slice info not initialized")
+        self._ensure_host_placement_group()
+        target = desired_hosts if desired_hosts is not None else self._slice_info.num_hosts
+        self._scale_actor_pool(target)
+
+    def _remove_unhealthy_members_from_actor_pool(self) -> None:
+        """Remove unhealthy actors from the pool.
+
+        Performs health checks on all actors and removes those that are
+        unresponsive, dead, or unhealthy. Attempts to kill removed actors.
+        """
+        healthy: list[ActorPoolMember[HostInfo]] = []
+        for member in self._actor_pool:
+            try:
+                ray.get(member.actor.healthy.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
+                healthy.append(member)
+            except (ActorDiedError, ActorUnavailableError, GetTimeoutError) as e:
+                name = self.get_actor_name_from_actor_info(member.actor_info)
+                logger.warning(f"Removing unhealthy actor {name}: {e}")
+                try:
+                    ray.kill(member.actor)
+                except Exception:
+                    pass
+        self._actor_pool = healthy
+
+    def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
+        """Add new actors to reach the desired pool size.
+
+        Args:
+            desired_num_actors: Target number of actors in the pool.
+        """
+        current = len(self._actor_pool)
+        if current >= desired_num_actors:
+            return
+        num_to_add = desired_num_actors - current
+        logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
+        actors = [self.create_actor() for _ in range(num_to_add)]
+        for actor in actors:
+            try:
+                info = ray.get(actor.get_info.remote())
+                self._actor_pool.append(ActorPoolMember(actor, info))
+                logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
             except Exception as e:
-                logger.error(f"Failed to cancel task: {e}")
-        self._tasks = []
+                logger.error(f"Failed to start actor: {e}")
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
+
+    def _remove_members_from_actor_pool(self, desired_num_actors: int) -> None:
+        """Remove actors to reach the desired pool size.
+
+        Args:
+            desired_num_actors: Target number of actors in the pool.
+        """
+        while len(self._actor_pool) > desired_num_actors:
+            member = self._actor_pool.pop()
+            name = self.get_actor_name_from_actor_info(member.actor_info)
+            try:
+                try:
+                    ray.get(member.actor.shutdown.remote(), timeout=5)
+                except Exception:
+                    pass
+                ray.kill(member.actor)
+                logger.info(f"Removed actor {name}")
+            except Exception as e:
+                logger.error(f"Failed to kill actor {name}: {e}")
+
+    def _scale_actor_pool(self, desired_num_actors: int) -> None:
+        """Scale the actor pool to the desired size.
+
+        First removes unhealthy actors, then adds or removes actors
+        as needed to reach the target size.
+
+        Args:
+            desired_num_actors: Target number of actors in the pool.
+        """
+        self._remove_unhealthy_members_from_actor_pool()
+        current = len(self._actor_pool)
+        if current < desired_num_actors:
+            self._add_members_to_actor_pool(desired_num_actors)
+        elif current > desired_num_actors:
+            self._remove_members_from_actor_pool(desired_num_actors)
+
+    def drain_actor_pool(self) -> None:
+        """Shut down and remove all actors from the pool.
+
+        Attempts graceful shutdown first, then forcefully kills actors.
+        Clears the actor pool after draining.
+        """
+        for member in self._actor_pool:
+            name = self.get_actor_name_from_actor_info(member.actor_info)
+            try:
+                try:
+                    ray.get(member.actor.shutdown.remote(), timeout=5)
+                except Exception:
+                    pass
+                ray.kill(member.actor)
+                logger.info(f"Killed actor {name}")
+            except Exception as e:
+                logger.error(f"Failed to kill actor {name}: {e}")
+        self._actor_pool = []
+
+    def execute_function(self, fn, *args, use_host_actors: bool = False, env: dict | None = None, **kwargs):
+        """Execute a function on this slice.
+
+        Args:
+            fn: Function to execute.
+            *args: Positional arguments for remote_fn.
+            use_host_actors: If True, run on all host actors in parallel.
+            env: Optional environment variables.
+            **kwargs: Keyword arguments for remote_fn.
+
+        Returns:
+            Result of function execution (list if using host actors).
+
+        Raises:
+            RuntimeError: If slice info is not initialized.
+        """
+        if not self._slice_info:
+            raise RuntimeError("Slice info not initialized")
+
+        if use_host_actors:
+            self.ensure_host_pool(self._slice_info.num_hosts)
+            futures = [member.actor.run_task.remote(fn, *args, env=env, **kwargs) for member in self._actor_pool]
+            return ray.get(futures)
+        else:
+            return fn(*args, **kwargs)
+
+    def shutdown(self):
+        """Gracefully shut down this slice actor.
+
+        Removes the placement group, marks the slice as failed,
+        and prevents any new task execution on this slice.
+        """
+        if self._host_placement_group:
+            try:
+                remove_placement_group(self._host_placement_group)
+            except Exception:
+                pass
+            self._host_placement_group = None
+        self._failed = True
+
+
+class SlicePoolManager(ResourcePoolManager[SliceInfo]):
+    """Manager for multiple TPU slices.
+
+    Coordinates multiple SliceActors to manage multi-slice TPU configurations.
+    Handles scaling, health monitoring, and distributed task execution across
+    multiple TPU slices.
+
+    Attributes:
+        _tpu_type: Type of TPU (e.g., "v4-8").
+        _last_scale_ts: Timestamp of last scaling operation.
+        _last_scale_check_ts: Timestamp of last scale check.
+    """
+
+    def __init__(self, tpu_type: str | None):
+        """Initialize a slice pool manager.
+
+        Args:
+            tpu_type: Type of TPU to manage (e.g., "v4-8", "v5e-16").
+                     Used for resource labeling and identification.
+        """
+        super().__init__()
+        self._tpu_type = tpu_type
+        self._last_scale_ts: float | None = None
+        self._last_scale_check_ts: float | None = None
+
+    def get_actor_pool_name(self) -> str:
+        """Get a human-readable name for this actor pool.
+
+        Returns:
+            String identifier for the pool, defaults to class name.
+        """
+        return f"SlicePool({self._tpu_type})"
+
+    def get_actor_name_from_actor_info(self, actor_info: SliceInfo) -> str:
+        """Generate a human-readable name from actor info.
+
+        Args:
+            actor_info: Metadata about the actor.
+
+        Returns:
+            String representation of the actor for logging.
+        """
+        return actor_info.slice_name
+
+    def create_actor(self) -> ActorHandle:
+        """Create a new SliceActor to manage a TPU slice.
+
+        Creates a SliceActor with appropriate resource requirements
+        based on the TPU type. The actor will manage all hosts within
+        its assigned slice.
+
+        Returns:
+            Ray actor handle for the newly created SliceActor.
+        """
+        return SliceActor.options(num_cpus=0, resources={f"TPU-{self._tpu_type}-head": 1}).remote()
+
+    def scale_multislice(self, num_slices: int | Sequence[int]) -> None:
+        """Scale the pool to the desired number of slices.
+
+        Supports flexible scaling with multiple valid sizes. Will scale
+        to the largest feasible size from the provided options.
+
+        Args:
+            num_slices: Target number of slices or list of valid sizes.
+
+        Raises:
+            ValueError: If target is invalid or empty.
+            RuntimeError: If requested sizes cannot be achieved.
+        """
+        self._last_scale_ts = time.time()
+
+        if isinstance(num_slices, int):
+            valid = [int(num_slices)]
+        else:
+            valid = sorted({int(x) for x in num_slices})
+            if not valid:
+                raise ValueError("valid sizes list is empty")
+
+        target = valid[-1]
+        if target <= 0:
+            raise ValueError(f"Target slice count must be > 0, got {target}")
+
+        head_bundles = [{"CPU": 0, f"TPU-{self._tpu_type}-head": 1} for _ in range(target)]
+        request_resources(bundles=head_bundles)
+
+        self._scale_actor_pool(target)
+        current = len(self._actor_pool)
+        if current not in valid:
+            feasible = [v for v in valid if v <= current]
+            if not feasible:
+                raise RuntimeError(f"Requested one of {valid}, but only {current} slices available")
+            self._scale_actor_pool(feasible[-1])
+
+    def prepare_all_slices(self) -> None:
+        """Prepare all slices by ensuring host placement groups.
+
+        Pre-requests resources for all slices and prepares their host
+        placement groups for distributed execution.
+        """
+        # Pre-request per-slice host bundles
+        slice_infos: list[SliceInfo] = ray.get([member.actor.get_info.remote() for member in self._actor_pool])
+        for info in slice_infos:
+            host_bundles = [{"CPU": 0, info.slice_name: 1} for _ in range(info.num_hosts)]
+            request_resources(bundles=host_bundles)
+
+        ray.get([member.actor.prepare_hosts.remote() for member in self._actor_pool])
+
+    def should_scale_up_multislice(self, valid_sizes: Sequence[int]) -> bool:
+        """Check if pool should scale up to a larger size.
+
+        Implements rate limiting to prevent frequent scaling operations.
+
+        Args:
+            valid_sizes: List of valid pool sizes.
+
+        Returns:
+            True if scaling up is recommended.
+        """
+        self._last_scale_check_ts = time.time()
+        current = len(self._actor_pool)
+        larger = [size for size in valid_sizes if size > current]
+        if not larger:
+            return False
+        if self._last_scale_ts and (time.time() - self._last_scale_ts) < 60:
+            return False
+        return True
+
+    def execute_on_each_slice(self, fn, *args, **kwargs):
+        """Execute a function on each slice in parallel.
+
+        Args:
+            fn: Function to execute on each slice.
+            *args: Positional arguments for fn.
+            **kwargs: Keyword arguments for fn.
+
+        Returns:
+            List of results from each slice.
+        """
+        return ray.get([member.actor.execute_function.remote(fn, *args, **kwargs) for member in self._actor_pool])
+
+    def execute_on_each_host(self, fn, *args, env: dict | None = None, **kwargs):
+        """Execute a function on each host across all slices.
+
+        Prepares all slices and runs the function on every host actor
+        in parallel across all slices.
+
+        Args:
+            fn: Function to execute on each host.
+            *args: Positional arguments for fn.
+            env: Optional environment variables.
+            **kwargs: Keyword arguments for fn.
+
+        Returns:
+            Nested list of results (outer list for slices, inner for hosts).
+        """
+        self.prepare_all_slices()
+        ray.get([member.actor.ensure_host_pool.remote() for member in self._actor_pool])
+        return ray.get(
+            [
+                member.actor.execute_function.remote(fn, *args, use_host_actors=True, env=env, **kwargs)
+                for member in self._actor_pool
+            ]
+        )

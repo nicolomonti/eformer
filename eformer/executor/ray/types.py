@@ -693,3 +693,5 @@ class SliceInfo:
     num_hosts: int
     ip_address: str
     num_accelerators_per_host: int
+    node_ids: list[str] | None = None
+    host_infos: list[dict] | None = None
