@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import asyncio
 import hashlib
 import json
 import os
@@ -107,9 +106,9 @@ class CheckpointMetadata:
 
 
 class AsyncCheckpointManager:
-    """Async-capable checkpoint manager with concurrent operations.
+    """Checkpoint manager with concurrent operations.
 
-    This manager provides asynchronous checkpoint saving and loading with support
+    This manager provides checkpoint saving and loading with support
     for parallel operations, tensorstore backend, validation, and compression.
     Supports both TensorStore (for large-scale distributed checkpoints) and
     SafeTensors (for smaller, single-file checkpoints) formats.
@@ -138,9 +137,9 @@ class AsyncCheckpointManager:
         ...     max_workers=8,
         ...     use_tensorstore=True
         ... )
-        >>> # Save checkpoint
+        >>>
         >>> manager.save(model_state, "checkpoint", mesh=mesh)
-        >>> # Load checkpoint with partition rules
+        >>>
         >>> rules = [(".*kernel", PartitionSpec("model", None))]
         >>> state, meta = manager.load("checkpoint", mesh, partition_rules=rules)
     """
@@ -152,10 +151,10 @@ class AsyncCheckpointManager:
         verbose: bool = False,
         gcs_bucket: str | None = None,
         gcs_credentials_path: str | None = None,
-        max_workers: int = 1,
         enable_validation: bool = False,
         enable_compression: bool = False,
         use_tensorstore: bool = True,
+        max_workers: int = 8,
     ):
         if jax.process_count() > 1:
             assert is_initialized(), "you should call jax distribution init before running process."
@@ -164,14 +163,13 @@ class AsyncCheckpointManager:
         self.enable = enable
         self.verbose = verbose
         self.gcs_bucket = gcs_bucket
-        self.max_workers = max_workers
         self.enable_validation = enable_validation
         self.enable_compression = enable_compression
         self.use_tensorstore = use_tensorstore
+        self.max_workers = max_workers
 
         self.gcs_client = None
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._pending_saves = []
         self._save_lock = threading.Lock()
 
         if gcs_bucket:
@@ -185,23 +183,6 @@ class AsyncCheckpointManager:
         """
         if hasattr(self, "executor"):
             self.executor.shutdown(wait=False)
-
-    def _run_async(self, coro):
-        """Helper to run async code in sync context.
-
-        Attempts to create a task if an event loop is running, otherwise
-        runs the coroutine in a new event loop.
-
-        Args:
-            coro: Coroutine to run.
-
-        Returns:
-            Result of the coroutine execution.
-        """
-        try:
-            return asyncio.create_task(coro)
-        except RuntimeError:
-            return asyncio.run(coro)
 
     @staticmethod
     def _estimate_nbytes(array: jax.Array) -> int:
@@ -313,7 +294,7 @@ class AsyncCheckpointManager:
                     return False
         return True
 
-    def save(
+    def save_tree(
         self,
         tree: PyTree,
         path: ePathLike | str | os.PathLike,
@@ -326,57 +307,7 @@ class AsyncCheckpointManager:
         do_all_gather: bool = False,
         cpu_offload: bool = False,
     ) -> str:
-        """Synchronous wrapper for save_tree_async.
-
-        This method can be called without async/await and handles the async runtime internally.
-
-        Args:
-            tree: PyTree structure to save.
-            path: Path where the checkpoint will be saved.
-            mesh: JAX mesh for distributed computation. If None, creates a CPU mesh
-                with a warning.
-            gather_fns: Dictionary of gather functions or bool for device gathering.
-            float_dtype: Data type for floating point arrays.
-            metadata: Additional metadata to save with checkpoint.
-            callback: Optional callback function called after save.
-            prefix: Optional prefix for saving specific tree (e.g., 'model', 'optimizer').
-            do_all_gather: Whether to gather all arrays to host. Defaults to True for
-                safer checkpoint saving.
-            cpu_offload: Whether to offload arrays to CPU during gathering. Defaults to
-                True to reduce memory pressure on accelerators.
-
-        Returns:
-            Path where the checkpoint was saved.
-        """
-        return self._run_async(
-            self.save_tree_async(
-                tree=tree,
-                path=path,
-                mesh=mesh,
-                gather_fns=gather_fns,
-                float_dtype=float_dtype,
-                metadata=metadata,
-                callback=callback,
-                prefix=prefix,
-                do_all_gather=do_all_gather,
-                cpu_offload=cpu_offload,
-            )
-        )
-
-    async def save_tree_async(
-        self,
-        tree: PyTree,
-        path: ePathLike | str | os.PathLike,
-        mesh: Mesh | None = None,
-        gather_fns: dict[tp.Callable] | bool | None = None,
-        float_dtype: str | jnp.dtype | None = None,
-        metadata: dict[str, str] | None = None,
-        callback: tp.Callable[[str], None] | None = None,
-        prefix: str | None = None,
-        do_all_gather: bool = False,
-        cpu_offload: bool = False,
-    ) -> str:
-        """Asynchronously save checkpoint with parallel shard writing.
+        """Save checkpoint with parallel shard writing.
 
         Saves a PyTree structure to disk using either TensorStore or SafeTensors format,
         with support for sharding large checkpoints and parallel I/O operations.
@@ -409,15 +340,14 @@ class AsyncCheckpointManager:
             - Arrays are automatically flattened before saving and unflattened when loading.
 
         Example:
-            >>> async def save():
-            ...     manager = AsyncCheckpointManager()
-            ...     await manager.save_tree_async(
-            ...         tree=model_state,
-            ...         path="checkpoint",
-            ...         mesh=mesh,
-            ...         prefix="model",
-            ...         cpu_offload=True
-            ...     )
+            >>> manager = AsyncCheckpointManager()
+            >>> manager.save_tree(
+            ...     tree=model_state,
+            ...     path="checkpoint",
+            ...     mesh=mesh,
+            ...     prefix="model",
+            ...     cpu_offload=True
+            ... )
         """
         if float_dtype is None:
             float_dtype = self.float_dtype
@@ -429,7 +359,7 @@ class AsyncCheckpointManager:
             logger.warn("`mesh` should be provided otherwise you will face some sharding issues.")
             mesh = create_cpu_mesh()
         if gather_fns:
-            tree = await self._gather_async(tree, gather_fns)
+            tree = self._gather_fn(tree, gather_fns)
         if do_all_gather:
             tree = jax.tree_util.tree_map(
                 lambda x: _to_host(x, float_dtype, mesh, cpu_offload),
@@ -451,17 +381,19 @@ class AsyncCheckpointManager:
         path_str = str(path)
 
         if self.use_tensorstore:
-            out = await self._save_tensorstore_async(tree, path_str, checkpoint_meta, prefix)
+            out = self._save_tensorstore(tree, path_str, checkpoint_meta, prefix)
         else:
-            out = await self._save_single_async(tree, path_str, checkpoint_meta.to_dict())
+            out = self._save_single(tree, path_str, checkpoint_meta.to_dict())
 
         if callback:
             callback(path_str)
 
         return out
 
-    async def _gather_async(self, tree: dict, gather_fns: dict[tp.Callable] | bool) -> dict:
-        """Asynchronously gather distributed arrays.
+    save = save_tree
+
+    def _gather_fn(self, tree: dict, gather_fns: dict[tp.Callable] | bool) -> dict:
+        """Gather distributed arrays.
 
         Performs parallel gathering of distributed arrays using provided gather
         functions or device_get.
@@ -479,52 +411,38 @@ class AsyncCheckpointManager:
             Arrays without matching gather functions are returned unchanged.
         """
         if isinstance(gather_fns, bool):
-            loop = asyncio.get_event_loop()
-            futures = []
-            for key, value in tree.items():
-                future = loop.run_in_executor(self.executor, jax.device_get, value)
-                futures.append((key, future))
-
             results = {}
-            for key, future in futures:
-                results[key] = await future
+            for key, value in tree.items():
+                results[key] = jax.device_get(value)
             return results
 
         if not is_flatten(gather_fns):
             gather_fns = flatten_dict(gather_fns, sep=".")
 
-        loop = asyncio.get_event_loop()
-        futures = []
-
+        results = {}
         for key, value in tree.items():
             if key in gather_fns:
-                future = loop.run_in_executor(self.executor, gather_fns[key], value)
-                futures.append((key, future))
+                results[key] = gather_fns[key](value)
             else:
-                futures.append((key, asyncio.create_task(asyncio.sleep(0, value))))
-
-        results = {}
-        for key, future in futures:
-            results[key] = await future
+                results[key] = value
 
         return results
 
-    async def _save_single_async(self, tree: dict, path: str, metadata: dict):
-        """Save single checkpoint file asynchronously.
+    def _save_single(self, tree: dict, path: str, metadata: dict):
+        """Save single checkpoint file.
 
         Args:
             tree: Dictionary to save.
             path: Path where the checkpoint will be saved.
             metadata: Metadata to save with the checkpoint.
         """
-
         if metadata:
             metadata = {k: json.dumps(v) if not isinstance(v, str) else v for k, v in metadata.items()}
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, safe_flax.save_file, tree, path, metadata)
+        safe_flax.save_file(tree, path, metadata)
+        return path
 
-    async def _save_tensorstore_async(
+    def _save_tensorstore(
         self,
         tree: dict,
         path: str,
@@ -555,33 +473,26 @@ class AsyncCheckpointManager:
 
         pytree = unflatten_dict(tree, sep=".")
 
-        loop = asyncio.get_event_loop()
         from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 
         manager = GlobalAsyncCheckpointManager()
 
-        def commit_with_metadata():
-            logger.info("Committed checkpoint to Tensorstore")
-            meta_path = ePath(path) / "checkpoint_metadata.json"
-            meta_path.write_text(json.dumps(metadata.to_dict()))
-
-        await loop.run_in_executor(
-            self.executor,
-            lambda: tree_serialize_leaves(
-                checkpoint_dir=path,
-                pytree=pytree,
-                manager=manager,
-                prefix=prefix,
-                commit_callback=lambda: logger.info("Committed checkpoint to Tensorstore"),
-                write_index=True,
-            ),
+        tree_serialize_leaves(
+            checkpoint_dir=path,
+            pytree=pytree,
+            manager=manager,
+            prefix=prefix,
+            commit_callback=lambda: logger.info("Committed checkpoint to Tensorstore"),
+            write_index=True,
         )
 
-        await loop.run_in_executor(self.executor, commit_with_metadata)
+        logger.info("Committed checkpoint to Tensorstore")
+        meta_path = ePath(path) / "checkpoint_metadata.json"
+        meta_path.write_text(json.dumps(metadata.to_dict()))
 
         return path
 
-    async def _load_tensorstore_async(
+    def _load_tensorstore_sync(
         self,
         path: str,
         shardings: dict[NamedSharding] | None = None,
@@ -594,26 +505,24 @@ class AsyncCheckpointManager:
         Args:
             path: Path to the tensorstore checkpoint.
             shardings: PyTree of sharding specifications or dict of functions.
+            partition_rules: Pattern-based partition rules.
+            mesh: JAX mesh for distributed computation.
             prefix: Optional prefix for loading specific tree.
 
         Returns:
             Tuple of (loaded tree dictionary, metadata dictionary).
         """
-        loop = asyncio.get_event_loop()
         from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 
         manager = GlobalAsyncCheckpointManager()
 
-        tree = await loop.run_in_executor(
-            self.executor,
-            lambda: tree_deserialize_leaves(
-                checkpoint_dir=path,
-                mesh=mesh,
-                partition_rules=partition_rules,
-                manager=manager,
-                prefix=prefix,
-                shardings=shardings,
-            ),
+        tree = tree_deserialize_leaves(
+            checkpoint_dir=path,
+            mesh=mesh,
+            partition_rules=partition_rules,
+            manager=manager,
+            prefix=prefix,
+            shardings=shardings,
         )
 
         meta_path = ePath(path) / "checkpoint_metadata.json"
@@ -662,7 +571,7 @@ class AsyncCheckpointManager:
             prefix_filter: Deprecated. Use 'prefix' instead.
             prefix: Optional prefix for loading specific tree (e.g., 'model', 'optimizer').
                 Required when checkpoint contains multiple prefixes.
-            use_async: Whether to use async loading (faster) or sync loading.
+            use_async: Whether to use parallel loading (faster) or sequential loading.
 
         Returns:
             Tuple of (loaded tree, metadata dictionary).
@@ -695,14 +604,12 @@ class AsyncCheckpointManager:
 
         if is_tensorstore:
             if use_async:
-                tree, metadata = self._run_async(
-                    self._load_tensorstore_async(
-                        path=path_str,
-                        mesh=mesh,
-                        partition_rules=partition_rules,
-                        shardings=shardings,
-                        prefix=prefix,
-                    )
+                tree, metadata = self._load_tensorstore_sync(
+                    path=path_str,
+                    mesh=mesh,
+                    partition_rules=partition_rules,
+                    shardings=shardings,
+                    prefix=prefix,
                 )
             else:
                 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
@@ -834,14 +741,11 @@ class AsyncCheckpointManager:
         for k, shard_name in weight_map.items():
             file_to_keys[shard_name].append(k)
 
-        # Convert shardings to flat dict if needed for SafeTensors format
         shard_fns = None
         if shardings:
             if isinstance(shardings, dict) and not any(isinstance(v, dict) for v in shardings.values()):
-                # Already flat dict format
                 shard_fns = shardings
             else:
-                # PyTree format - flatten it
                 from eformer.pytree import flatten_dict, is_flatten
 
                 if not is_flatten(shardings):
@@ -921,20 +825,6 @@ class AsyncCheckpointManager:
                 k, tensor, _ = process_func(key)
                 shard_tree[k] = tensor
         return shard_tree
-
-    async def wait_for_pending_saves(self):
-        """Wait for all pending async saves to complete.
-
-        Ensures all asynchronous save operations tracked by this manager are
-        finished before continuing. Useful for ensuring data consistency before
-        shutdown or when synchronization is needed.
-
-        Note:
-            Clears the pending saves list after all operations complete.
-        """
-        if self._pending_saves:
-            await asyncio.gather(*self._pending_saves)
-            self._pending_saves.clear()
 
     @staticmethod
     def is_tensorstore(path) -> bool:

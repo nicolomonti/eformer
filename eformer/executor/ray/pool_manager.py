@@ -722,7 +722,7 @@ class SliceActor:
             node_ids=[h.get("node_id") for h in self._host_infos],
             host_infos=self._host_infos,
         )
-        logger.info(f"Prepared host placement group for slice {self._slice_info.slice_name}; hosts: {self._host_infos}")
+        logger.info(f"Prepared host placement group for slice {self._slice_info.slice_name};")
 
     def prepare_hosts(self) -> None:
         """Prepare host placement group for this slice.

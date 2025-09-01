@@ -80,6 +80,7 @@ from .executor import (
 )
 from .pool_manager import (
     ActorPoolMember,
+    DeviceHostActor,
     ResourcePoolManager,
     SlicePoolManager,
 )
@@ -120,6 +121,7 @@ __all__ = (
     "ActorPoolMember",
     "ComputeResourceConfig",
     "CpuAcceleratorConfig",
+    "DeviceHostActor",
     "DockerConfig",
     "DoneSentinel",
     "ExceptionInfo",

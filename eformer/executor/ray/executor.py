@@ -25,6 +25,15 @@ Key Features:
     - Resource management and allocation via Ray
     - Support for both synchronous and asynchronous execution
     - Decorator-based API for easy integration
+    - MegaScale coordination for multi-slice TPU workloads
+    - Flexible result flattening for multi-host scenarios
+
+Environment Variables:
+    - EXECUTOR_CALL_INDEX: Set to worker index within a pod (0-based)
+    - EXECUTOR_CALL_SLICE: Set to slice ID for multi-slice execution
+    - COORD_PORT: Coordinator port for MegaScale (default: 8192)
+    - TPU_NAME, TPU_VERSION, TPU_ZONE: TPU configuration passed to workers
+    - MEGASCALE_* variables: Auto-configured for multi-slice coordination
 
 Example:
     Basic single-pod execution:
@@ -56,6 +65,15 @@ Example:
     ...     return slice_results
     >>>
     >>> results = distributed_train(training_data)
+
+Classes:
+    RayExecutor: Core executor with static methods for various execution patterns
+
+Functions:
+    execute: Decorator for single-pod execution without retry
+    execute_resumable: Decorator for single-pod execution with retry
+    execute_multislice: Decorator for multi-slice execution without retry
+    execute_multislice_resumable: Decorator for multi-slice execution with retry
 """
 
 import functools
@@ -100,8 +118,21 @@ class RayExecutor:
     workloads with automatic resource allocation, retry mechanisms, and
     failure handling.
 
+    Methods:
+        execute: Single-pod execution without retry
+        execute_multislice: Multi-slice execution without retry
+        execute_resumable: Single-pod execution with automatic retry
+        execute_multislice_resumable: Multi-slice execution with automatic retry
+
+    All methods return JobStatus objects that encapsulate:
+        - JobSucceeded: Successful completion with results
+        - JobFailed: Failure due to exceptions
+        - JobPreempted: Preemption on preemptible resources
+        - JobError: Unexpected errors
+
     Note:
         All methods are static and can be called directly on the class.
+        The class does not maintain state between executions.
     """
 
     @staticmethod
@@ -162,15 +193,15 @@ class RayExecutor:
 
             Returns:
                 JobStatus: Status object indicating:
-                    - JobSucceeded: Execution completed successfully
-                    - JobFailed: Execution failed with an error
+                    - JobSucceeded: Execution completed successfully with results
+                    - JobFailed: Execution failed with an error (non-preemption)
                     - JobPreempted: Execution was preempted (for preemptible instances)
+
+            Note:
+                Creates one Ray future per worker as specified in accelerator_config.worker_count.
+                Each worker receives an ENV_CALL_INDEX environment variable set to its index.
             """
-            info = JobInfo(
-                accelerator_config.runtime_name,
-                "running",
-                accelerator_config.resource_name,
-            )
+            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
             futures = []
             for idx in range(accelerator_config.worker_count):
                 _call = accelerator_config.redecorate_remote_fn_for_call(
@@ -188,10 +219,7 @@ class RayExecutor:
                 RayResources.cancel_all_futures(futures)
                 return JobFailed(info, e)
 
-        if accelerator_config.head_name is None and not isinstance(
-            accelerator_config,
-            TpuAcceleratorConfig,
-        ):
+        if accelerator_config.head_name is None and not isinstance(accelerator_config, TpuAcceleratorConfig):
             do_run = ray.remote(do_run)
         else:
             default_name = f"TPU-{accelerator_config.tpu_version}-head"
@@ -205,7 +233,7 @@ class RayExecutor:
         accelerator_config: AcceleratorConfigType,
         flatten: bool = True,
         **kwargs,
-    ) -> list[ray.ObjectRef]:
+    ) -> JobStatus:
         """Execute a Ray remote function across multiple TPU slices.
 
         Distributes execution of a remote function across multiple TPU slices
@@ -223,9 +251,9 @@ class RayExecutor:
                 function on each slice.
 
         Returns:
-            list[ray.ObjectRef]: List of Ray futures, one per slice.
-                Each future represents the execution result on that slice.
-                The order corresponds to slice IDs (0-indexed).
+            JobStatus: A single JobStatus object containing results from all slices.
+                JobSucceeded contains a list of all results if successful.
+                JobFailed or JobPreempted if any error occurs.
 
         Raises:
             RayError: If slice actor creation fails, coordinator IP cannot
@@ -243,12 +271,14 @@ class RayExecutor:
             ...     return model_weights
             >>>
             >>> tpu_config = TpuAcceleratorConfig(type="v4-32", pod_count=4)
-            >>> futures = RayExecutor.execute_multislice(
+            >>> job_status = RayExecutor.execute_multislice(
             ...     train_on_slice,
             ...     tpu_config,
             ...     data=training_data
             ... )
-            >>> results = ray.get(futures)  # List of JobStatus objects
+            >>> # job_status is a single JobStatus object
+            >>> if isinstance(job_status, JobSucceeded):
+            ...     results = job_status.result  # List of results from all slices
         """
         pool_manager = SlicePoolManager(tpu_type=accelerator_config.tpu_version)
         pool_manager.scale_multislice(accelerator_config.pod_count)
@@ -302,7 +332,27 @@ class RayExecutor:
             ]
             per_slice_futures.append(host_futures)
 
-        return ray.get([f for sub in per_slice_futures for f in sub] if flatten else per_slice_futures)
+        all_futures = [f for sub in per_slice_futures for f in sub] if flatten else per_slice_futures
+
+        info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+
+        try:
+            results = ray.get(ray.get(all_futures))
+            return JobSucceeded(info, results)
+        except RayError as e:
+            if flatten:
+                RayResources.cancel_all_futures(all_futures)
+            else:
+                for slice_futures in all_futures:
+                    RayResources.cancel_all_futures(slice_futures)
+            return handle_ray_error(info, e)
+        except Exception as e:
+            if flatten:
+                RayResources.cancel_all_futures(all_futures)
+            else:
+                for slice_futures in all_futures:
+                    RayResources.cancel_all_futures(slice_futures)
+            return JobFailed(info, e)
 
     @classmethod
     def execute_resumable(
@@ -332,11 +382,22 @@ class RayExecutor:
 
         Returns:
             Any: The result from successful execution of the remote function.
+                The actual return type depends on what the remote function returns.
 
         Raises:
             RuntimeError: If the job is preempted more than max_retries_preemption
-                times or fails more than max_retries_failure times.
+                times or fails more than max_retries_failure times. The error
+                message indicates whether it was due to preemptions or failures.
+            ray.exceptions.RayTaskError: Re-raised if it occurs and is not
+                preemption-related after max retries.
             Exception: The last encountered exception if all retries are exhausted.
+
+        Note:
+            - Preemptions and failures are tracked separately
+            - Each attempt logs status information for debugging
+            - The method distinguishes between preemption (often recoverable)
+              and failures (may indicate code issues)
+            - RayTaskErrors containing "preempted" are treated as preemptions
 
         Example:
             >>> @ray.remote
@@ -441,23 +502,33 @@ class RayExecutor:
             max_retries_failure (int): Maximum number of retries when any
                 slice fails. Defaults to 10.
             **kwargs: Additional keyword arguments passed to the remote
-                function on each slice.
+                function on each slice. The 'flatten' parameter can be used
+                to control result structure.
 
         Returns:
             list[Any]: List of results from successful execution on all slices.
-                The order corresponds to slice IDs (0-indexed). All slices
-                must complete successfully.
+                The structure depends on the flatten parameter passed in kwargs:
+                - If flatten=True (default): Flat list of all results
+                - If flatten=False: List of lists, one per slice
 
         Raises:
             RuntimeError: If any slice is preempted more than max_retries_preemption
-                times or fails more than max_retries_failure times.
-            RayError: If execute_multislice fails during setup or coordination.
+                times, fails more than max_retries_failure times, or if
+                execute_multislice returns None or unexpected result type.
+            RayError: If execute_multislice fails during setup or coordination
+                (slice actor creation, placement group setup, etc.).
+            ray.exceptions.RayTaskError: Re-raised if it occurs and indicates
+                preemption or failure after max retries.
             Exception: The last encountered exception if retries are exhausted.
 
         Note:
-            This method implements an all-or-nothing retry policy. If any
-            slice fails or is preempted, the entire multi-slice execution
-            is retried.
+            - Implements an all-or-nothing retry policy: if any slice fails
+              or is preempted, the entire multi-slice execution is retried
+            - Different error types are handled with appropriate retry logic:
+              * RayTaskError/RayError with "preempted" -> preemption counter
+              * Other errors -> failure counter
+            - Each retry attempt creates new slice actors and placement groups
+            - Detailed logging tracks retry attempts and error types
 
         Example:
             >>> @ray.remote
@@ -466,6 +537,8 @@ class RayExecutor:
             ...     return trained_weights
             >>>
             >>> tpu_config = TpuAcceleratorConfig(type="v4-32", pod_count=4)
+            >>>
+            >>> # Get flat list of results
             >>> results = RayExecutor.execute_multislice_resumable(
             ...     distributed_training,
             ...     tpu_config,
@@ -473,7 +546,16 @@ class RayExecutor:
             ...     max_retries_failure=3,
             ...     data_shard=sharded_data
             ... )
-            >>> # results contains 4 trained_weights, one from each slice
+            >>>
+            >>> # Get nested results by slice
+            >>> results_by_slice = RayExecutor.execute_multislice_resumable(
+            ...     distributed_training,
+            ...     tpu_config,
+            ...     max_retries_preemption=50,
+            ...     max_retries_failure=3,
+            ...     data_shard=sharded_data,
+            ...     flatten=False
+            ... )
         """
         num_failures = 0
         num_preemptions = 0
@@ -484,15 +566,10 @@ class RayExecutor:
             logger.info(f"Running multislice on Attempt {attempt}")
             attempt += 1
             problem = None
-            all_slice_job_statuses: list[JobStatus] = []
+            job_status: JobStatus | None = None
 
             try:
-                slice_futures: list[ray.ObjectRef] = cls.execute_multislice(
-                    remote_fn=remote_fn,
-                    accelerator_config=accelerator_config,
-                    **kwargs,
-                )
-                all_slice_job_statuses = ray.get(slice_futures)
+                job_status = cls.execute_multislice(remote_fn=remote_fn, accelerator_config=accelerator_config, **kwargs)
 
             except ray.exceptions.RayTaskError as e:
                 problem = e
@@ -538,89 +615,44 @@ class RayExecutor:
                     )
                     continue
 
-            current_attempt_overall_failed = False
-            current_attempt_overall_preempted = False
-            aggregated_successful_slice_results = [None] * len(all_slice_job_statuses)
-
-            if not all_slice_job_statuses:
-                logger.warning(
-                    "execute_multislice returned or resulted in empty job statuses after ray.get(). Treating as failure."
-                )
+            if not job_status:
+                logger.warning("execute_multislice returned None. Treating as failure.")
                 num_failures += 1
-                problem = problem or RuntimeError("Empty job statuses from execute_multislice after ray.get()")
+                problem = problem or RuntimeError("No job status from execute_multislice")
                 continue
 
-            # Process results from each slice to determine overall status
-            for slice_idx, single_slice_status in enumerate(all_slice_job_statuses):
-                if isinstance(single_slice_status, JobSucceeded):
-                    # Slice succeeded - store its result
-                    aggregated_successful_slice_results[slice_idx] = single_slice_status.result
-                elif isinstance(single_slice_status, JobPreempted):
-                    if not problem:
-                        problem = single_slice_status.error
-                    current_attempt_overall_preempted = True
-                    logger.warning(
-                        f"Slice {slice_idx} preempted. Error: {single_slice_status.error}",
-                        exc_info=single_slice_status.error,
-                    )
-                elif isinstance(single_slice_status, JobFailed):
-                    if not problem:
-                        problem = single_slice_status.error
-                    current_attempt_overall_failed = True
-                    logger.warning(
-                        f"Slice {slice_idx} failed (JobFailed). Error: {single_slice_status.error}",
-                        exc_info=single_slice_status.error,
-                    )
-                elif isinstance(single_slice_status, JobError):
-                    if not problem:
-                        problem = single_slice_status.error
-                    current_attempt_overall_failed = True
-                    logger.warning(
-                        f"Slice {slice_idx} reported JobError. Error: {single_slice_status.error}",
-                        exc_info=single_slice_status.error,
-                    )
-                else:
-                    err_msg = (
-                        f"Unexpected result type {type(single_slice_status)} "
-                        f"from slice {slice_idx}: {single_slice_status}"
-                    )
-                    if not problem:
-                        problem = RuntimeError(err_msg)
-                    current_attempt_overall_failed = True
-                    logger.error(err_msg)
-
-            # Handle overall attempt status based on individual slice results
-            if current_attempt_overall_failed:
-                num_failures += 1
-                logger.warning(
-                    f"At least one slice failed or reported an error this attempt. Overall failure "
-                    f"count: {num_failures}. Last/first error: {problem}",
-                )
-                continue
-
-            if current_attempt_overall_preempted:
+            if isinstance(job_status, JobSucceeded):
+                logger.info("All slices succeeded in this attempt.")
+                return job_status.result
+            elif isinstance(job_status, JobPreempted):
+                problem = job_status.error
                 num_preemptions += 1
                 logger.warning(
-                    f"At least one slice was preempted (and no failures) this attempt. Overall preemption count:"
-                    f" {num_preemptions}. Last/first error: {problem}",
+                    f"Multislice execution preempted. Preemption count: {num_preemptions}. Error: {problem}",
+                    exc_info=problem,
                 )
                 continue
-            # Check if all slices succeeded
-            if (
-                not current_attempt_overall_failed
-                and not current_attempt_overall_preempted
-                and all(res is not None for res in aggregated_successful_slice_results)
-            ):
-                logger.info("All slices succeeded in this attempt.")
-                return aggregated_successful_slice_results
-            else:
-                # Inconsistent state - some slices may have unknown status
-                logger.error(
-                    "Inconsistent state in multislice resumable logic after "
-                    "processing slice results. Treating as failure."
-                )
+            elif isinstance(job_status, JobFailed):
+                problem = job_status.error
                 num_failures += 1
-                problem = problem or RuntimeError("Inconsistent state in multislice resumable after processing results")
+                logger.warning(
+                    f"Multislice execution failed (JobFailed). Failure count: {num_failures}. Error: {problem}",
+                    exc_info=problem,
+                )
+                continue
+            elif isinstance(job_status, JobError):
+                problem = job_status.error
+                num_failures += 1
+                logger.warning(
+                    f"Multislice execution reported JobError. Failure count: {num_failures}. Error: {problem}",
+                    exc_info=problem,
+                )
+                continue
+            else:
+                err_msg = f"Unexpected result type {type(job_status)} from execute_multislice: {job_status}"
+                problem = RuntimeError(err_msg)
+                num_failures += 1
+                logger.error(err_msg)
                 continue
 
         if num_preemptions >= max_retries_preemption:
@@ -717,12 +749,10 @@ def execute(accelerator_config: AcceleratorConfigType):
     def decorator(remote_fn: RemoteFunction):
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
-            return ray.get(
-                RayExecutor.execute(
-                    remote_fn=remote_fn,
-                    accelerator_config=accelerator_config,
-                    **kwargs,
-                )
+            return RayExecutor.execute(
+                remote_fn=remote_fn,
+                accelerator_config=accelerator_config,
+                **kwargs,
             )
 
         return wrapper
@@ -765,12 +795,10 @@ def execute_multislice(accelerator_config: AcceleratorConfigType):
     def decorator(remote_fn: RemoteFunction):
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
-            return ray.get(
-                RayExecutor.execute_multislice(
-                    remote_fn=remote_fn,
-                    accelerator_config=accelerator_config,
-                    **kwargs,
-                )
+            return RayExecutor.execute_multislice(
+                remote_fn=remote_fn,
+                accelerator_config=accelerator_config,
+                **kwargs,
             )
 
         return wrapper
