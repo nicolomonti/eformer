@@ -39,16 +39,19 @@ Example:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
+from uuid import uuid4
 
 import ray
 import requests
 from ray.actor import ActorHandle
 from ray.autoscaler.sdk import request_resources
 from ray.exceptions import ActorDiedError, ActorUnavailableError, GetTimeoutError
+from ray.remote_function import RemoteFunction as _RF
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
@@ -57,6 +60,7 @@ from .types import SliceInfo
 logger = logging.getLogger("ray")
 
 HEALTH_CHECK_TIMEOUT_S = 60
+SLICE_ACTOR_START_TIMEOUT_S = 4 * 60 * 60
 ActorInfoT = TypeVar("ActorInfoT")
 
 
@@ -77,6 +81,7 @@ class HostInfo:
     num_devices: int | None
     healthy: bool
     failed: bool
+    node_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,7 +181,10 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         self._actor_pool = healthy
 
     def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
-        """Add new actors to reach the desired pool size.
+        """Add new actors to the pool to reach desired size.
+
+        Creates new actors asynchronously and waits for them to start.
+        Actors that fail to start within the timeout are killed.
 
         Args:
             desired_num_actors: Target number of actors in the pool.
@@ -186,18 +194,28 @@ class ResourcePoolManager(Generic[ActorInfoT]):
             return
         num_to_add = desired_num_actors - current
         logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
+
         actors = [self.create_actor() for _ in range(num_to_add)]
-        for actor in actors:
+        awaitables = [(actor, actor.get_info.remote()) for actor in actors]
+
+        logger.info(f"Waiting up to {SLICE_ACTOR_START_TIMEOUT_S}s for {num_to_add} slice actors to start...")
+        ray.wait([a for _, a in awaitables], num_returns=len(awaitables), timeout=SLICE_ACTOR_START_TIMEOUT_S)
+
+        started = 0
+        for actor, info_ref in awaitables:
             try:
-                info = ray.get(actor.get_info.remote())
+                info = ray.get(info_ref, timeout=0)
                 self._actor_pool.append(ActorPoolMember(actor, info))
+                started += 1
                 logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
             except Exception as e:
-                logger.error(f"Failed to start actor: {e}")
+                logger.warning(f"SliceActor failed to start in time: {e}; killing actor")
                 try:
                     ray.kill(actor)
                 except Exception:
                     pass
+
+        logger.info(f"Started {started}/{num_to_add} slice actors")
 
     def _remove_members_from_actor_pool(self, desired_num_actors: int) -> None:
         """Remove actors to reach the desired pool size.
@@ -256,34 +274,39 @@ class ResourcePoolManager(Generic[ActorInfoT]):
 
 @ray.remote
 class DeviceHostActor:
-    """Ray actor for managing a single Device-Comp host.
+    """Ray actor for managing a single TPU host within a slice.
 
-    Runs on a specific TPU host and executes tasks with proper environment
-    configuration. Monitors host health and preemption status.
+    Handles task execution on a specific TPU host, managing TPU resources,
+    environment variables, and task lifecycle. Supports cancellation and
+    health monitoring.
 
     Attributes:
-        host_id: Unique identifier for this host.
-        slice_name: Name of the TPU slice.
+        host_id: Unique identifier for this host within its slice.
+        slice_name: Name of the TPU slice this host belongs to.
         num_devices: Number of TPU devices on this host.
         _failed: Whether this host has encountered a failure.
+        _awaitable: Current running task's ObjectRef.
+        _node_id: Ray node ID where this actor is running.
     """
 
     def __init__(self, host_id: int, slice_name: str, num_devices: int | None = None):
-        """Initialize a TPU host actor.
+        """Initialize a DeviceHostActor.
 
         Args:
-            host_id: Unique identifier for this host within the slice.
+            host_id: Unique identifier for this host within its slice.
             slice_name: Name of the TPU slice this host belongs to.
             num_devices: Optional number of TPU devices available on this host.
         """
         self.host_id = host_id
         self.slice_name = slice_name
-        self.num_devices = num_devices
+        self.num_devices = num_devices or 0
         self._failed = False
-        logger.info(f"DeviceHostActor[{slice_name}#{host_id}] init; num_devices={num_devices}")
+        self._awaitable: ray.ObjectRef | None = None
+        self._node_id = ray.get_runtime_context().get_node_id()
+        logger.info(f"DeviceHostActor[{slice_name}#{host_id}] init; num_devices={num_devices}; node_id={self._node_id}")
 
     def healthy(self) -> bool:
-        """Check if the host is healthy and operational.
+        """Check if this host is healthy and operational.
 
         Returns:
             True if host is not failed and not being preempted.
@@ -293,7 +316,8 @@ class DeviceHostActor:
     def is_being_preempted(self) -> bool:
         """Check if this GCP instance is being preempted.
 
-        Queries GCP metadata server to determine preemption status.
+        Queries the GCP metadata server to determine if the instance
+        is scheduled for preemption.
 
         Returns:
             True if instance is being preempted, False otherwise.
@@ -312,7 +336,7 @@ class DeviceHostActor:
         """Get current information about this host.
 
         Returns:
-            HostInfo object with current host status and metadata.
+            HostInfo object with host metadata and status.
         """
         return HostInfo(
             host_id=self.host_id,
@@ -320,52 +344,128 @@ class DeviceHostActor:
             num_devices=self.num_devices,
             healthy=self.healthy(),
             failed=self._failed,
+            node_id=self._node_id,
         )
 
-    def run_task(self, task_fn, *args, env: dict | None = None, **kwargs):
-        """Execute a task on this TPU host.
-
-        Sets up proper environment variables and executes the given function.
-        Marks host as failed if task execution fails.
+    def _merge_runtime_env(self, runtime_env: dict | None, env_vars: dict | None) -> dict:
+        """Merge environment variables into a runtime environment dict.
 
         Args:
-            task_fn: Function to execute.
-            *args: Positional arguments for task_fn.
-            env: Optional environment variables to set.
-            **kwargs: Keyword arguments for task_fn.
+            runtime_env: Base runtime environment configuration.
+            env_vars: Environment variables to merge in.
 
         Returns:
-            Result of task_fn execution.
+            Merged runtime environment dictionary.
+        """
+        re = dict(runtime_env or {})
+        if env_vars:
+            ev = dict(re.get("env_vars", {}))
+            ev.update({str(k): str(v) for k, v in env_vars.items() if v is not None})
+            re["env_vars"] = ev
+        return re
 
-        Raises:
-            RuntimeError: If host is unhealthy or preempted.
+    def _hacky_remove_tpu_lockfile(self):
+        """Remove TPU lockfile that may prevent TPU initialization.
+
+        Attempts to remove /tmp/libtpu_lockfile which can cause issues
+        when reusing TPU resources. Falls back to sudo if needed.
+        """
+        try:
+            if os.path.exists("/tmp/libtpu_lockfile"):
+                os.unlink("/tmp/libtpu_lockfile")
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            try:
+                os.system("sudo rm /tmp/libtpu_lockfile")
+            except Exception:
+                pass
+
+    def _cancel_tasks_and_wait(self, tasks: list[ray.ObjectRef], timeout_s: float = 240.0) -> None:
+        """Cancel Ray tasks and wait for them to complete.
+
+        Forcefully cancels all provided tasks and waits for completion
+        or timeout.
+
+        Args:
+            tasks: List of Ray ObjectRefs to cancel.
+            timeout_s: Maximum time to wait for cancellation.
+        """
+        if not tasks:
+            return
+        try:
+            for t in tasks:
+                ray.cancel(t, force=True, recursive=True)
+        except Exception as e:
+            logger.warning(f"Failed to cancel some tasks: {e}")
+        done, pending = ray.wait(tasks, num_returns=len(tasks), timeout=timeout_s)
+        if pending:
+            logger.warning(f"Cancelled {len(done)} tasks; {len(pending)} still pending after {timeout_s}s.")
+
+    def cancel_current(self):
+        """Cancel the currently running task if any.
+
+        Cancels and waits for the current task to complete,
+        then clears the awaitable reference.
+        """
+        if self._awaitable:
+            self._cancel_tasks_and_wait([self._awaitable])
+            self._awaitable = None
+
+    def run_remote_fn(
+        self,
+        remote_fn,
+        *,
+        runtime_env: dict | None = None,
+        env: dict | None = None,
+        num_cpus: float = 8.0,
+        memory_bytes: float = 20e9,
+        extra_resources: dict | None = None,
+    ) -> ray.ObjectRef:
+        """
+        Launch a cancelable task on this host's node, reserving TPU for the task.
+        Returns the task ObjectRef (caller can wait/cancel).
         """
         if not self.healthy():
             raise RuntimeError(f"Host {self.host_id} unhealthy or preempted")
-        import os
 
-        if env:
-            for k, v in env.items():
-                if v is not None:
-                    os.environ[str(k)] = str(v)
-        os.environ["TPU_HOST_ID"] = str(self.host_id)
-        os.environ["TPU_SLICE_NAME"] = self.slice_name
-        if self.num_devices is not None:
-            os.environ["TPU_NUM_DEVICES"] = str(self.num_devices)
-        try:
-            return task_fn(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Task failed on host {self.host_id}: {e}")
-            self._failed = True
-            raise
+        if not isinstance(remote_fn, _RF):
+            remote_fn = ray.remote(max_calls=1)(remote_fn)
+        elif remote_fn._default_options.get("max_calls") is None:
+            raise ValueError("remote_fn must have max_calls=1 for TPU workloads")
+
+        if self._awaitable:
+            self._cancel_tasks_and_wait([self._awaitable])
+
+        self._hacky_remove_tpu_lockfile()
+        host_env = {"TPU_HOST_ID": str(self.host_id), "TPU_SLICE_NAME": self.slice_name}
+        if self.num_devices:
+            host_env["TPU_NUM_DEVICES"] = str(self.num_devices)
+        merged_runtime_env = self._merge_runtime_env(runtime_env, {**host_env, **(env or {})})
+        resources = dict(extra_resources or {})
+        if self.num_devices:
+            resources["TPU"] = self.num_devices
+
+        self._awaitable = remote_fn.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(self._node_id, soft=False),
+            resources=resources,
+            num_cpus=num_cpus,
+            num_gpus=0,
+            memory=memory_bytes,
+            runtime_env=merged_runtime_env,
+        ).remote()
+        return self._awaitable
 
     def shutdown(self) -> None:
         """Gracefully shut down this host actor.
 
-        Marks the host as failed to prevent new task execution.
+        Cancels any running task and marks the host as failed.
         """
-        logger.info(f"Shutting down DeviceHostActor {self.host_id}")
-        self._failed = True
+        try:
+            self.cancel_current()
+        finally:
+            self._failed = True
+            logger.info(f"Shut down DeviceHostActor[{self.slice_name}#{self.host_id}]")
 
 
 @ray.remote
@@ -430,6 +530,42 @@ class SliceActor:
             "pod_name": pod_name,
             "num_devices": num_devices,
         }
+
+    def _create_actor_for_host_id(self, host_id: int) -> ActorHandle:
+        """Create a DeviceHostActor for a specific host ID.
+
+        Creates an actor with node affinity to ensure it runs on the
+        correct TPU host. The actor is created as detached to persist
+        beyond the parent's lifetime.
+
+        Args:
+            host_id: Zero-based index of the host within the slice.
+
+        Returns:
+            Ray actor handle for the DeviceHostActor.
+
+        Raises:
+            RuntimeError: If slice/host info not initialized or host_id invalid.
+        """
+        if not self._slice_info or not self._host_infos:
+            raise RuntimeError("Slice or host info not initialized")
+        if host_id >= len(self._host_infos):
+            raise RuntimeError(f"Missing host info for host_id={host_id}")
+
+        info = self._host_infos[host_id]
+        node_id = info["node_id"]
+        num_devices_for_host = info.get("num_devices")
+
+        return DeviceHostActor.options(
+            num_cpus=0,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+            lifetime="detached",
+            name=f"{self._slice_info.slice_name}-host-{host_id}-{uuid4().hex[:8]}",
+        ).remote(
+            host_id,
+            self._slice_info.slice_name,
+            num_devices_for_host,
+        )
 
     def _initialize_slice_info(self) -> None:
         """Initialize slice information from TPU environment.
@@ -620,22 +756,10 @@ class SliceActor:
         node_id = info["node_id"]
         num_devices_for_host = info.get("num_devices")
 
-        resource_kwargs = {}
-        if num_devices_for_host:
-            resource_kwargs["resources"] = {"TPU": num_devices_for_host}
-
         return DeviceHostActor.options(
             num_cpus=0,
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=node_id,
-                soft=False,
-            ),
-            **resource_kwargs,
-        ).remote(
-            host_id,
-            self._slice_info.slice_name,
-            num_devices_for_host,
-        )
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+        ).remote(host_id, self._slice_info.slice_name, num_devices_for_host)
 
     def ensure_host_pool(self, desired_hosts: int | None = None) -> None:
         """Ensure the host actor pool has the desired number of hosts.
@@ -673,7 +797,10 @@ class SliceActor:
         self._actor_pool = healthy
 
     def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
-        """Add new actors to reach the desired pool size.
+        """Add new host actors to reach the desired pool size.
+
+        Creates host actors sequentially to ensure correct host_id assignment.
+        Each actor is given a timeout to start, after which it's killed.
 
         Args:
             desired_num_actors: Target number of actors in the pool.
@@ -683,14 +810,15 @@ class SliceActor:
             return
         num_to_add = desired_num_actors - current
         logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
-        actors = [self.create_actor() for _ in range(num_to_add)]
-        for actor in actors:
+
+        for host_id in range(current, current + num_to_add):
+            actor = self._create_actor_for_host_id(host_id)
             try:
-                info = ray.get(actor.get_info.remote())
+                info = ray.get(actor.get_info.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
                 self._actor_pool.append(ActorPoolMember(actor, info))
                 logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
             except Exception as e:
-                logger.error(f"Failed to start actor: {e}")
+                logger.error(f"Failed to start actor for host_id={host_id}: {e}")
                 try:
                     ray.kill(actor)
                 except Exception:
@@ -750,31 +878,30 @@ class SliceActor:
                 logger.error(f"Failed to kill actor {name}: {e}")
         self._actor_pool = []
 
-    def execute_function(self, fn, *args, use_host_actors: bool = False, env: dict | None = None, **kwargs):
-        """Execute a function on this slice.
+    def run_remote_fn(self, remote_fn, runtime_env: dict | None = None, env: dict | None = None):
+        """Execute a remote function on all hosts in this slice.
+
+        Ensures all hosts are ready, then launches the function on each host
+        in parallel. The function runs with TPU resources reserved.
 
         Args:
-            fn: Function to execute.
-            *args: Positional arguments for remote_fn.
-            use_host_actors: If True, run on all host actors in parallel.
-            env: Optional environment variables.
-            **kwargs: Keyword arguments for remote_fn.
+            remote_fn: Ray remote function or callable to execute.
+            runtime_env: Optional Ray runtime environment configuration.
+            env: Optional environment variables to set.
 
         Returns:
-            Result of function execution (list if using host actors).
+            List of Ray ObjectRefs for each host's execution.
 
         Raises:
             RuntimeError: If slice info is not initialized.
         """
         if not self._slice_info:
             raise RuntimeError("Slice info not initialized")
-
-        if use_host_actors:
-            self.ensure_host_pool(self._slice_info.num_hosts)
-            futures = [member.actor.run_task.remote(fn, *args, env=env, **kwargs) for member in self._actor_pool]
-            return ray.get(futures)
-        else:
-            return fn(*args, **kwargs)
+        self.ensure_host_pool(self._slice_info.num_hosts)
+        futures = [
+            member.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for member in self._actor_pool
+        ]
+        return futures
 
     def shutdown(self):
         """Gracefully shut down this slice actor.
@@ -782,6 +909,10 @@ class SliceActor:
         Removes the placement group, marks the slice as failed,
         and prevents any new task execution on this slice.
         """
+        try:
+            self.drain_actor_pool()
+        except Exception:
+            pass
         if self._host_placement_group:
             try:
                 remove_placement_group(self._host_placement_group)
@@ -890,7 +1021,7 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         Pre-requests resources for all slices and prepares their host
         placement groups for distributed execution.
         """
-        # Pre-request per-slice host bundles
+
         slice_infos: list[SliceInfo] = ray.get([member.actor.get_info.remote() for member in self._actor_pool])
         for info in slice_infos:
             host_bundles = [{"CPU": 0, info.slice_name: 1} for _ in range(info.num_hosts)]
@@ -918,18 +1049,43 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             return False
         return True
 
-    def execute_on_each_slice(self, fn, *args, **kwargs):
-        """Execute a function on each slice in parallel.
+    def execute_on_each_slice(self, remote_fn, env: dict | None = None, runtime_env: dict | None = None):
+        """Execute a function on all hosts across all slices.
+
+        Prepares all slices and runs the function on every host in parallel.
+        Returns results grouped by slice.
 
         Args:
-            fn: Function to execute on each slice.
-            *args: Positional arguments for fn.
-            **kwargs: Keyword arguments for fn.
+            remote_fn: Ray remote function or callable to execute.
+            env: Optional environment variables to set.
+            runtime_env: Optional Ray runtime environment configuration.
 
         Returns:
-            List of results from each slice.
+            List of lists where outer list represents slices and inner lists
+            contain ObjectRefs for each host in that slice.
         """
-        return ray.get([member.actor.execute_function.remote(fn, *args, **kwargs) for member in self._actor_pool])
+        self.prepare_all_slices()
+        per_slice_futures = ray.get(
+            [m.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for m in self._actor_pool]
+        )
+        return per_slice_futures
+
+    def execute_on_each_host_flat(self, remote_fn, env: dict | None = None, runtime_env: dict | None = None):
+        """Execute a function on all hosts, returning a flat list.
+
+        Similar to execute_on_each_slice but flattens the nested result
+        structure into a single list of ObjectRefs.
+
+        Args:
+            remote_fn: Ray remote function or callable to execute.
+            env: Optional environment variables to set.
+            runtime_env: Optional Ray runtime environment configuration.
+
+        Returns:
+            Flat list of ObjectRefs from all hosts across all slices.
+        """
+        per_slice = self.execute_on_each_slice(remote_fn, env=env, runtime_env=runtime_env)
+        return [f for sub in per_slice for f in sub]
 
     def execute_on_each_host(self, fn, *args, env: dict | None = None, **kwargs):
         """Execute a function on each host across all slices.
@@ -954,3 +1110,24 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
                 for member in self._actor_pool
             ]
         )
+
+    def schedule_on_each_host(self, remote_fn, env: dict | None = None, runtime_env: dict | None = None):
+        """Schedule a function on all hosts without waiting for results.
+
+        Ensures all slices and hosts are ready, then schedules the function
+        execution on all hosts. Returns immediately with ObjectRefs.
+
+        Args:
+            remote_fn: Ray remote function or callable to execute.
+            env: Optional environment variables to set.
+            runtime_env: Optional Ray runtime environment configuration.
+
+        Returns:
+            Flat list of ObjectRefs that can be waited on later.
+        """
+        self.prepare_all_slices()
+        ray.get([m.actor.ensure_host_pool.remote() for m in self._actor_pool])
+        per_slice_futures = ray.get(
+            [m.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for m in self._actor_pool]
+        )
+        return [f for sl in per_slice_futures for f in sl]

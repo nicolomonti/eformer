@@ -203,6 +203,7 @@ class RayExecutor:
     def execute_multislice(
         remote_fn: RemoteFunction,
         accelerator_config: AcceleratorConfigType,
+        flatten: bool = True,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Execute a Ray remote function across multiple TPU slices.
@@ -251,42 +252,57 @@ class RayExecutor:
         """
         pool_manager = SlicePoolManager(tpu_type=accelerator_config.tpu_version)
         pool_manager.scale_multislice(accelerator_config.pod_count)
+
         pool_manager.prepare_all_slices()
-        pool_members = pool_manager.get_all_pool_members()
-        if not pool_members:
-            raise RayError("Failed to create slice actors in pool")
-        slice_infos = ray.get([m.actor.get_info.remote() for m in pool_members])
-        coord_ip = slice_infos[0].ip_address if slice_infos else None
+        members = pool_manager.get_all_pool_members()
+        if not members:
+            raise RuntimeError("No SliceActors available after scaling.")
+        ray.get([m.actor.ensure_host_pool.remote() for m in members])
 
+        slice_infos = ray.get([m.actor.get_info.remote() for m in members])
+        coord_ip = slice_infos[0].ip_address
         if not coord_ip:
-            raise RayError("Failed to determine coordinator IP from slice info")
+            raise RuntimeError("Could not determine coordinator IP.")
+        port = int(os.getenv("COORD_PORT", 8192))
 
-        port = int(os.getenv("COORD_PORT", MEGASCALE_DEFAULT_PORT))
         base_env = dict(
             TPU_NAME=os.getenv("TPU_NAME", "EMPTY"),
             TPU_VERSION=accelerator_config.tpu_version,
             TPU_ZONE=os.getenv("TPU_ZONE", "EMPTY"),
-            TPU_POD_COUNT=str(accelerator_config.pod_count),
+            TPU_POD_COUNT=str(len(members)),
         )
+        if accelerator_config.execution_env:
+            base_env.update({str(k): str(v) for k, v in accelerator_config.execution_env.items() if v is not None})
 
-        futures = []
-        for slice_id, member in enumerate(pool_members):
-            megascale_env = dict(
-                MEGASCALE_COORDINATOR_ADDRESS=coord_ip,
-                MEGASCALE_NUM_SLICES=str(accelerator_config.pod_count),
-                MEGASCALE_PORT=str(port),
-                MEGASCALE_SLICE_ID=str(slice_id),
-            )
-            env = dict(**base_env, EXECUTOR_CALL_INDEX=str(0), EXECUTOR_CALL_SLICE=str(slice_id))
+        per_slice_futures: list[list[ray.ObjectRef]] = []
 
-            if accelerator_config.pod_count > 1:
-                env.update(**megascale_env)
-            future = member.actor.execute_function.remote(remote_fn, use_host_actors=True, env=env, **kwargs)
-            futures.append(future)
+        for slice_id, member in enumerate(members):
+            if len(members) > 1:
+                env_for_slice = dict(
+                    **base_env,
+                    MEGASCALE_COORDINATOR_ADDRESS=f"{coord_ip}:{port}",
+                    MEGASCALE_NUM_SLICES=str(len(members)),
+                    MEGASCALE_PORT=str(port),
+                    MEGASCALE_SLICE_ID=str(slice_id),
+                    EXECUTOR_CALL_INDEX="0",
+                    EXECUTOR_CALL_SLICE=str(slice_id),
+                    TPU_SLICE_NAME=slice_infos[slice_id].slice_name,
+                )
+            else:
+                env_for_slice = base_env
+            env_for_slice = {str(k): str(v) for k, v in env_for_slice.items()}
+            host_handles: list[ray.actor.ActorHandle] = ray.get(member.actor.get_all_actors_in_pool.remote())
+            host_futures = [
+                h.run_remote_fn.remote(
+                    remote_fn,
+                    runtime_env=accelerator_config.execution_env,
+                    env=env_for_slice,
+                )
+                for h in host_handles
+            ]
+            per_slice_futures.append(host_futures)
 
-        # NOTE (erfanzar): pool_manager.drain_actor_pool() can be called after getting results
-        # to clean up resources, but is left to the caller for flexibility
-        return futures
+        return ray.get([f for sub in per_slice_futures for f in sub] if flatten else per_slice_futures)
 
     @classmethod
     def execute_resumable(
