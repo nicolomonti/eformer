@@ -749,10 +749,12 @@ def execute(accelerator_config: AcceleratorConfigType):
     def decorator(remote_fn: RemoteFunction):
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
-            return RayExecutor.execute(
-                remote_fn=remote_fn,
-                accelerator_config=accelerator_config,
-                **kwargs,
+            return ray.get(
+                RayExecutor.execute(
+                    remote_fn=remote_fn,
+                    accelerator_config=accelerator_config,
+                    **kwargs,
+                )
             )
 
         return wrapper
