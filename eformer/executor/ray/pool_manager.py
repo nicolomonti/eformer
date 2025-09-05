@@ -55,33 +55,38 @@ from ray.remote_function import RemoteFunction as _RF
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
-from .types import SliceInfo
+from .types import HostInfo, SliceInfo
 
 logger = logging.getLogger("ray")
 
 HEALTH_CHECK_TIMEOUT_S = 60
 SLICE_ACTOR_START_TIMEOUT_S = 4 * 60 * 60
+SCALE_POLL_S = int(os.getenv("EFORMER_SCALE_POLL_S", "30"))
+SCALE_ADD_TIMEOUT_S = int(os.getenv("EFORMER_SCALE_ADD_TIMEOUT_S", "604800"))
 ActorInfoT = TypeVar("ActorInfoT")
 
 
-@dataclass(frozen=True)
-class HostInfo:
-    """Information about a TPU host within a slice.
+class InsufficientSlicesError(RuntimeError):
+    """Raised when the requested number of TPU slices cannot be allocated.
 
-    Attributes:
-        host_id: Unique identifier for the host within its slice.
-        slice_name: Name of the TPU slice this host belongs to.
-        num_devices: Number of TPU devices available on this host.
-        healthy: Whether the host is currently healthy and operational.
-        failed: Whether the host has encountered a failure.
+    This exception is raised by SlicePoolManager.scale_multislice when
+    none of the requested slice counts can be satisfied, typically due to:
+    - Insufficient TPU resources in the cluster
+    - Preemption of TPU nodes during scaling
+    - Ray autoscaler unable to provision required nodes
+
+    The exception message includes details about requested vs available slices.
+
+    Example:
+        >>> manager = SlicePoolManager(tpu_type="v4-32")
+        >>> try:
+        ...     manager.scale_multislice([4, 8])  # Request 8 slices, fallback to 4
+        ... except InsufficientSlicesError as e:
+        ...     print(f"Could not allocate TPU slices: {e}")
+        ...     # Handle fallback or retry logic
     """
 
-    host_id: int
-    slice_name: str
-    num_devices: int | None
-    healthy: bool
-    failed: bool
-    node_id: str | None = None
+    pass
 
 
 @dataclass(frozen=True)
@@ -278,15 +283,21 @@ class DeviceHostActor:
 
     Handles task execution on a specific TPU host, managing TPU resources,
     environment variables, and task lifecycle. Supports cancellation and
-    health monitoring.
+    health monitoring. Each DeviceHostActor runs on a specific Ray node
+    and manages TPU devices on that node.
 
     Attributes:
-        host_id: Unique identifier for this host within its slice.
+        host_id: Unique identifier for this host within its slice (0-based).
         slice_name: Name of the TPU slice this host belongs to.
         num_devices: Number of TPU devices on this host.
         _failed: Whether this host has encountered a failure.
         _awaitable: Current running task's ObjectRef.
         _node_id: Ray node ID where this actor is running.
+
+    Environment Variables Set:
+        TPU_HOST_ID: Host index within the slice.
+        TPU_SLICE_NAME: Name of the parent slice.
+        TPU_NUM_DEVICES: Number of devices on this host (if available).
     """
 
     def __init__(self, host_id: int, slice_name: str, num_devices: int | None = None):
@@ -422,9 +433,35 @@ class DeviceHostActor:
         memory_bytes: float = 20e9,
         extra_resources: dict | None = None,
     ) -> ray.ObjectRef:
-        """
-        Launch a cancelable task on this host's node, reserving TPU for the task.
-        Returns the task ObjectRef (caller can wait/cancel).
+        """Launch a cancelable task on this host's node, reserving TPU resources.
+
+        Executes a Ray remote function on this specific TPU host with proper
+        resource allocation and node affinity. Automatically cancels any
+        previously running task and manages TPU lockfiles.
+
+        Args:
+            remote_fn: Ray remote function or callable to execute. If not already
+                a remote function, will be wrapped with @ray.remote(max_calls=1).
+            runtime_env: Optional Ray runtime environment configuration for
+                dependency management and environment setup.
+            env: Additional environment variables to merge with host environment.
+            num_cpus: Number of CPUs to reserve for the task (default: 8.0).
+            memory_bytes: Memory to reserve in bytes (default: 20GB).
+            extra_resources: Additional custom resources to request.
+
+        Returns:
+            ray.ObjectRef: Reference to the running task that can be used to
+                retrieve results with ray.get() or cancel with ray.cancel().
+
+        Raises:
+            RuntimeError: If host is unhealthy or being preempted.
+            ValueError: If remote_fn doesn't have max_calls=1 set.
+
+        Note:
+            - Task runs with strict node affinity to this host's node.
+            - TPU resources are automatically reserved based on num_devices.
+            - Previous tasks are cancelled before starting new ones.
+            - TPU lockfile is cleaned up before execution.
         """
         if not self.healthy():
             raise RuntimeError(f"Host {self.host_id} unhealthy or preempted")
@@ -474,13 +511,23 @@ class SliceActor:
 
     Coordinates multiple TPU hosts within a single slice, handling
     placement groups, resource allocation, and distributed task execution.
+    Each SliceActor manages a complete TPU pod/slice and ensures hosts
+    are properly distributed across nodes using placement groups.
 
     Attributes:
-        _actor_pool: List of active actor pool members.
-        _failed: Whether this slice has failed.
-        _slice_info: Information about the TPU slice.
-        _host_placement_group: Ray placement group for host distribution.
-        _host_infos: Information about each host in the slice.
+        _actor_pool: List of DeviceHostActor pool members for this slice.
+        _failed: Whether this slice has failed or been preempted.
+        _slice_info: Detailed information about the TPU slice configuration.
+        _host_placement_group: Ray placement group for STRICT_SPREAD host distribution.
+        _host_infos: Node and device information for each host in the slice.
+
+    Lifecycle:
+        1. Created by SlicePoolManager with TPU head resource requirement.
+        2. Discovers slice configuration from TPU environment.
+        3. Creates placement group for host distribution.
+        4. Spawns DeviceHostActors on each host node.
+        5. Manages task execution across all hosts.
+        6. Cleans up resources on shutdown.
     """
 
     def __init__(self):
@@ -882,18 +929,29 @@ class SliceActor:
         """Execute a remote function on all hosts in this slice.
 
         Ensures all hosts are ready, then launches the function on each host
-        in parallel. The function runs with TPU resources reserved.
+        in parallel. The function runs with TPU resources reserved. This is
+        the primary method used by RayExecutor.execute_multislice to run
+        workloads across the slice.
 
         Args:
-            remote_fn: Ray remote function or callable to execute.
-            runtime_env: Optional Ray runtime environment configuration.
-            env: Optional environment variables to set.
+            remote_fn: Ray remote function or callable to execute. Will be
+                executed once per host in the slice.
+            runtime_env: Optional Ray runtime environment configuration for
+                dependencies and environment setup.
+            env: Optional environment variables to set on all hosts.
 
         Returns:
-            List of Ray ObjectRefs for each host's execution.
+            List[ray.ObjectRef]: One ObjectRef per host in the slice,
+                ordered by host_id. Results can be retrieved with ray.get().
 
         Raises:
             RuntimeError: If slice info is not initialized.
+
+        Note:
+            - Automatically ensures host pool is at full capacity.
+            - Each host runs the function with proper TPU resource allocation.
+            - Functions run in parallel across all hosts.
+            - Environment variables include TPU_HOST_ID and TPU_SLICE_NAME.
         """
         if not self._slice_info:
             raise RuntimeError("Slice info not initialized")
@@ -923,16 +981,26 @@ class SliceActor:
 
 
 class SlicePoolManager(ResourcePoolManager[SliceInfo]):
-    """Manager for multiple TPU slices.
+    """Manager for multiple TPU slices in multi-slice configurations.
 
     Coordinates multiple SliceActors to manage multi-slice TPU configurations.
     Handles scaling, health monitoring, and distributed task execution across
-    multiple TPU slices.
+    multiple TPU slices. This is the top-level manager used by RayExecutor
+    for multi-slice workloads.
 
     Attributes:
-        _tpu_type: Type of TPU (e.g., "v4-8").
-        _last_scale_ts: Timestamp of last scaling operation.
+        _tpu_type: Type of TPU (e.g., "v4-8", "v5e-16").
+        _last_scale_ts: Timestamp of last scaling operation for rate limiting.
         _last_scale_check_ts: Timestamp of last scale check.
+        _actor_pool: List of SliceActor pool members.
+
+    Hierarchy:
+        SlicePoolManager -> SliceActors -> DeviceHostActors -> Tasks
+
+    Resource Requirements:
+        - Each SliceActor requires a TPU-{type}-head resource.
+        - Each slice requires placement group bundles for host distribution.
+        - Automatically requests resources from Ray autoscaler.
     """
 
     def __init__(self, tpu_type: str | None):
@@ -982,14 +1050,27 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         """Scale the pool to the desired number of slices.
 
         Supports flexible scaling with multiple valid sizes. Will scale
-        to the largest feasible size from the provided options.
+        to the largest feasible size from the provided options. This method
+        is typically called by RayExecutor.execute_multislice to set up
+        the required number of slices.
 
         Args:
             num_slices: Target number of slices or list of valid sizes.
+                If int: exact number of slices required.
+                If sequence: will try largest first, falling back to smaller.
 
         Raises:
-            ValueError: If target is invalid or empty.
-            RuntimeError: If requested sizes cannot be achieved.
+            ValueError: If target is invalid or empty list provided.
+            InsufficientSlicesError: If none of the requested sizes can be achieved.
+
+        Example:
+            >>> manager.scale_multislice(4)  # Exactly 4 slices
+            >>> manager.scale_multislice([2, 4, 8])  # Try 8, fall back to 4 or 2
+
+        Note:
+            - Requests TPU head resources from Ray autoscaler.
+            - Removes unhealthy actors before scaling.
+            - Falls back to smaller sizes if larger ones unavailable.
         """
         self._last_scale_ts = time.time()
 
@@ -1012,14 +1093,25 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         if current not in valid:
             feasible = [v for v in valid if v <= current]
             if not feasible:
-                raise RuntimeError(f"Requested one of {valid}, but only {current} slices available")
+                raise InsufficientSlicesError(f"Requested one of {valid}, but only {current} slices available")
             self._scale_actor_pool(feasible[-1])
 
     def prepare_all_slices(self) -> None:
         """Prepare all slices by ensuring host placement groups.
 
         Pre-requests resources for all slices and prepares their host
-        placement groups for distributed execution.
+        placement groups for distributed execution. This ensures that
+        all nodes are ready before task execution begins.
+
+        This method:
+        1. Fetches slice information from all SliceActors.
+        2. Requests host resources for each slice from autoscaler.
+        3. Creates placement groups with STRICT_SPREAD strategy.
+        4. Ensures all hosts are discovered and ready.
+
+        Note:
+            Called automatically by execute_multislice before running tasks.
+            Essential for proper multi-host coordination within each slice.
         """
 
         slice_infos: list[SliceInfo] = ray.get([member.actor.get_info.remote() for member in self._actor_pool])
@@ -1131,3 +1223,92 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             [m.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for m in self._actor_pool]
         )
         return [f for sl in per_slice_futures for f in sl]
+
+    def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
+        """Add new SliceActors to the pool with timeout and retry logic.
+
+        Creates and starts SliceActors asynchronously, waiting for them to
+        initialize with configurable timeout. Implements a polling strategy
+        that periodically nudges the Ray autoscaler to provision resources.
+
+        This method differs from the base class implementation by:
+        - Creating all actors immediately (non-blocking)
+        - Polling with timeout instead of blocking wait
+        - Periodically requesting resources from autoscaler
+        - Processing actors as they become ready
+
+        Args:
+            desired_num_actors: Target number of SliceActors in the pool.
+
+        Behavior:
+            1. Creates actor handles immediately (scheduling is deferred)
+            2. Polls every SCALE_POLL_S seconds for actors to start
+            3. Nudges autoscaler each poll to request TPU head resources
+            4. Processes actors as they complete initialization
+            5. Kills actors that don't start within SCALE_ADD_TIMEOUT_S
+
+        Environment Variables:
+            EFORMER_SCALE_POLL_S: Poll interval in seconds (default: 30)
+            EFORMER_SCALE_ADD_TIMEOUT_S: Total timeout in seconds (default: 604800/7 days)
+
+        Note:
+            - Actors are added to pool as soon as they're ready
+            - Partial success is supported (some actors may start)
+            - Unstarted actors are killed after timeout
+            - Progress is logged throughout the scaling process
+        """
+        current = len(self._actor_pool)
+        if current >= desired_num_actors:
+            return
+        num_to_add = desired_num_actors - current
+        logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
+
+        pairs = []
+        for _ in range(num_to_add):
+            a = self.create_actor()
+            r = a.get_info.remote()
+            pairs.append((a, r))
+
+        deadline = time.time() + SCALE_ADD_TIMEOUT_S
+        started = 0
+        while pairs and time.time() < deadline:
+            remaining = len(pairs)
+            head_bundles = [{"CPU": 0, f"TPU-{self._tpu_type}-head": 1} for _ in range(remaining)]
+            try:
+                request_resources(bundles=head_bundles)
+            except Exception:
+                pass
+
+            done, _ = ray.wait([r for _, r in pairs], num_returns=1, timeout=SCALE_POLL_S)
+            if not done:
+                continue
+            newly_started = []
+            remaining_pairs = []
+            for actor, info_ref in pairs:
+                if info_ref in done:
+                    try:
+                        info = ray.get(info_ref, timeout=0)
+                        self._actor_pool.append(ActorPoolMember(actor, info))
+                        newly_started.append(info)
+                    except Exception as e:
+                        logger.warning(f"SliceActor failed to start: {e}; killing actor")
+                        try:
+                            ray.kill(actor)
+                        except Exception:
+                            pass
+                else:
+                    remaining_pairs.append((actor, info_ref))
+            pairs = remaining_pairs
+            started += len(newly_started)
+            if newly_started:
+                for info in newly_started:
+                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
+                logger.info(f"Started {started}/{num_to_add} slice actors so far")
+
+        if pairs:
+            for actor, _ in pairs:
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
+            logger.info(f"Started {started}/{num_to_add} slice actors (timed out for the rest)")

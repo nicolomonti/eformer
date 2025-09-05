@@ -695,3 +695,23 @@ class SliceInfo:
     num_accelerators_per_host: int
     node_ids: list[str] | None = None
     host_infos: list[dict] | None = None
+
+
+@dataclass(frozen=True)
+class HostInfo:
+    """Information about a TPU host within a slice.
+
+    Attributes:
+        host_id: Unique identifier for the host within its slice.
+        slice_name: Name of the TPU slice this host belongs to.
+        num_devices: Number of TPU devices available on this host.
+        healthy: Whether the host is currently healthy and operational.
+        failed: Whether the host has encountered a failure.
+    """
+
+    host_id: int
+    slice_name: str
+    num_devices: int | None
+    healthy: bool
+    failed: bool
+    node_id: str | None = None

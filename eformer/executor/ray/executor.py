@@ -79,12 +79,13 @@ Functions:
 import functools
 import logging
 import os
+import time
 
 import ray
 from ray.exceptions import RayError
 from ray.remote_function import RemoteFunction
 
-from .pool_manager import SlicePoolManager
+from .pool_manager import InsufficientSlicesError, SlicePoolManager
 from .resource_manager import (
     AcceleratorConfigType,
     RayResources,
@@ -225,7 +226,7 @@ class RayExecutor:
             default_name = f"TPU-{accelerator_config.tpu_version}-head"
             resources = {accelerator_config.head_name or default_name: accelerator_config.head_workers}
             do_run = ray.remote(resources=resources)(do_run)
-        return do_run.remote(remote_fn, accelerator_config, kwargs)
+        return ray.get(do_run.remote(remote_fn, accelerator_config, kwargs))
 
     @staticmethod
     def execute_multislice(
@@ -247,22 +248,37 @@ class RayExecutor:
             accelerator_config (AcceleratorConfigType): Configuration for
                 accelerator resources, must include multi-slice details
                 (pod_count > 1).
+            flatten (bool): If True (default), returns a flat list of results
+                from all hosts across all slices. If False, returns nested
+                lists where outer list represents slices and inner lists
+                contain results from hosts within each slice.
             **kwargs: Additional keyword arguments passed to the remote
                 function on each slice.
 
         Returns:
             JobStatus: A single JobStatus object containing results from all slices.
-                JobSucceeded contains a list of all results if successful.
-                JobFailed or JobPreempted if any error occurs.
+                - JobSucceeded: Contains results list (flat or nested based on flatten)
+                - JobFailed: Contains the exception that caused the failure
+                - JobPreempted: Contains preemption error details
+                - JobError: Contains unexpected error information
 
         Raises:
+            InsufficientSlicesError: If requested number of slices cannot be allocated.
             RayError: If slice actor creation fails, coordinator IP cannot
                 be determined, or remote function calls fail.
+            RuntimeError: If no SliceActors available after scaling or
+                coordinator IP cannot be determined.
 
         Note:
-            The method automatically sets up MegaScale environment variables
-            for multi-slice coordination including coordinator address, slice IDs,
-            and port configuration.
+            - The method automatically sets up MegaScale environment variables
+              for multi-slice coordination including coordinator address, slice IDs,
+              and port configuration.
+            - Each slice gets its own SliceActor which manages multiple DeviceHostActors.
+            - The pool manager is automatically drained after execution completes
+              or if an error occurs.
+            - Environment variables set include: MEGASCALE_COORDINATOR_ADDRESS,
+              MEGASCALE_NUM_SLICES, MEGASCALE_PORT, MEGASCALE_SLICE_ID,
+              TPU_SLICE_NAME, and more.
 
         Example:
             >>> @ray.remote
@@ -271,88 +287,117 @@ class RayExecutor:
             ...     return model_weights
             >>>
             >>> tpu_config = TpuAcceleratorConfig(type="v4-32", pod_count=4)
+            >>>
+            >>> # Get flat list of results (default)
             >>> job_status = RayExecutor.execute_multislice(
             ...     train_on_slice,
             ...     tpu_config,
             ...     data=training_data
             ... )
-            >>> # job_status is a single JobStatus object
             >>> if isinstance(job_status, JobSucceeded):
-            ...     results = job_status.result  # List of results from all slices
+            ...     flat_results = job_status.result  # Flat list from all hosts
+            >>>
+            >>> # Get nested results by slice
+            >>> job_status = RayExecutor.execute_multislice(
+            ...     train_on_slice,
+            ...     tpu_config,
+            ...     flatten=False,
+            ...     data=training_data
+            ... )
+            >>> if isinstance(job_status, JobSucceeded):
+            ...     results_by_slice = job_status.result  # List of lists
         """
         pool_manager = SlicePoolManager(tpu_type=accelerator_config.tpu_version)
-        pool_manager.scale_multislice(accelerator_config.pod_count)
-
-        pool_manager.prepare_all_slices()
-        members = pool_manager.get_all_pool_members()
-        if not members:
-            raise RuntimeError("No SliceActors available after scaling.")
-        ray.get([m.actor.ensure_host_pool.remote() for m in members])
-
-        slice_infos = ray.get([m.actor.get_info.remote() for m in members])
-        coord_ip = slice_infos[0].ip_address
-        if not coord_ip:
-            raise RuntimeError("Could not determine coordinator IP.")
-        port = int(os.getenv("COORD_PORT", 8192))
-
-        base_env = dict(
-            TPU_NAME=os.getenv("TPU_NAME", "EMPTY"),
-            TPU_VERSION=accelerator_config.tpu_version,
-            TPU_ZONE=os.getenv("TPU_ZONE", "EMPTY"),
-            TPU_POD_COUNT=str(len(members)),
-        )
-        if accelerator_config.execution_env:
-            base_env.update({str(k): str(v) for k, v in accelerator_config.execution_env.items() if v is not None})
-
-        per_slice_futures: list[list[ray.ObjectRef]] = []
-
-        for slice_id, member in enumerate(members):
-            if len(members) > 1:
-                env_for_slice = dict(
-                    **base_env,
-                    MEGASCALE_COORDINATOR_ADDRESS=f"{coord_ip}:{port}",
-                    MEGASCALE_NUM_SLICES=str(len(members)),
-                    MEGASCALE_PORT=str(port),
-                    MEGASCALE_SLICE_ID=str(slice_id),
-                    EXECUTOR_CALL_INDEX="0",
-                    EXECUTOR_CALL_SLICE=str(slice_id),
-                    TPU_SLICE_NAME=slice_infos[slice_id].slice_name,
-                )
-            else:
-                env_for_slice = base_env
-            env_for_slice = {str(k): str(v) for k, v in env_for_slice.items()}
-            host_handles: list[ray.actor.ActorHandle] = ray.get(member.actor.get_all_actors_in_pool.remote())
-            host_futures = [
-                h.run_remote_fn.remote(
-                    remote_fn,
-                    runtime_env=accelerator_config.execution_env,
-                    env=env_for_slice,
-                )
-                for h in host_handles
-            ]
-            per_slice_futures.append(host_futures)
-
-        all_futures = [f for sub in per_slice_futures for f in sub] if flatten else per_slice_futures
-
-        info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+        per_slice_futures = None
 
         try:
-            results = ray.get(ray.get(all_futures))
-            return JobSucceeded(info, results)
-        except RayError as e:
+            pool_manager.scale_multislice(accelerator_config.pod_count)
+            pool_manager.prepare_all_slices()
+
+            members = pool_manager.get_all_pool_members()
+            if not members:
+                raise RuntimeError("No SliceActors available after scaling.")
+            ray.get([m.actor.ensure_host_pool.remote() for m in members])
+
+            slice_infos = ray.get([m.actor.get_info.remote() for m in members])
+            coord_ip = slice_infos[0].ip_address
+            if not coord_ip:
+                raise RuntimeError("Could not determine coordinator IP.")
+            port = int(os.getenv("COORD_PORT", str(MEGASCALE_DEFAULT_PORT)))
+            base_env = dict(
+                TPU_NAME=os.getenv("TPU_NAME", "EMPTY"),
+                TPU_VERSION=accelerator_config.tpu_version,
+                TPU_ZONE=os.getenv("TPU_ZONE", "EMPTY"),
+                TPU_POD_COUNT=str(len(members)),
+            )
+            if accelerator_config.execution_env:
+                base_env.update({str(k): str(v) for k, v in accelerator_config.execution_env.items() if v is not None})
+
+            per_slice_futures = []
+            for slice_id, member in enumerate(members):
+                if len(members) > 1:
+                    env_for_slice = dict(
+                        **base_env,
+                        MEGASCALE_COORDINATOR_ADDRESS=f"{coord_ip}:{port}",
+                        MEGASCALE_NUM_SLICES=str(len(members)),
+                        MEGASCALE_PORT=str(port),
+                        MEGASCALE_SLICE_ID=str(slice_id),
+                        EXECUTOR_CALL_INDEX="0",
+                        EXECUTOR_CALL_SLICE=str(slice_id),
+                        TPU_SLICE_NAME=slice_infos[slice_id].slice_name,
+                    )
+                else:
+                    env_for_slice = base_env
+                env_for_slice = {str(k): str(v) for k, v in env_for_slice.items()}
+
+                host_handles = ray.get(member.actor.get_all_actors_in_pool.remote())
+                host_futures = [
+                    h.run_remote_fn.remote(
+                        remote_fn,
+                        runtime_env=accelerator_config.execution_env,
+                        env=env_for_slice,
+                    )
+                    for h in host_handles
+                ]
+                per_slice_futures.append(host_futures)
+
+            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+
             if flatten:
-                RayResources.cancel_all_futures(all_futures)
+                outer_refs = [f for sub in per_slice_futures for f in sub]
+                inner_refs = ray.get(outer_refs)
+                results = ray.get(inner_refs)
             else:
-                for slice_futures in all_futures:
-                    RayResources.cancel_all_futures(slice_futures)
+                inner_by_slice = [ray.get(lst) for lst in per_slice_futures]
+                results = [ray.get(lst) for lst in inner_by_slice]
+
+            return JobSucceeded(info, results)
+
+        except InsufficientSlicesError as e:
+            raise e
+        except RayError as e:
+            if per_slice_futures:
+                try:
+                    for lst in per_slice_futures:
+                        RayResources.cancel_all_futures(lst)
+                except Exception:
+                    pass
+            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
             return handle_ray_error(info, e)
         except Exception as e:
-            if flatten:
-                RayResources.cancel_all_futures(all_futures)
-            else:
-                for slice_futures in all_futures:
-                    RayResources.cancel_all_futures(slice_futures)
+            if per_slice_futures:
+                try:
+                    for lst in per_slice_futures:
+                        RayResources.cancel_all_futures(lst)
+                except Exception:
+                    pass
+            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
             return JobFailed(info, e)
+        finally:
+            try:
+                pool_manager.drain_actor_pool()
+            except Exception:
+                pass
 
     @classmethod
     def execute_resumable(
@@ -424,13 +469,7 @@ class RayExecutor:
             attempt += 1
             problem = None
             try:
-                out = ray.get(
-                    cls.execute(
-                        remote_fn=remote_fn,
-                        accelerator_config=accelerator_config,
-                        **kwargs,
-                    )
-                )
+                out = cls.execute(remote_fn=remote_fn, accelerator_config=accelerator_config, **kwargs)
             except ray.exceptions.RayTaskError as e:
                 problem = e
                 if "preempted" in str(e).lower():
@@ -598,7 +637,15 @@ class RayExecutor:
                         exc_info=e,
                     )
                 continue
-
+            except InsufficientSlicesError as e:
+                problem = e
+                num_preemptions += 1
+                logger.warning(
+                    f"Not enough TPU slices (likely preemption/capacity). "
+                    f"Preemption count: {num_preemptions}. Error: {e}"
+                )
+                time.sleep(int(os.getenv("EFORMER_SCALE_RETRY_SLEEP_S", "60")))
+                continue
             except Exception as e:
                 problem = e
                 num_failures += 1
