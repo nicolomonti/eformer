@@ -5,7 +5,9 @@ Serialization
    :maxdepth: 2
 
    serialization___init__
-   serialization_checkpoint_manager
-   serialization_host_checkpoint_manager
-   serialization_loader
+   serialization_async_manager
+   serialization_base_manager
+   serialization_fsspec_utils
+   serialization_serialization
+   serialization_sharding_utils
    serialization_utils

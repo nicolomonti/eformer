@@ -86,11 +86,7 @@ from ray.exceptions import RayError
 from ray.remote_function import RemoteFunction
 
 from .pool_manager import InsufficientSlicesError, SlicePoolManager
-from .resource_manager import (
-    AcceleratorConfigType,
-    RayResources,
-    TpuAcceleratorConfig,
-)
+from .resource_manager import AcceleratorConfigType, RayResources, TpuAcceleratorConfig
 from .types import (
     JobError,
     JobFailed,
@@ -156,8 +152,7 @@ class RayExecutor:
             **kwargs: Additional keyword arguments passed to the remote function.
 
         Returns:
-            ray.ObjectRef: A Ray future representing the result of execution.
-                Call ray.get() on this to retrieve the actual result.
+            ray.JobStatus: actual result.
 
         Raises:
             AssertionError: If pod_count in accelerator_config is not 1,
@@ -169,8 +164,7 @@ class RayExecutor:
             ...     return x * 2
             >>>
             >>> config = GpuAcceleratorConfig(count=1, type="v100")
-            >>> future = RayExecutor.execute(compute, config, x=10)
-            >>> result = ray.get(future)  # Returns JobStatus object
+            >>> result = RayExecutor.execute(compute, config, x=10) # Returns JobStatus object
         """
         assert getattr(accelerator_config, "pod_count", 1) == 1, (
             "Multi-slice workloads on TPUs should use 'execute_multislice'."
@@ -310,6 +304,8 @@ class RayExecutor:
         pool_manager = SlicePoolManager(tpu_type=accelerator_config.tpu_version)
         per_slice_futures = None
 
+        info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+
         try:
             pool_manager.scale_multislice(accelerator_config.pod_count)
             pool_manager.prepare_all_slices()
@@ -361,11 +357,12 @@ class RayExecutor:
                 ]
                 per_slice_futures.append(host_futures)
 
-            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
-
             if flatten:
                 outer_refs = [f for sub in per_slice_futures for f in sub]
                 inner_refs = ray.get(outer_refs)
+                pending = list(inner_refs)
+                while pending:
+                    _, pending = ray.wait(pending, num_returns=1, timeout=10.0)
                 results = ray.get(inner_refs)
             else:
                 inner_by_slice = [ray.get(lst) for lst in per_slice_futures]
@@ -382,7 +379,11 @@ class RayExecutor:
                         RayResources.cancel_all_futures(lst)
                 except Exception:
                     pass
-            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+
+            s = str(e).lower()
+            if ("preempt" in s) or ("unhealthy or preempted" in s) or ("owner died" in s) or ("owner has exited" in s):
+                return JobPreempted(info, e)
+
             return handle_ray_error(info, e)
         except Exception as e:
             if per_slice_futures:
@@ -796,12 +797,10 @@ def execute(accelerator_config: AcceleratorConfigType):
     def decorator(remote_fn: RemoteFunction):
         @functools.wraps(remote_fn)
         def wrapper(**kwargs):
-            return ray.get(
-                RayExecutor.execute(
-                    remote_fn=remote_fn,
-                    accelerator_config=accelerator_config,
-                    **kwargs,
-                )
+            return RayExecutor.execute(
+                remote_fn=remote_fn,
+                accelerator_config=accelerator_config,
+                **kwargs,
             )
 
         return wrapper

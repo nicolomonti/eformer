@@ -397,10 +397,7 @@ def tree_deserialize_leaves(
                 {k.replace(".", "/"): i for i, k in enumerate(keys)},
                 strict=False,
             )
-            partition_rules = [
-                NamedSharding(mesh=mesh, spec=partition_rules[k.replace(".", "/")])
-                for k in keys
-            ]
+            partition_rules = [NamedSharding(mesh=mesh, spec=partition_rules[k.replace(".", "/")]) for k in keys]
             apply_tree_shardings = partition_rules
         if paths_to_load:
             deser_leaves = manager.deserialize_with_paths(shardings=apply_tree_shardings, paths=paths_to_load)

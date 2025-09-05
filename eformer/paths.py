@@ -532,7 +532,9 @@ class GCSPath(UniversalPath):
                 remaining_patterns = patterns[1:]
 
                 if current_prefix not in paths_cache:
-                    paths_cache[current_prefix] = list(GCSPath(f"gs://{self.bucket_name}/{current_prefix}", self.client).iterdir())
+                    paths_cache[current_prefix] = list(
+                        GCSPath(f"gs://{self.bucket_name}/{current_prefix}", self.client).iterdir()
+                    )
                 paths = paths_cache[current_prefix]
 
                 for path in paths:

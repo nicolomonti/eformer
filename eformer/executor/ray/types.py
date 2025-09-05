@@ -59,7 +59,10 @@ from dataclasses import dataclass
 import ray
 import tblib
 from ray.exceptions import (
+    ActorDiedError,
+    ActorUnavailableError,
     NodeDiedError,
+    OwnerDiedError,
     RayError,
     RaySystemError,
     RayTaskError,
@@ -94,20 +97,14 @@ def handle_ray_error(job_info: JobInfo, e: RayError) -> JobStatus:
         ...     status = handle_ray_error(job_info, e)
         ...     assert isinstance(status, JobPreempted)
     """
-    if isinstance(e, NodeDiedError):
-        logger.exception("Node died", exc_info=e)
-        return JobPreempted(job_info, e)
-    elif isinstance(e, ray.exceptions.ActorUnavailableError | ray.exceptions.ActorDiedError):
-        logger.exception("Actor died", exc_info=e)
-        return JobPreempted(job_info, e)
-    elif isinstance(e, WorkerCrashedError):
-        logger.exception("Worker crashed", exc_info=e)
+    if isinstance(e, (NodeDiedError, OwnerDiedError, ActorDiedError, ActorUnavailableError, WorkerCrashedError)):  # noqa
+        logger.exception("Infra/preemption-related error", exc_info=e)
         return JobPreempted(job_info, e)
     elif isinstance(e, RaySystemError):
         logger.exception("System error", exc_info=e)
         return JobError(job_info, e)
     elif isinstance(e, RayTaskError):
-        logger.exception(f"Task error {e}", exc_info=e)
+        logger.exception("Task error", exc_info=e)
         return JobError(job_info, e)
     else:
         logger.exception("Unknown error", exc_info=e)

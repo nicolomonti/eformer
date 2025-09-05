@@ -50,7 +50,6 @@ import ray
 import requests
 from ray.actor import ActorHandle
 from ray.autoscaler.sdk import request_resources
-from ray.exceptions import ActorDiedError, ActorUnavailableError, GetTimeoutError
 from ray.remote_function import RemoteFunction as _RF
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
@@ -171,18 +170,42 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         Performs health checks on all actors and removes those that are
         unresponsive, dead, or unhealthy. Attempts to kill removed actors.
         """
+        if not self._actor_pool:
+            return
+
+        ref_map = {m: m.actor.healthy.remote() for m in self._actor_pool}
+        refs = list(ref_map.values())
+
+        done, pending = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
+
+        done_set = set(done)
         healthy: list[ActorPoolMember[ActorInfoT]] = []
-        for member in self._actor_pool:
-            try:
-                ray.get(member.actor.healthy.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
-                healthy.append(member)
-            except (ActorDiedError, ActorUnavailableError, GetTimeoutError) as e:
-                name = self.get_actor_name_from_actor_info(member.actor_info)
-                logger.warning(f"Removing unhealthy actor {name}: {e}")
+
+        for member, ref in ref_map.items():
+            name = self.get_actor_name_from_actor_info(member.actor_info)
+            if ref in done_set:
+                try:
+                    if ray.get(ref, timeout=0):
+                        healthy.append(member)
+                    else:
+                        logger.warning(f"Actor {name} reported unhealthy; killing")
+                        try:
+                            ray.kill(member.actor)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Actor {name} health check exception ({e}); killing")
+                    try:
+                        ray.kill(member.actor)
+                    except Exception:
+                        pass
+            else:
+                logger.warning(f"Actor {name} health timeout; killing")
                 try:
                     ray.kill(member.actor)
                 except Exception:
                     pass
+
         self._actor_pool = healthy
 
     def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
@@ -263,17 +286,29 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         Attempts graceful shutdown first, then forcefully kills actors.
         Clears the actor pool after draining.
         """
+        if not self._actor_pool:
+            return
+
+        shutdown_refs = []
+        for member in self._actor_pool:
+            try:
+                shutdown_refs.append(member.actor.shutdown.remote())
+            except Exception:
+                pass
+
+        try:
+            ray.wait(shutdown_refs, num_returns=len(shutdown_refs), timeout=5.0)
+        except Exception:
+            pass
+
         for member in self._actor_pool:
             name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
-                try:
-                    ray.get(member.actor.shutdown.remote(), timeout=5)
-                except Exception:
-                    pass
                 ray.kill(member.actor)
                 logger.info(f"Killed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
+
         self._actor_pool = []
 
 
@@ -480,12 +515,13 @@ class DeviceHostActor:
             host_env["TPU_NUM_DEVICES"] = str(self.num_devices)
         merged_runtime_env = self._merge_runtime_env(runtime_env, {**host_env, **(env or {})})
         resources = dict(extra_resources or {})
+
         if self.num_devices:
             resources["TPU"] = self.num_devices
 
         self._awaitable = remote_fn.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(self._node_id, soft=False),
-            resources=resources,
+            resources=resources or None,
             num_cpus=num_cpus,
             num_gpus=0,
             memory=memory_bytes,
@@ -829,18 +865,42 @@ class SliceActor:
         Performs health checks on all actors and removes those that are
         unresponsive, dead, or unhealthy. Attempts to kill removed actors.
         """
-        healthy: list[ActorPoolMember[HostInfo]] = []
-        for member in self._actor_pool:
-            try:
-                ray.get(member.actor.healthy.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
-                healthy.append(member)
-            except (ActorDiedError, ActorUnavailableError, GetTimeoutError) as e:
-                name = self.get_actor_name_from_actor_info(member.actor_info)
-                logger.warning(f"Removing unhealthy actor {name}: {e}")
+        if not self._actor_pool:
+            return
+
+        ref_map = {m: m.actor.healthy.remote() for m in self._actor_pool}
+        refs = list(ref_map.values())
+
+        done, pending = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
+
+        done_set = set(done)
+        healthy: list[ActorPoolMember[ActorInfoT]] = []
+
+        for member, ref in ref_map.items():
+            name = self.get_actor_name_from_actor_info(member.actor_info)
+            if ref in done_set:
+                try:
+                    if ray.get(ref, timeout=0):
+                        healthy.append(member)
+                    else:
+                        logger.warning(f"Actor {name} reported unhealthy; killing")
+                        try:
+                            ray.kill(member.actor)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Actor {name} health check exception ({e}); killing")
+                    try:
+                        ray.kill(member.actor)
+                    except Exception:
+                        pass
+            else:
+                logger.warning(f"Actor {name} health timeout; killing")
                 try:
                     ray.kill(member.actor)
                 except Exception:
                     pass
+
         self._actor_pool = healthy
 
     def _add_members_to_actor_pool(self, desired_num_actors: int) -> None:
@@ -853,23 +913,42 @@ class SliceActor:
             desired_num_actors: Target number of actors in the pool.
         """
         current = len(self._actor_pool)
+
         if current >= desired_num_actors:
             return
-        num_to_add = desired_num_actors - current
+        to_add = desired_num_actors - current
         logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
 
-        for host_id in range(current, current + num_to_add):
+        info_ref_to_actor: dict[ray.ObjectRef, ActorHandle] = {}
+        for host_id in range(current, current + to_add):
             actor = self._create_actor_for_host_id(host_id)
-            try:
-                info = ray.get(actor.get_info.remote(), timeout=HEALTH_CHECK_TIMEOUT_S)
-                self._actor_pool.append(ActorPoolMember(actor, info))
-                logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
-            except Exception as e:
-                logger.error(f"Failed to start actor for host_id={host_id}: {e}")
+            info_ref = actor.get_info.remote()
+            info_ref_to_actor[info_ref] = actor
+
+        pending = list(info_ref_to_actor.keys())
+        started = 0
+        poll_s = 2.0
+        deadline = time.time() + HEALTH_CHECK_TIMEOUT_S
+
+        while pending and time.time() < deadline:
+            done, pending = ray.wait(pending, num_returns=len(pending), timeout=poll_s)
+            if not done:
+                continue
+            for info_ref in done:
+                actor = info_ref_to_actor.pop(info_ref, None)
+                if not actor:
+                    continue
                 try:
-                    ray.kill(actor)
-                except Exception:
-                    pass
+                    info = ray.get(info_ref, timeout=0)
+                    self._actor_pool.append(ActorPoolMember(actor, info))
+                    started += 1
+                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
+                except Exception as e:
+                    logger.error(f"Failed to start host actor: {e}")
+                    try:
+                        ray.kill(actor)
+                    except Exception:
+                        pass
 
     def _remove_members_from_actor_pool(self, desired_num_actors: int) -> None:
         """Remove actors to reach the desired pool size.
@@ -912,18 +991,39 @@ class SliceActor:
         Attempts graceful shutdown first, then forcefully kills actors.
         Clears the actor pool after draining.
         """
+        if not self._actor_pool:
+            return
+
+        shutdown_refs = []
+        for member in self._actor_pool:
+            try:
+                shutdown_refs.append(member.actor.shutdown.remote())
+            except Exception:
+                pass
+
+        try:
+            ray.wait(shutdown_refs, num_returns=len(shutdown_refs), timeout=5.0)
+        except Exception:
+            pass
+
         for member in self._actor_pool:
             name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
-                try:
-                    ray.get(member.actor.shutdown.remote(), timeout=5)
-                except Exception:
-                    pass
                 ray.kill(member.actor)
                 logger.info(f"Killed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
+
         self._actor_pool = []
+
+    def _await_all_hosts_healthy(self, timeout_s: int = 60, poll_s: float = 2.0) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            statuses = ray.get([m.actor.healthy.remote() for m in self._actor_pool])
+            if all(statuses):
+                return True
+            time.sleep(poll_s)
+        return False
 
     def run_remote_fn(self, remote_fn, runtime_env: dict | None = None, env: dict | None = None):
         """Execute a remote function on all hosts in this slice.
@@ -956,6 +1056,11 @@ class SliceActor:
         if not self._slice_info:
             raise RuntimeError("Slice info not initialized")
         self.ensure_host_pool(self._slice_info.num_hosts)
+
+        try:
+            self._await_all_hosts_healthy(timeout_s=int(os.getenv("EFORMER_HOST_HEALTH_WAIT_S", "60")))
+        except Exception:
+            pass
         futures = [
             member.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for member in self._actor_pool
         ]
@@ -1113,13 +1218,15 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             Called automatically by execute_multislice before running tasks.
             Essential for proper multi-host coordination within each slice.
         """
+        slice_infos: list[SliceInfo] = ray.get([m.actor.get_info.remote() for m in self._actor_pool])
+        all_bundles = []
 
-        slice_infos: list[SliceInfo] = ray.get([member.actor.get_info.remote() for member in self._actor_pool])
         for info in slice_infos:
-            host_bundles = [{"CPU": 0, info.slice_name: 1} for _ in range(info.num_hosts)]
-            request_resources(bundles=host_bundles)
+            all_bundles.extend([{"CPU": 0, info.slice_name: 1}] * info.num_hosts)
+        if all_bundles:
+            request_resources(bundles=all_bundles)
 
-        ray.get([member.actor.prepare_hosts.remote() for member in self._actor_pool])
+        ray.get([m.actor.prepare_hosts.remote() for m in self._actor_pool])
 
     def should_scale_up_multislice(self, valid_sizes: Sequence[int]) -> bool:
         """Check if pool should scale up to a larger size.
@@ -1196,12 +1303,12 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         """
         self.prepare_all_slices()
         ray.get([member.actor.ensure_host_pool.remote() for member in self._actor_pool])
-        return ray.get(
-            [
-                member.actor.execute_function.remote(fn, *args, use_host_actors=True, env=env, **kwargs)
-                for member in self._actor_pool
-            ]
-        )
+
+        @ray.remote(max_calls=1)
+        def _runner():
+            return fn(*args, **kwargs)
+
+        return ray.get([member.actor.run_remote_fn.remote(_runner, env=env) for member in self._actor_pool])
 
     def schedule_on_each_host(self, remote_fn, env: dict | None = None, runtime_env: dict | None = None):
         """Schedule a function on all hosts without waiting for results.
@@ -1263,52 +1370,52 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         num_to_add = desired_num_actors - current
         logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
 
-        pairs = []
+        info_ref_to_actor: dict[ray.ObjectRef, ActorHandle] = {}
         for _ in range(num_to_add):
-            a = self.create_actor()
-            r = a.get_info.remote()
-            pairs.append((a, r))
+            actor = self.create_actor()
+            info_ref = actor.get_info.remote()
+            info_ref_to_actor[info_ref] = actor
 
+        pending = list(info_ref_to_actor.keys())
         deadline = time.time() + SCALE_ADD_TIMEOUT_S
         started = 0
-        while pairs and time.time() < deadline:
-            remaining = len(pairs)
+
+        while pending and time.time() < deadline:
+            remaining = len(pending)
             head_bundles = [{"CPU": 0, f"TPU-{self._tpu_type}-head": 1} for _ in range(remaining)]
             try:
                 request_resources(bundles=head_bundles)
             except Exception:
                 pass
 
-            done, _ = ray.wait([r for _, r in pairs], num_returns=1, timeout=SCALE_POLL_S)
+            done, pending = ray.wait(pending, num_returns=len(pending), timeout=SCALE_POLL_S)
             if not done:
                 continue
-            newly_started = []
-            remaining_pairs = []
-            for actor, info_ref in pairs:
-                if info_ref in done:
-                    try:
-                        info = ray.get(info_ref, timeout=0)
-                        self._actor_pool.append(ActorPoolMember(actor, info))
-                        newly_started.append(info)
-                    except Exception as e:
-                        logger.warning(f"SliceActor failed to start: {e}; killing actor")
-                        try:
-                            ray.kill(actor)
-                        except Exception:
-                            pass
-                else:
-                    remaining_pairs.append((actor, info_ref))
-            pairs = remaining_pairs
-            started += len(newly_started)
-            if newly_started:
-                for info in newly_started:
-                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
-                logger.info(f"Started {started}/{num_to_add} slice actors so far")
 
-        if pairs:
-            for actor, _ in pairs:
+            for info_ref in done:
+                actor = info_ref_to_actor.pop(info_ref, None)
+                if actor is None:
+                    continue
                 try:
-                    ray.kill(actor)
-                except Exception:
-                    pass
+                    info = ray.get(info_ref, timeout=0)
+                    self._actor_pool.append(ActorPoolMember(actor, info))
+                    started += 1
+                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
+                except Exception as e:
+                    logger.warning(f"SliceActor failed to start: {e}; killing actor")
+                    try:
+                        ray.kill(actor)
+                    except Exception:
+                        pass
+
+            logger.info(f"Started {started}/{num_to_add} slice actors so far")
+
+        if pending:
+            for info_ref in pending:
+                actor = info_ref_to_actor.get(info_ref)
+                if actor is not None:
+                    try:
+                        ray.kill(actor)
+                    except Exception:
+                        pass
             logger.info(f"Started {started}/{num_to_add} slice actors (timed out for the rest)")
