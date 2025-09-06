@@ -12,6 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""JAX mesh creation utilities for distributed computation.
+
+This module provides utilities for creating and managing JAX meshes for distributed
+computation across multiple devices. It supports various parallelism strategies including:
+
+- Data Parallelism (dp): Replicates model across devices, splits data
+- Fully Sharded Data Parallelism (fsdp): Shards both model and data across devices
+- Expert Parallelism (ep): For mixture-of-experts models
+- Tensor Parallelism (tp): Splits individual tensors across devices
+- Sequence Parallelism (sp): Splits sequence dimension across devices
+
+Key Features:
+    - Automatic device mesh creation for single/multi-host setups
+    - Support for TPU slices and multi-process environments
+    - CPU-specific utilities for debugging and testing
+    - String-based mesh configuration parsing
+    - Caching for efficient mesh reuse
+
+Typical Usage:
+    >>> # Create a simple mesh with data and model parallelism
+    >>> mesh = create_mesh(
+    ...     axis_dims=(2, 4),
+    ...     axis_names=('data', 'model')
+    ... )
+    >>> with mesh:
+    ...     # Use mesh for sharded computation
+    ...     pass
+
+    >>> # Parse mesh from string configuration
+    >>> mesh = parse_mesh_from_string("dp:2,tp:4", ["dp", "tp"])
+
+    >>> # CPU-only execution for debugging
+    >>> with cpu_context() as mesh:
+    ...     # All operations run on CPU
+    ...     pass
+"""
+
 import functools
 import os
 import typing as tp
@@ -51,15 +88,16 @@ def calculate_host_mesh_shape(
             the calculated host mesh doesn't use the correct number of devices.
 
     Example:
-        >>> # With 8 global devices across 2 processes (4 devices each)
+        >>>
         >>> calculate_host_mesh_shape((2, 4), total_devices=4, num_processes=2)
-        (1, 4)  # Each host gets half of the first dimension
+        (1, 4)
     """
     total_devices = total_devices or jax.local_device_count()
     num_processes = num_processes or jax.process_count()
-    total_mesh_size = np.prod(global_mesh_shape)
+    total_mesh_size = int(np.prod(global_mesh_shape))
     assert total_mesh_size == total_devices * num_processes, (
-        f"Mesh size {total_mesh_size} doesn't match available devices {total_devices * num_processes}"
+        f"Mesh size {total_mesh_size} doesn't match available devices "
+        f"{total_devices * num_processes} (local x processes)"
     )
     host_mesh = list(global_mesh_shape)
     remaining_process_split = num_processes
@@ -76,108 +114,204 @@ def calculate_host_mesh_shape(
             host_mesh[idx] = 1
             remaining_process_split = remaining_process_split // factor
         idx += 1
-    host_total = np.prod(host_mesh)
+    host_total = int(np.prod(host_mesh))
     assert host_total == total_devices, (
-        f"Host mesh shape {tuple(host_mesh)} uses {host_total} devices instead of {total_devices}"
+        f"Host mesh shape {tuple(host_mesh)} uses {host_total} devices instead of {total_devices}. "
+        "Ensure that num_processes factors the global mesh shape."
     )
 
     return tuple(host_mesh)
 
 
-@functools.lru_cache
 def _cached_mesh(
     axis_dims: tp.Sequence[int],
     axis_names: tp.Sequence[str],
     dcn_mesh_dims: tp.Sequence[int] | None = None,
-    process_is_granule: bool = False,
     should_sort_granules_by_key: bool = True,
     allow_split_physical_axes: bool = True,
     backend: str | None = None,
 ):
-    """Create and cache a mesh configuration for distributed computation.
+    """Wrapper that normalizes arguments and feeds the cached implementation.
 
-    Internal function that handles the complex logic of creating meshes for
-    various distributed setups including multi-slice environments and hybrid
-    device configurations. Results are cached for efficiency.
+    This function converts sequences to tuples for hashability and delegates
+    to the cached implementation. The caching ensures that identical mesh
+    configurations reuse the same mesh object, improving performance.
 
     Args:
-        axis_dims: Dimensions for each mesh axis.
-        axis_names: Names for each mesh axis (e.g., 'dp', 'tp', 'sp').
-        dcn_mesh_dims: Data center network mesh dimensions for hybrid setups.
-        process_is_granule: Whether to treat each process as a granule in
-            the mesh creation.
-        should_sort_granules_by_key: Whether to sort device granules by their
-            keys for consistent ordering.
-        allow_split_physical_axes: Whether to allow splitting physical device
-            axes in the mesh.
-        backend: JAX backend to use ('cpu', 'gpu', 'tpu'). If None, uses
-            the default backend.
+        axis_dims: Dimensions for each mesh axis
+        axis_names: Names for each mesh axis
+        dcn_mesh_dims: Data center network mesh dimensions
+        should_sort_granules_by_key: Whether to sort device granules
+        allow_split_physical_axes: Whether to allow splitting physical axes
+        backend: JAX backend to use
 
     Returns:
-        JAX Mesh object configured for the specified parameters.
-
-    Note:
-        This function handles three main scenarios:
-        1. Multi-slice environments (MEGASCALE_NUM_SLICES > 1)
-        2. Multi-process setups with slice indices
-        3. Single process or simple multi-device setups
+        Cached JAX Mesh object
     """
-    backend = backend or jax.default_backend()
-    num_devices = jax.device_count(backend)
-    num_local_devices = jax.local_device_count(backend)
-    if dcn_mesh_dims is None:
-        mesh_shape = np.arange(num_devices).reshape(axis_dims).shape
-    else:
-        mesh_shape = np.arange(num_local_devices).reshape(axis_dims).shape
-    num_slices = int(os.environ.get("MEGASCALE_NUM_SLICES", 1))
-    multi_slice_env = num_slices > 1
 
-    if multi_slice_env:
+    axis_dims_t = tuple(axis_dims)
+    axis_names_t = tuple(axis_names)
+    dcn_mesh_dims_t = None if dcn_mesh_dims is None else tuple(dcn_mesh_dims)
+    backend_s = backend or jax.default_backend()
+    return _cached_mesh_impl(
+        axis_dims=axis_dims_t,
+        axis_names=axis_names_t,
+        dcn_mesh_dims=dcn_mesh_dims_t,
+        should_sort_granules_by_key=should_sort_granules_by_key,
+        allow_split_physical_axes=allow_split_physical_axes,
+        backend=backend_s,
+    )
+
+
+@functools.cache
+def _cached_mesh_impl(
+    axis_dims: tuple[int, ...],
+    axis_names: tuple[str, ...],
+    dcn_mesh_dims: tuple[int, ...] | None = None,
+    should_sort_granules_by_key: bool = True,
+    allow_split_physical_axes: bool = True,
+    backend: str = "cpu",
+):
+    """Cached implementation of mesh creation logic.
+
+    This function handles three main scenarios:
+    1. Multi-slice environments (TPU pods): Creates per-slice meshes with
+       appropriate DCN configuration for inter-slice communication.
+    2. Multi-process environments: Distributes mesh across processes,
+       calculating DCN dimensions to map logical to physical topology.
+    3. Single-process environments: Creates a simple device mesh.
+
+    The function automatically detects the environment type and applies
+    the appropriate mesh creation strategy.
+
+    Args:
+        axis_dims: Tuple of dimensions for each mesh axis
+        axis_names: Tuple of names for each mesh axis
+        dcn_mesh_dims: Data center network dimensions for hybrid setups
+        should_sort_granules_by_key: Sort devices for consistency
+        allow_split_physical_axes: Allow splitting physical device axes
+        backend: Backend to use ('cpu', 'gpu', 'tpu')
+
+    Returns:
+        JAX Mesh configured for the detected environment
+
+    Raises:
+        ValueError: If mesh configuration is invalid for the environment
+    """
+    devices = jax.devices(backend)
+    total_devices = jax.device_count(backend)
+    local_devices = jax.local_device_count(backend)
+    process_count = jax.process_count()
+
+    num_slices = 1
+    if devices and hasattr(devices[0], "slice_index"):
+        try:
+            num_slices = len({d.slice_index for d in devices})
+        except Exception:
+            pass
+    if num_slices == 1:
+        num_slices = int(os.environ.get("MEGASCALE_NUM_SLICES", num_slices))
+
+    def fill_minus_one_to_target(shape: tuple[int, ...], target: int) -> tuple[int, ...]:
+        """Replace -1 in shape with value to match target product.
+
+        Allows using -1 as a placeholder in dcn_mesh_dims to automatically
+        calculate the appropriate dimension size.
+
+        Args:
+            shape: Shape tuple potentially containing one -1
+            target: Target product all dimensions should multiply to
+
+        Returns:
+            Shape tuple with -1 replaced by calculated value
+
+        Raises:
+            ValueError: If multiple -1s exist or product doesn't match target
+        """
+        shp = list(shape)
+        minus = [i for i, v in enumerate(shp) if v == -1]
+        if len(minus) > 1:
+            raise ValueError("Only one -1 is supported in dcn_mesh_dims.")
+        prod_known = 1
+        for v in shp:
+            if v != -1:
+                if v <= 0:
+                    raise ValueError(f"dcn_mesh_dims entries must be > 0 or -1, got {v}")
+                prod_known *= v
+        if minus:
+            if target % prod_known != 0:
+                raise ValueError(f"dcn_mesh_dims product ({prod_known}) does not divide target ({target}).")
+            shp[minus[0]] = target // prod_known
+        if np.prod(shp) != target:
+            raise ValueError(f"dcn_mesh_dims product {int(np.prod(shp))} must equal {target}; got {tuple(shp)}")
+        return tuple(int(v) for v in shp)
+
+    if num_slices > 1:
+        # Multi-slice configuration (typically TPU pods)
+        global_mesh_shape = np.arange(total_devices).reshape(axis_dims).shape
+
+        dynamic_axis = next((i for i, dim in enumerate(global_mesh_shape) if dim % num_slices == 0), None)
+        if dynamic_axis is None:
+            raise ValueError(
+                f"Multi-slice detected (num_slices={num_slices}) but no mesh axis in "
+                f"{global_mesh_shape} is divisible by num_slices."
+            )
+
+        per_slice_mesh_shape = list(global_mesh_shape)
+        per_slice_mesh_shape[dynamic_axis] //= num_slices
+        per_slice_mesh_shape = tuple(per_slice_mesh_shape)
+
         if dcn_mesh_dims is None:
-            dynamic_axis = None
-            for i, dim in enumerate(mesh_shape):
-                if dim % num_slices == 0:
-                    dynamic_axis = i
-                    break
-            if dynamic_axis is None:
-                raise ValueError("No axis in the mesh shape is divisible by num_slices")
-
-            per_slice_mesh_shape = list(mesh_shape)
-            per_slice_mesh_shape[dynamic_axis] //= num_slices
-            per_slice_mesh_shape = tuple(per_slice_mesh_shape)
-
-            dcn_mesh_dims = tuple(num_slices if i == dynamic_axis else 1 for i in range(len(mesh_shape)))
+            dcn_list = [1] * len(axis_dims)
+            dcn_list[dynamic_axis] = num_slices
+            dcn = tuple(dcn_list)
         else:
-            per_slice_mesh_shape = mesh_shape
+            dcn = fill_minus_one_to_target(dcn_mesh_dims, num_slices)
+
         ndarray = create_hybrid_device_mesh(
             mesh_shape=per_slice_mesh_shape,
-            dcn_mesh_shape=dcn_mesh_dims,
-            devices=jax.devices(backend),
+            dcn_mesh_shape=dcn,
+            devices=devices,
             allow_split_physical_axes=allow_split_physical_axes,
-            process_is_granule=process_is_granule,
+            process_is_granule=False,
             should_sort_granules_by_key=should_sort_granules_by_key,
         )
 
-    elif jax.process_count() > 1 and hasattr(jax.devices()[0], "slice_index"):
+    elif process_count > 1:
+        # Multi-process configuration
+        local_mesh_shape = np.arange(local_devices).reshape(axis_dims).shape
+
         if dcn_mesh_dims is None:
-            dcn_mesh_dims = calculate_host_mesh_shape(
-                mesh_shape,
-                jax.device_count(),
-                jax.process_count(),
-            )
+            global_mesh_shape = np.arange(total_devices).reshape(axis_dims).shape
+
+            ratios = [int(g // le) for g, le in zip(global_mesh_shape, local_mesh_shape, strict=False)]
+            if np.prod(ratios) != process_count:
+                ratios = [1] * len(axis_dims)
+                for i in range(len(axis_dims)):
+                    ratios[i] = process_count
+                    break
+            dcn = tuple(ratios)
+        else:
+            dcn = fill_minus_one_to_target(dcn_mesh_dims, process_count)
+
         ndarray = create_hybrid_device_mesh(
-            mesh_shape=mesh_shape,
-            dcn_mesh_shape=dcn_mesh_dims,
-            devices=jax.devices(backend),
+            mesh_shape=local_mesh_shape,
+            dcn_mesh_shape=dcn,
+            devices=devices,
             allow_split_physical_axes=allow_split_physical_axes,
-            process_is_granule=process_is_granule,
+            process_is_granule=True,
             should_sort_granules_by_key=should_sort_granules_by_key,
         )
+
     else:
+        # Single-process configuration
+        global_mesh_shape = np.arange(total_devices).reshape(axis_dims).shape
         ndarray = create_device_mesh(
-            mesh_shape=mesh_shape,
-            allow_split_physical_axes=True,
+            mesh_shape=global_mesh_shape,
+            devices=devices,
+            allow_split_physical_axes=allow_split_physical_axes,
         )
+
     return Mesh(ndarray, axis_names)
 
 
@@ -185,7 +319,6 @@ def create_mesh(
     axis_dims: tp.Sequence[int] = DEFAULT_SHARDING_STG,
     axis_names: tp.Sequence[str] = DEFAULT_NAMED_SHARDING_STG,
     dcn_mesh_dims: tp.Sequence[int] | None = None,
-    process_is_granule: bool = False,
     should_sort_granules_by_key: bool = True,
     allow_split_physical_axes: bool = True,
     backend: str | None = None,
@@ -216,12 +349,12 @@ def create_mesh(
         JAX Mesh object ready for use with pjit and sharding specifications.
 
     Example:
-        >>> # Create a simple 2D mesh for data and model parallelism
+        >>>
         >>> mesh = create_mesh(
         ...     axis_dims=(2, 4),
         ...     axis_names=('data', 'model')
         ... )
-        >>> # Use with pjit
+        >>>
         >>> with mesh:
         ...     sharded_fn = pjit(fn, in_shardings=..., out_shardings=...)
     """
@@ -229,7 +362,6 @@ def create_mesh(
         axis_dims=axis_dims,
         axis_names=axis_names,
         dcn_mesh_dims=dcn_mesh_dims,
-        process_is_granule=process_is_granule,
         should_sort_granules_by_key=should_sort_granules_by_key,
         allow_split_physical_axes=allow_split_physical_axes,
         backend=backend,
@@ -237,7 +369,7 @@ def create_mesh(
 
 
 def parse_mesh_from_string(
-    axis_dims: tp.Sequence[str],
+    axis_dims: str,
     names: tp.Sequence[str],
 ) -> Mesh:
     """Parse mesh configuration from string representation.
@@ -260,10 +392,10 @@ def parse_mesh_from_string(
             different lengths, or unknown axis names are used.
 
     Example:
-        >>> # Named format
+        >>>
         >>> mesh = parse_mesh_from_string("dp:2,tp:4", ["dp", "tp"])
         >>>
-        >>> # Positional format
+        >>>
         >>> mesh = parse_mesh_from_string("2,4", ["data", "model"])
     """
     if ":" in axis_dims:
@@ -277,43 +409,35 @@ def parse_mesh_from_string(
         assert set(dim_names) == set(names), "Not all axis names were used in 'axis_dims'"
     else:
         dims = [int(x) for x in axis_dims.split(",")]
-        dim_names = names
+        dim_names = list(names)
     assert len(dims) == len(names), "Number of dimensions and names must match"
 
-    mesh_shape = np.arange(jax.device_count()).reshape(dims).shape
-    return create_mesh(mesh_shape, dim_names)
+    return create_mesh(tuple(dims), tuple(dim_names))
 
 
 def create_cpu_mesh(
     axis_dims: tp.Sequence[int] = DEFAULT_SHARDING_STG,
     axis_names: tp.Sequence[str] = DEFAULT_NAMED_SHARDING_STG,
 ) -> Mesh:
-    """Create a mesh using only CPU devices.
+    """Create a mesh using CPU devices.
 
     Useful for debugging, testing, or when you want to force operations
     to run on CPU regardless of available accelerators.
 
     Args:
         axis_dims: Dimensions for each mesh axis. Default is (1, -1, 1, 1, 1).
-            Note that for CPU, this typically uses just one device.
+            For CPU, this typically resolves to a shape matching the number of
+            available CPU devices.
         axis_names: Names for each axis. Default is ('dp', 'fsdp', 'ep', 'tp', 'sp').
 
     Returns:
-        JAX Mesh configured to use CPU device(s) only.
-
-    Example:
-        >>> # Create CPU mesh for testing
-        >>> cpu_mesh = create_cpu_mesh()
-        >>> with cpu_mesh:
-        ...     # Operations here run on CPU
-        ...     result = jax.jit(fn)(data)
+        JAX Mesh configured to use CPU device(s).
 
     Note:
-        This function always uses the first available CPU device and reshapes
-        it according to axis_dims. Since CPU typically has one device, most
-        axis dimensions should be 1.
+        This uses all available CPU devices on the host and arranges them
+        according to axis_dims.
     """
-    return jax.sharding.Mesh(np.array([jax.local_devices(backend="cpu")[0]]).reshape(*axis_dims), axis_names)
+    return create_mesh(axis_dims=tuple(axis_dims), axis_names=tuple(axis_names), backend="cpu")
 
 
 @contextlib2.contextmanager
@@ -329,7 +453,7 @@ def force_cpu():
 
     Example:
         >>> with force_cpu() as cpu_device:
-        ...     # All JAX operations here run on CPU
+        ...
         ...     result = jax.numpy.sum(array)
         ...     print(f"Running on {cpu_device}")
 
@@ -354,7 +478,7 @@ def cpu_context():
 
     Example:
         >>> with cpu_context() as mesh:
-        ...     # All operations here run on CPU with CPU mesh
+        ...
         ...     @jax.jit
         ...     def fn(x):
         ...         return x * 2
@@ -369,20 +493,3 @@ def cpu_context():
     mesh = create_cpu_mesh()
     with force_cpu(), mesh:
         yield mesh
-
-
-if __name__ == "__main__":
-    test_cases = [
-        ((1, 1, 32), 4, 8, (1, 1, 4)),
-        ((8, 4), 4, 8, (1, 4)),
-        ((1, 1, 8, 4), 4, 8, (1, 1, 1, 4)),
-        ((2, 4, 8), 8, 8, (1, 1, 8)),
-        ((16, 4), 4, 16, (1, 4)),
-    ]
-
-    for global_mesh, devices, processes, expected in test_cases:
-        mesh_size = np.prod(global_mesh)
-        device_total = devices * processes
-        assert mesh_size == device_total, f"Mesh size {mesh_size} must equal total devices {device_total}"
-        result = calculate_host_mesh_shape(global_mesh, devices, processes)
-        assert result == expected, f"Failed for {global_mesh}: expected {expected}, got {result}"
