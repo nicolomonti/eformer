@@ -20,7 +20,6 @@ import os
 import pickle
 import typing as tp
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -35,6 +34,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
+from eformer import __version__
 from eformer.escale import create_cpu_mesh, match_partition_rules
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -141,7 +141,7 @@ class CheckpointMetadata:
         custom_metadata: User-defined metadata dictionary.
     """
 
-    version: str = "0.0.51"
+    version: str = __version__
     timestamp: str = None
     checksum: dict[str, str] = None
     array_metadata: dict[str, dict] = None
@@ -174,7 +174,7 @@ class CheckpointMetadata:
             CheckpointMetadata instance.
         """
         return cls(
-            version=data.get("version", "0.0.52"),
+            version=data.get("version", __version__),
             timestamp=data.get("timestamp"),
             checksum=data.get("checksum", {}),
             array_metadata=data.get("array_metadata", {}),
@@ -204,7 +204,6 @@ class AsyncCheckpointManager:
         enable: Whether checkpointing is enabled.
         verbose: Enable verbose output.
         gcs_bucket: Google Cloud Storage bucket name.
-        max_workers: Maximum number of worker threads.
         enable_validation: Enable checksum validation.
         enable_compression: Enable compression for tensorstore.
         use_tensorstore: Use tensorstore backend when available.
@@ -212,7 +211,6 @@ class AsyncCheckpointManager:
     Example:
         >>> manager = AsyncCheckpointManager(
         ...     enable_validation=True,
-        ...     max_workers=8,
         ...     use_tensorstore=True
         ... )
         >>>
@@ -245,6 +243,7 @@ class AsyncCheckpointManager:
         self.use_tensorstore = use_tensorstore
 
         self.gcs_client = None
+        self._global_manager = None  # Lazy initialization
 
         if gcs_bucket:
             self.gcs_client = CheckpointManager.create_gcs_client(gcs_credentials_path)
@@ -255,6 +254,17 @@ class AsyncCheckpointManager:
         Ensures the thread pool executor is properly shutdown when the
         manager is destroyed.
         """
+
+    @property
+    def global_manager(self) -> GlobalAsyncCheckpointManager:
+        """Get or create the global async checkpoint manager.
+
+        Returns:
+            GlobalAsyncCheckpointManager: The singleton manager instance.
+        """
+        if self._global_manager is None:
+            self._global_manager = GlobalAsyncCheckpointManager()
+        return self._global_manager
 
     @staticmethod
     def _estimate_nbytes(array: jax.Array) -> int:
@@ -543,16 +553,15 @@ class AsyncCheckpointManager:
 
         pytree = unflatten_dict(tree, sep=".")
 
-        manager = GlobalAsyncCheckpointManager()
-
         tree_serialize_leaves(
             checkpoint_dir=path,
             pytree=pytree,
-            manager=manager,
+            manager=self.global_manager,
             prefix=prefix,
             commit_callback=lambda: logger.info("Committed checkpoint to Tensorstore"),
             write_index=True,
         )
+        self.global_manager.wait_until_finished()
 
         logger.info("Committed checkpoint to Tensorstore")
         meta_path = ePath(path) / "checkpoint_metadata.json"
@@ -581,16 +590,15 @@ class AsyncCheckpointManager:
             Tuple of (loaded tree dictionary, metadata dictionary).
         """
 
-        manager = GlobalAsyncCheckpointManager()
-
         tree = tree_deserialize_leaves(
             checkpoint_dir=path,
             mesh=mesh,
             partition_rules=partition_rules,
-            manager=manager,
+            manager=self.global_manager,
             prefix=prefix,
             shardings=shardings,
         )
+        self.global_manager.wait_until_finished()
 
         meta_path = ePath(path) / "checkpoint_metadata.json"
         if meta_path.exists():
@@ -679,15 +687,15 @@ class AsyncCheckpointManager:
                     prefix=prefix,
                 )
             else:
-                manager = GlobalAsyncCheckpointManager()
                 tree = tree_deserialize_leaves(
                     checkpoint_dir=path_str,
                     mesh=mesh,
                     partition_rules=partition_rules,
-                    manager=manager,
+                    manager=self.global_manager,
                     prefix=prefix,
                     shardings=shardings,
                 )
+                self.global_manager.wait_until_finished()
                 meta_path = path_obj / "checkpoint_metadata.json"
                 if meta_path.exists():
                     metadata = json.loads(meta_path.read_text())
@@ -817,30 +825,22 @@ class AsyncCheckpointManager:
                     shard_fns = shardings
 
         tree = {}
-        futures = []
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for shard_name, keys in file_to_keys.items():
-                shard_path = str(ePath(directory) / shard_name)
-                future = executor.submit(
-                    self._load_shard_file,
-                    shard_path,
-                    keys,
-                    shard_fns,
-                    mismatch_allowed,
-                    callback,
-                    dtype,
-                )
-                futures.append(future)
-
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="Loading shards (parallel)",
-                disable=not self.verbose,
-            ):
-                shard_tree = future.result()
-                tree.update(shard_tree)
+        for shard_name, keys in tqdm(
+            file_to_keys.items(),
+            desc="Loading shards",
+            disable=not self.verbose,
+        ):
+            shard_path = str(ePath(directory) / shard_name)
+            shard_tree = self._load_shard_file(
+                shard_path,
+                keys,
+                shard_fns,
+                mismatch_allowed,
+                callback,
+                dtype,
+            )
+            tree.update(shard_tree)
 
         tree = unflatten_dict(tree, sep=".")
         metadata = index_data.get("metadata", {})
@@ -986,15 +986,15 @@ class AsyncCheckpointManager:
         array_relpaths: list[str] = []
         safetensors_file = None
 
-        manager = GlobalAsyncCheckpointManager()
         tree_serialize_leaves(
             checkpoint_dir=str(root),
             pytree=pytree,
-            manager=manager,
+            manager=self.global_manager,
             prefix=prefix,
             write_index=write_index,
         )
 
+        self.global_manager.wait_until_finished()
         index_path = root / "tensorstore_index.json"
         if not index_path.exists():
             raise FileNotFoundError(f"Missing tensorstore_index.json in {root}")
@@ -1018,7 +1018,7 @@ class AsyncCheckpointManager:
 
         structure = {
             "format": "pytree-structure",
-            "version": "1",
+            "version": __version__,
             "backend": backend,
             "prefix": prefix,
             "treedef_b64": _treedef_to_b64(treedef),
@@ -1123,9 +1123,8 @@ class AsyncCheckpointManager:
                 shardings.get(k, default_sharding()) if shardings else default_sharding() for k in array_keys
             ]
 
-        manager = GlobalAsyncCheckpointManager()
-        array_leaves = manager.deserialize_with_paths(shardings=apply_shardings, paths=abs_paths)
-
+        array_leaves = self.global_manager.deserialize_with_paths(shardings=apply_shardings, paths=abs_paths)
+        self.global_manager.wait_until_finished()
         if dtype is not None:
             array_leaves = [jnp.asarray(x, dtype=dtype) for x in array_leaves]
 

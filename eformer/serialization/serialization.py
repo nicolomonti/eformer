@@ -27,6 +27,7 @@ from jax.experimental.array_serialization import serialization as array_ser
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding, SingleDeviceSharding
 from jaxtyping import PyTree
 
+from eformer import __version__
 from eformer.escale import match_partition_rules
 from eformer.loggings import get_logger
 from eformer.paths import ePath
@@ -240,7 +241,7 @@ def tree_serialize_leaves(
         else:
             index_data = {
                 "format": "tensorstore",
-                "version": "2.0",
+                "version": __version__,
                 "prefixes": {},
             }
 
@@ -248,7 +249,7 @@ def tree_serialize_leaves(
             if "prefixes" not in index_data:
                 index_data = {
                     "format": "tensorstore",
-                    "version": "2.0",
+                    "version": __version__,
                     "prefixes": {},
                 }
             index_data["prefixes"][prefix] = array_info
