@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Resource pool management for distributed Ray actors.
 
 This module provides abstractions for managing pools of Ray actors,
@@ -50,7 +51,6 @@ import ray
 import requests
 from ray.actor import ActorHandle
 from ray.autoscaler.sdk import request_resources
-from ray.remote_function import RemoteFunction as _RF
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
@@ -79,10 +79,10 @@ class InsufficientSlicesError(RuntimeError):
     Example:
         >>> manager = SlicePoolManager(tpu_type="v4-32")
         >>> try:
-        ...     manager.scale_multislice([4, 8])  # Request 8 slices, fallback to 4
+        ...     manager.scale_multislice([4, 8])
         ... except InsufficientSlicesError as e:
         ...     print(f"Could not allocate TPU slices: {e}")
-        ...     # Handle fallback or retry logic
+        ...
     """
 
     pass
@@ -462,6 +462,8 @@ class DeviceHostActor:
         self,
         remote_fn,
         *,
+        f_args: tuple = (),
+        f_kwargs: dict | None = None,
         runtime_env: dict | None = None,
         env: dict | None = None,
         num_cpus: float = 8.0,
@@ -501,32 +503,54 @@ class DeviceHostActor:
         if not self.healthy():
             raise RuntimeError(f"Host {self.host_id} unhealthy or preempted")
 
-        if not isinstance(remote_fn, _RF):
-            remote_fn = ray.remote(max_calls=1)(remote_fn)
-        elif remote_fn._default_options.get("max_calls") is None:
-            raise ValueError("remote_fn must have max_calls=1 for TPU workloads")
-
         if self._awaitable:
             self._cancel_tasks_and_wait([self._awaitable])
 
         self._hacky_remove_tpu_lockfile()
+
         host_env = {"TPU_HOST_ID": str(self.host_id), "TPU_SLICE_NAME": self.slice_name}
         if self.num_devices:
             host_env["TPU_NUM_DEVICES"] = str(self.num_devices)
         merged_runtime_env = self._merge_runtime_env(runtime_env, {**host_env, **(env or {})})
-        resources = dict(extra_resources or {})
 
+        resources = dict(extra_resources or {})
         if self.num_devices:
             resources["TPU"] = self.num_devices
 
-        self._awaitable = remote_fn.options(
+        py_fn = None
+        try:
+            from ray.remote_function import RemoteFunction as _RF
+
+            if isinstance(remote_fn, _RF):
+                py_fn = remote_fn._function
+            else:
+                py_fn = remote_fn
+        except Exception:
+            py_fn = remote_fn
+
+        f_kwargs = f_kwargs or {}
+
+        @ray.remote(max_calls=1)
+        def _runner(fn, args, kwargs):
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    import jax.distributed as jdist
+
+                    jdist.shutdown()
+                except Exception:
+                    pass
+
+        self._awaitable = _runner.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(self._node_id, soft=False),
             resources=resources or None,
             num_cpus=num_cpus,
             num_gpus=0,
             memory=memory_bytes,
             runtime_env=merged_runtime_env,
-        ).remote()
+        ).remote(py_fn, f_args, f_kwargs)
+
         return self._awaitable
 
     def shutdown(self) -> None:
@@ -642,13 +666,8 @@ class SliceActor:
         return DeviceHostActor.options(
             num_cpus=0,
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
-            lifetime="detached",
             name=f"{self._slice_info.slice_name}-host-{host_id}-{uuid4().hex[:8]}",
-        ).remote(
-            host_id,
-            self._slice_info.slice_name,
-            num_devices_for_host,
-        )
+        ).remote(host_id, self._slice_info.slice_name, num_devices_for_host)
 
     def _initialize_slice_info(self) -> None:
         """Initialize slice information from TPU environment.
@@ -1017,6 +1036,18 @@ class SliceActor:
         self._actor_pool = []
 
     def _await_all_hosts_healthy(self, timeout_s: int = 60, poll_s: float = 2.0) -> bool:
+        """Wait for all hosts in the pool to become healthy.
+
+        Polls the health status of all host actors until they all report
+        healthy or the timeout is reached.
+
+        Args:
+            timeout_s: Maximum time to wait for hosts to become healthy (default: 60).
+            poll_s: Interval between health checks in seconds (default: 2.0).
+
+        Returns:
+            True if all hosts became healthy within the timeout, False otherwise.
+        """
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             statuses = ray.get([m.actor.healthy.remote() for m in self._actor_pool])
@@ -1169,8 +1200,8 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             InsufficientSlicesError: If none of the requested sizes can be achieved.
 
         Example:
-            >>> manager.scale_multislice(4)  # Exactly 4 slices
-            >>> manager.scale_multislice([2, 4, 8])  # Try 8, fall back to 4 or 2
+            >>> manager.scale_multislice(4)
+            >>> manager.scale_multislice([2, 4, 8])
 
         Note:
             - Requests TPU head resources from Ray autoscaler.

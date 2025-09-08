@@ -73,6 +73,7 @@ from .docker_executor import (
 )
 from .executor import (
     RayExecutor,
+    device_remote,
     execute,
     execute_multislice,
     execute_multislice_resumable,
@@ -146,6 +147,7 @@ __all__ = (
     "available_cpu_cores",
     "build_and_push_docker_image",
     "current_actor_handle",
+    "device_remote",
     "execute",
     "execute_multislice",
     "execute_multislice_resumable",
