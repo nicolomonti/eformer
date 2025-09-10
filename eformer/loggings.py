@@ -25,6 +25,7 @@ import typing as tp
 from functools import wraps
 
 import jax
+from jax._src import xla_bridge
 
 COLORS: dict[str, str] = {
     "PURPLE": "\033[95m",
@@ -92,8 +93,9 @@ class LazyLogger:
             return
 
         try:
-            if jax.process_index() > 0:
-                self._level = logging.WARNING
+            if xla_bridge.backends_are_initialized():
+                if jax.process_index() > 0:
+                    self._level = logging.WARNING
         except RuntimeError:
             pass
 

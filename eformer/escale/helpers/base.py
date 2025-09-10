@@ -24,6 +24,8 @@ from jax.sharding import Mesh, PartitionSpec
 
 from ..partition import get_incontext_mesh
 
+_sync_counter = 0
+
 
 class ShardingRule(abc.ABC):
     """Base class for sharding rules."""
