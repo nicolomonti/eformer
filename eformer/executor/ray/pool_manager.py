@@ -680,6 +680,12 @@ class SliceActor:
 
             slice_name = ray_tpu.get_current_pod_name()
             num_hosts = int(ray_tpu.get_current_pod_worker_count())
+            if os.getenv("EFORMER_MODERATE", "1") == "1":
+                available_hosts = ray.cluster_resources().get(slice_name, None)
+                if available_hosts is not None and num_hosts > available_hosts:
+                    available_hosts = int(available_hosts)
+                    logger.info(f"setting {num_hosts=} to {available_hosts}")
+                    num_hosts = available_hosts
             ip_address = ray.util.get_node_ip_address()
 
             num_accelerators_per_host = None
