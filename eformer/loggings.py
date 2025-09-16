@@ -77,9 +77,13 @@ class ColorFormatter(logging.Formatter):
         record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
         current_time = datetime.datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
         formatted_name = f"{color}({current_time} {record.name}){COLORS['RESET']}"
-        message = f"{formatted_name} {record.getMessage()}"
+        message = record.getMessage()
+        lines = message.split("\n")
+        formatted_lines = [f"{formatted_name} {line}" if line else formatted_name for line in lines]
+        result = "\n".join(formatted_lines)
+
         record.levelname = orig_levelname
-        return message
+        return result
 
 
 class LazyLogger:

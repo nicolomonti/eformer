@@ -107,6 +107,17 @@ MEGASCALE_DEFAULT_PORT = 8081
 logger = logging.getLogger("ray")
 
 
+def resolve_maybe_refs(items):
+    """If items are Ray ObjectRefs, ray.get() them; otherwise return as-is."""
+    if not items:
+        return items
+    import ray
+
+    if all(isinstance(x, ray.ObjectRef) for x in items):
+        return ray.get(items)
+    return items
+
+
 class RayExecutor:
     """Core executor for Ray-based distributed workloads.
 
@@ -353,6 +364,8 @@ class RayExecutor:
                 host_futures = [
                     h.run_remote_fn.remote(
                         remote_fn,
+                        f_args=(),
+                        f_kwargs=kwargs,
                         runtime_env=accelerator_config.execution_env,
                         env=env_for_slice,
                     )
@@ -362,14 +375,11 @@ class RayExecutor:
 
             if flatten:
                 outer_refs = [f for sub in per_slice_futures for f in sub]
-                inner_refs = ray.get(outer_refs)
-                pending = list(inner_refs)
-                while pending:
-                    _, pending = ray.wait(pending, num_returns=1, timeout=10.0)
-                results = ray.get(inner_refs)
+                inner = ray.get(outer_refs)
+                results = resolve_maybe_refs(inner)
             else:
                 inner_by_slice = [ray.get(lst) for lst in per_slice_futures]
-                results = [ray.get(lst) for lst in inner_by_slice]
+                results = [resolve_maybe_refs(lst) for lst in inner_by_slice]
 
             return JobSucceeded(info, results)
 
@@ -395,8 +405,8 @@ class RayExecutor:
                         RayResources.cancel_all_futures(lst)
                 except Exception:
                     pass
-            info = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
-            return JobFailed(info, e)
+            info2 = JobInfo(accelerator_config.runtime_name, "running", accelerator_config.resource_name)
+            return JobFailed(info2, e)
         finally:
             try:
                 pool_manager.drain_actor_pool()

@@ -176,7 +176,7 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         ref_map = {m: m.actor.healthy.remote() for m in self._actor_pool}
         refs = list(ref_map.values())
 
-        done, pending = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
+        done, _ = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
 
         done_set = set(done)
         healthy: list[ActorPoolMember[ActorInfoT]] = []
@@ -514,8 +514,6 @@ class DeviceHostActor:
         merged_runtime_env = self._merge_runtime_env(runtime_env, {**host_env, **(env or {})})
 
         resources = dict(extra_resources or {})
-        if self.num_devices:
-            resources["TPU"] = self.num_devices
 
         py_fn = None
         try:
@@ -547,7 +545,7 @@ class DeviceHostActor:
             resources=resources or None,
             num_cpus=num_cpus,
             num_gpus=0,
-            memory=memory_bytes,
+            memory=int(memory_bytes),
             runtime_env=merged_runtime_env,
         ).remote(py_fn, f_args, f_kwargs)
 
@@ -896,7 +894,7 @@ class SliceActor:
         ref_map = {m: m.actor.healthy.remote() for m in self._actor_pool}
         refs = list(ref_map.values())
 
-        done, pending = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
+        done, _ = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
 
         done_set = set(done)
         healthy: list[ActorPoolMember[ActorInfoT]] = []
@@ -1062,7 +1060,14 @@ class SliceActor:
             time.sleep(poll_s)
         return False
 
-    def run_remote_fn(self, remote_fn, runtime_env: dict | None = None, env: dict | None = None):
+    def run_remote_fn(
+        self,
+        remote_fn,
+        runtime_env: dict | None = None,
+        env: dict | None = None,
+        f_args: tuple = (),
+        f_kwargs: dict | None = None,
+    ):
         """Execute a remote function on all hosts in this slice.
 
         Ensures all hosts are ready, then launches the function on each host
@@ -1098,8 +1103,16 @@ class SliceActor:
             self._await_all_hosts_healthy(timeout_s=int(os.getenv("EFORMER_HOST_HEALTH_WAIT_S", "60")))
         except Exception:
             pass
+
         futures = [
-            member.actor.run_remote_fn.remote(remote_fn, runtime_env=runtime_env, env=env) for member in self._actor_pool
+            member.actor.run_remote_fn.remote(
+                remote_fn,
+                f_args=f_args,
+                f_kwargs=f_kwargs,
+                runtime_env=runtime_env,
+                env=env,
+            )
+            for member in self._actor_pool
         ]
         return futures
 
