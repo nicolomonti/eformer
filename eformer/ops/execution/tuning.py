@@ -801,8 +801,6 @@ def _experimental_time_with_profiler(
     for it in pbar:
         now = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
         profile_path = Path(tempfile.mkdtemp(prefix=f"tuning_profile_{now}_")).absolute()
-        if it == 0:
-            pbar.write(f"Saving optimization profile to `{profile_path}`")
         profile_path.mkdir(exist_ok=True)
         with suppress_stdout_stderr():
             with jax.profiler.trace(str(profile_path)):
