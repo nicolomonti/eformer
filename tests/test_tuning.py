@@ -25,7 +25,6 @@ from eformer.ops.execution.tuning import (
     _normalize_sharding,
     _try_hash_input,
     autotune,
-    autotune_logger,
 )
 
 
