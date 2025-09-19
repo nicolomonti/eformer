@@ -31,7 +31,6 @@ import jax.dlpack
 import jax.extend as jex
 import jax.numpy as jnp
 import numpy as np
-from absl import logging
 from jax import tree_util
 from jax._src import core, state, util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
@@ -611,15 +610,6 @@ def triton_kernel_call_lowering(
     named_args = dict(unsafe_zip(fn.arg_names, args))
 
     if isinstance(fn, autotuner.Autotuner):
-        if hasattr(fn, "key_idx"):
-            key_idxs = fn.key_idx
-        else:
-            key_idxs = [fn.arg_names.index(k) for k in fn.keys]
-        if any(idx not in key_idxs for idx, _, _ in scalar_args):
-            logging.warning(
-                "Auto-tuning key does not include all scalar arguments. We may perform redundant auto-tuning."
-            )
-
         prev_early_config_prune_fn = fn.early_config_prune
 
         def prune_configs(configs, named_args, **kwargs):
