@@ -462,7 +462,7 @@ class CheckpointManager:
         tree = jax.tree_util.tree_map(
             lambda x: _to_host(x, float_dtype, mesh),
             tree,
-            is_leaf=lambda x: isinstance(x, (jax.Array, numpy.generic, float, int)),  # noqa
+            is_leaf=lambda x: isinstance(x, jax.Array | numpy.generic | float | int),
         )
 
         path_str = str(path)

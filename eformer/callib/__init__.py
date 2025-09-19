@@ -12,18 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._ejit import ejit, load_cached_functions
-from ._suppress_triton import disable_cpp_logs
-from ._triton_call import cdiv, get_triton_type, next_power_of_2, normalize_grid, strides_from_shape, triton_call
+from ._ejit import ejit
+from ._triton_call import get_triton_type, triton_call
+from ._utils import cdiv, next_power_of_2, strides_from_shape
 
-__all__ = (
-    "cdiv",
-    "disable_cpp_logs",
-    "ejit",
-    "get_triton_type",
-    "load_cached_functions",
-    "next_power_of_2",
-    "normalize_grid",
-    "strides_from_shape",
-    "triton_call",
-)
+__all__ = ("cdiv", "ejit", "get_triton_type", "next_power_of_2", "strides_from_shape", "triton_call")

@@ -6,6 +6,8 @@ __pycache__/
 # Hidden Local Files
 env.py
 exp.py
+*.json
+*.txt
 experimental.py
 # C extensions
 tmp-files

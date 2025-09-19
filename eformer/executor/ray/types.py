@@ -97,7 +97,7 @@ def handle_ray_error(job_info: JobInfo, e: RayError) -> JobStatus:
         ...     status = handle_ray_error(job_info, e)
         ...     assert isinstance(status, JobPreempted)
     """
-    if isinstance(e, (NodeDiedError, OwnerDiedError, ActorDiedError, ActorUnavailableError, WorkerCrashedError)):  # noqa
+    if isinstance(e, (NodeDiedError, OwnerDiedError, ActorDiedError, ActorUnavailableError, WorkerCrashedError)):
         logger.exception("Infra/preemption-related error", exc_info=e)
         return JobPreempted(job_info, e)
     elif isinstance(e, RaySystemError):
@@ -208,7 +208,7 @@ class ExceptionInfo:
             ...     exc_info = ExceptionInfo.ser_exc_info(e)  # Captures specific exception
         """
         if exception is None:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
+            _, exc_value, exc_traceback = sys.exc_info()
             tb = tblib.Traceback(exc_traceback)
             return ExceptionInfo(exc_value, tb)
         else:

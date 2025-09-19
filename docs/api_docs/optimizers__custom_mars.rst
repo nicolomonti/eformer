@@ -1,7 +1,7 @@
-eformer.callib._suppress_triton
+eformer.optimizers._custom.mars
 ===============================
 
-.. automodule:: eformer.callib._suppress_triton
+.. automodule:: eformer.optimizers._custom.mars
     :members:
     :undoc-members:
     :show-inheritance:

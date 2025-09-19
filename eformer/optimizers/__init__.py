@@ -15,18 +15,30 @@
 from ._config import (
     AdafactorConfig,
     AdamWConfig,
+    KronConfig,
     LionConfig,
+    MarsConfig,
+    MuonConfig,
     RMSPropConfig,
     SchedulerConfig,
+    ScionConfig,
+    SoapConfig,
+    WhiteKronConfig,
 )
 from ._factory import OptimizerFactory, SchedulerFactory
 
 __all__ = (
     "AdafactorConfig",
     "AdamWConfig",
+    "KronConfig",
     "LionConfig",
+    "MarsConfig",
+    "MuonConfig",
     "OptimizerFactory",
     "RMSPropConfig",
     "SchedulerConfig",
     "SchedulerFactory",
+    "ScionConfig",
+    "SoapConfig",
+    "WhiteKronConfig",
 )

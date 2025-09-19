@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Compilation utilities for JAX function optimization.
+
+Provides enhanced JIT compilation with persistent caching to disk,
+reducing compilation overhead across script runs.
+
+Functions:
+    ejit: Enhanced JIT with persistent caching
+    save_compiled_fn: Save compiled function to disk
+    load_compiled_fn: Load compiled function from disk
+    load_cached_functions: Load multiple cached functions
+    smart_compile: Smart compilation with auto-caching
+    hash_fn: Generate hash for function signature
+
+Constants:
+    RECOMPILE_FORCE: Force recompilation flag
+    ECACHE_COMPILES: Enable compilation caching
+    CACHE_DIR: Cache directory path
+    COMPILE_FUNC_DIR: Compiled functions directory
+    COMPILED_CACHE: In-memory cache of compiled functions
+
+Key Features:
+    - Persistent disk caching of compiled functions
+    - Automatic cache invalidation on changes
+    - Hardware-specific signatures
+    - Two-level caching (memory + disk)
+    - Graceful fallback on errors
+
+Example:
+    >>> from easydel.utils.compiling_utils import ejit
+    >>>
+    >>> @ejit
+    ... def optimized_fn(x, y):
+    ...     return x @ y + x.T @ y.T
+    >>>
+    >>> # First call compiles and caches
+    >>> result = optimized_fn(a, b)
+    >>> # Next run loads from cache
+    >>> result = optimized_fn(a, b)
+"""
+
 from __future__ import annotations
 
 import functools
@@ -21,50 +61,15 @@ import os
 import pickle
 import typing as tp
 import warnings
-from pathlib import Path
 
 import jax
 import numpy as np
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
+from ._utils import check_bool_flag, get_cache_dir
+
 if tp.TYPE_CHECKING:
     from jax._src.stages import Compiled, Lowered
-
-
-def check_bool_flag(name: str, default: bool = True) -> bool:
-    """Check if an environment variable is set to a truthy value.
-
-    Args:
-        name: Name of the environment variable to check
-        default: Default boolean value if variable is not set (default: True)
-
-    Returns:
-        True if environment variable value is in ['true', 'yes', 'ok', '1', 'easy'], False otherwise
-    """
-    default = "1" if default else "0"
-    return str(os.getenv(name, default)).lower() in ["true", "yes", "ok", "1", "easy"]
-
-
-def get_cache_dir() -> Path:
-    """Get the system-specific cache directory for eformer-cjit.
-
-    Returns:
-        Path object pointing to the cache directory
-    """
-    home_dir = Path.home()
-    app_name = "eformer-cjit"
-    if os.name == "nt":
-        cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
-    elif os.name == "posix":
-        if "darwin" in os.sys.platform:
-            cache_dir = home_dir / "Library" / "Caches" / app_name
-        else:
-            cache_dir = home_dir / ".cache" / app_name
-    else:
-        cache_dir = home_dir / ".cache" / app_name
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
@@ -73,20 +78,32 @@ RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = CACHE_DIR / "ejit_compiled_functions"
-COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
+if not isinstance(COMPILE_FUNC_DIR, str):
+    COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
 
 
 def _get_hardware_signature() -> str:
-    """Creates a signature for the current JAX hardware environment."""
+    """Create signature for current JAX hardware environment.
+
+    Returns:
+        String representation of available JAX devices.
+    """
     return str(jax.devices())
 
 
 def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
-    """Generates a hashable signature for a leaf node in a PyTree."""
+    """Generate hashable signature for PyTree leaf.
+
+    Args:
+        leaf: Leaf node from PyTree.
+
+    Returns:
+        Hashable signature including shape, dtype, and sharding.
+    """
     if isinstance(leaf, jax.Array | np.ndarray):
         if hasattr(leaf, "sharding"):
             return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)), repr(leaf.sharding))
@@ -95,7 +112,18 @@ def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
 
 
 def _get_args_signature(args: tuple, kwargs: dict) -> str:
-    """Creates a signature for arguments based on their tree structure, shapes, and dtypes."""
+    """Create signature for function arguments.
+
+    Generates a unique signature based on the PyTree structure,
+    shapes, and dtypes of arguments.
+
+    Args:
+        args: Positional arguments.
+        kwargs: Keyword arguments.
+
+    Returns:
+        String signature of the arguments.
+    """
     arg_leaves, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
     leaf_signatures = tuple(map(_get_leaf_signature, arg_leaves))
     return str((arg_tree, leaf_signatures))
@@ -109,26 +137,43 @@ def ejit(
     donate_argnums: int | tp.Sequence[int] | None = None,
     in_shardings: tp.Any = None,
     out_shardings: tp.Any = None,
+    donate_argnames: str | tp.Iterable[str] | None = None,
+    keep_unused: bool = False,
+    backend: str | None = None,
+    inline: bool = False,
+    abstracted_axes: tp.Any | None = None,
+    compiler_options: dict[str, tp.Any] | None = None,
 ):
-    """
-    An optimized, minimal-overhead, drop-in replacement for `jax.jit` that
-    caches compiled functions to disk for reuse across script runs.
+    """Enhanced JIT compilation with persistent caching.
 
-    This decorator uses a two-level caching system to ensure maximum performance:
-    1.  An in-memory LRU (Least Recently Used) cache acts as a fast "dispatch"
-        cache, mapping argument shapes to the correct compiled executable.
-    2.  A persistent on-disk cache stores the executables, avoiding the need
-        to recompile the same function in a new process.
+    Drop-in replacement for jax.jit that caches compiled functions
+    to disk for reuse across script runs, significantly reducing
+    compilation overhead.
 
-    It is designed to be robust, falling back gracefully to standard `jax.jit`
-    behavior if any part of the caching process fails.
+    Features:
+        - Two-level caching (in-memory LRU + persistent disk cache)
+        - Automatic cache invalidation on signature changes
+        - Graceful fallback to standard jax.jit on errors
+        - Support for all jax.jit parameters
 
     Args:
-        func: The function to be JIT-compiled and cached.
-        ... (all other jax.jit args)
+        func: Function to JIT-compile and cache.
+        static_argnums: Indices of static arguments.
+        static_argnames: Names of static arguments.
+        donate_argnums: Indices of donated arguments.
+        in_shardings: Input sharding specifications.
+        out_shardings: Output sharding specifications.
 
     Returns:
-        A wrapped function that is JIT-compiled and cached with high performance.
+        JIT-compiled function with caching.
+
+    Example:
+        >>> @ejit
+        ... def fast_matmul(a, b):
+        ...     return a @ b
+        >>> # First call compiles and caches
+        >>> result = fast_matmul(x, y)
+        >>> # Subsequent calls use cached version
     """
     if func is None:
         return functools.partial(
@@ -138,6 +183,12 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
+            abstracted_axes=abstracted_axes,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
         )
 
     if not ECACHE_COMPILES:
@@ -152,6 +203,12 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
+            abstracted_axes=abstracted_axes,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
         )
         return jitted_function
     jitted_function = jax.jit(
@@ -161,6 +218,12 @@ def ejit(
         donate_argnums=donate_argnums,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
+        abstracted_axes=abstracted_axes,
+        backend=backend,
+        compiler_options=compiler_options,
+        donate_argnames=donate_argnames,
+        inline=inline,
+        keep_unused=keep_unused,
     )
     try:
         func_source = inspect.getsource(func)
@@ -281,15 +344,54 @@ def load_cached_functions(verbose: bool = True) -> None:
 
 
 def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None = None):
-    """Save a compiled function to disk with its serialization metadata."""
+    """Save a compiled JAX function to disk for later reuse.
+
+    Serializes a compiled function along with its input/output tree structures,
+    allowing it to be loaded and executed in future Python sessions.
+
+    Args:
+        path: Directory path where the compiled function will be saved.
+              Will be created if it doesn't exist.
+        fn: Compiled JAX function (output of lowered.compile()).
+        prefix: Optional prefix for the filename. Useful for organizing
+               multiple compiled functions in the same directory.
+
+    Files Created:
+        - {prefix}-compiled.executable: Serialized function and metadata
+
+    Example:
+        >>> # Compile a function
+        >>> jitted = jax.jit(my_function)
+        >>> lowered = jitted.lower(sample_input)
+        >>> compiled = lowered.compile()
+        >>>
+        >>> # Save to disk
+        >>> from pathlib import Path
+        >>> cache_dir = Path("./my_cache")
+        >>> save_compiled_fn(cache_dir, compiled, prefix="model_v1")
+        >>>
+        >>> # File created: ./my_cache/model_v1-compiled.executable
+
+    Raises:
+        Warning: If serialization fails (logged, not raised).
+
+    Notes:
+        - Compiled functions are hardware-specific
+        - Large models may produce large cache files
+        - Uses pickle for serialization (standard security caveats apply)
+    """
+    from pathlib import Path
+
+    path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     prefix = prefix or ""
-    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
     serialized, in_tree, out_tree = serialize(fn)
     try:
-        pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+        with open(filename, "wb") as f:
+            pickle.dump((serialized, in_tree, out_tree), f)
     except Exception as e:
-        warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
+        warnings.warn(f"Could not save compiled function to {filename}: {e}", stacklevel=2)
 
 
 def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):

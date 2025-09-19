@@ -17,7 +17,7 @@ from logging import getLogger as _getLogger
 
 _getLogger("jax.experimental.array_serialization.serialization").setLevel(40)
 
-__version__ = "0.0.62"
+__version__ = "0.0.70"
 
 __all__ = (
     "aparser",

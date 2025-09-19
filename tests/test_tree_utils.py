@@ -426,7 +426,7 @@ class TestTreePaths:
     def test_tree_flatten_with_paths(self):
         """Test flattening with path tracking."""
         tree = {"a": jnp.array([1, 2]), "b": {"c": jnp.array([3, 4])}}
-        paths_vals, treedef = pytree.tree_flatten_with_paths(tree)
+        paths_vals, _treedef = pytree.tree_flatten_with_paths(tree)
 
         assert len(paths_vals) == 2
         # Check that we have the right paths

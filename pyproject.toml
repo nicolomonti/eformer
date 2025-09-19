@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "eformer"
-version = "0.0.62"
+version = "0.0.70"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
 readme = "README.md"
@@ -22,9 +22,9 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax>=0.7.0",
+	"jax>=0.7.2",
 	"optax>=0.2.2",
-	"chex",
+	"triton~=3.4.0",
 	"ml-collections==1.1.0",
 	"plum-dispatch==2.3.2",
 	"ray[default]>=2.34.0",
@@ -38,6 +38,8 @@ dependencies = [
 	"google-cloud-storage>=3.3.0",
 	"tensorstore>=0.1.76",
 	"braceexpand>=0.1.7",
+	"chex>=0.1.89",
+	"jaxtyping>=0.3.2",
 ]
 
 [project.urls]
@@ -48,6 +50,9 @@ dependencies = [
 [tool.uv.build-backend]
 module-name = "eformer"
 module-root = "."
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [tool.setuptools]
 package-dir = { "" = "." }

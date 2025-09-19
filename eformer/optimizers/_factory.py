@@ -24,11 +24,17 @@ import optax
 from ._config import (
     AdafactorConfig,
     AdamWConfig,
+    KronConfig,
     LionConfig,
+    MarsConfig,
+    MuonConfig,
     RMSPropConfig,
     SchedulerConfig,
     SerializationMixin,
+    SoapConfig,
+    WhiteKronConfig,
 )
+from ._custom import mars, white_kron
 from ._tx import optax_add_scheduled_weight_decay
 
 
@@ -159,7 +165,11 @@ class OptimizerFactory:
         "adafactor": (optax.adafactor, AdafactorConfig),
         "adamw": (optax.adamw, AdamWConfig),
         "lion": (optax.lion, LionConfig),
+        "mars": (mars, MarsConfig),
+        "muon": (optax.contrib.muon, MuonConfig),
         "rmsprop": (optax.rmsprop, RMSPropConfig),
+        "skew": (white_kron.skew, WhiteKronConfig),
+        "quad": (white_kron.quad, WhiteKronConfig),
     }
 
     @classmethod
@@ -179,7 +189,15 @@ class OptimizerFactory:
         cls,
         optimizer_type: str,
         scheduler_config: SchedulerConfig,
-        optimizer_config: AdafactorConfig | AdamWConfig | LionConfig | RMSPropConfig = None,
+        optimizer_config: AdafactorConfig
+        | AdamWConfig
+        | KronConfig
+        | LionConfig
+        | MarsConfig
+        | MuonConfig
+        | RMSPropConfig
+        | SoapConfig
+        | WhiteKronConfig = None,
         *,
         weight_decay: float = 0.0,
         weight_decay_mask: tp.Any | None = None,
@@ -194,7 +212,7 @@ class OptimizerFactory:
         Args:
             optimizer_type (str): One of the registered optimizer types.
             scheduler_config (SchedulerConfig): Configured scheduler parameters.
-            optimizer_config (Union[AdafactorConfig, AdamWConfig, LionConfig, RMSPropConfig]):
+            optimizer_config (Union[AdafactorConfig, AdamWConfig, LionConfig, MuonConfig, RMSPropConfig]):
                 Optimizer-specific configuration.
             weight_decay (float): Global weight decay rate. Defaults to 0.0.
             weight_decay_mask (Optional[Any]): Mask for weight decay application. Defaults to None.
@@ -369,7 +387,14 @@ class OptimizerFactory:
         for field in dataclasses.fields(config_cls):
             field_type = tp.get_type_hints(config_cls)[field.name]
             default = f" = {field.default}" if not isinstance(field.default, dataclasses._MISSING_TYPE) else ""
-            fields.append(f"    {field.name}: {field_type.__name__}{default}")
+
+            # Handle union types (e.g., Optional[int] = int | None)
+            if hasattr(field_type, "__name__"):
+                type_name = field_type.__name__
+            else:
+                type_name = str(field_type)
+
+            fields.append(f"    {field.name}: {type_name}{default}")
 
         return f"{config_cls.__name__}(\n" + "\n".join(fields) + "\n)"
 
