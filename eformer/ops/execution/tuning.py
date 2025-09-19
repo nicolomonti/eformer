@@ -879,7 +879,7 @@ def _try_hash_input(args, kws, must_be_concrete: bool = True):
 
 def autotune(
     fn: Callable[..., Any] | AutotuneConfig | None = None,
-    hyperparams: dict[Any, Any] | None = None,
+    hyperparams: dict[str, list[int, float, str]] | dict[Any, Any] | None = None,
     max_workers: int = 32,
     in_shardings: Any = UNSPECIFIED,
     out_shardings: Any = UNSPECIFIED,
