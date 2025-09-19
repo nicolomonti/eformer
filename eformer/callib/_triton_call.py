@@ -150,9 +150,7 @@ def get_triton_type(obj: Any) -> str:
             return "u64"
         else:
             raise ValueError(f"integer overflow representing {obj}")
-    if isinstance(obj, float):
-        return "fp64"
-    if isinstance(obj, np.float32):
+    if isinstance(obj, np.float32 | float):
         return "fp32"
     if isinstance(obj, bool):
         return "B"
