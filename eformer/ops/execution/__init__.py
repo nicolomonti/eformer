@@ -35,7 +35,17 @@ Functions:
 
 from .batch import pmap_with_config, vmap_with_config
 from .executor import ConfigChooser, Executor
-from .tuning import AutotuneData, Autotuner, AutotuningResult, Entry, Measurement, autotune, autotune_recorded, benchmark
+from .tuning import (
+    AutotuneData,
+    Autotuner,
+    AutotuningResult,
+    Entry,
+    FNAutotuner,
+    Measurement,
+    autotune,
+    autotune_recorded,
+    benchmark,
+)
 
 __all__ = (
     "AutotuneData",
@@ -44,6 +54,7 @@ __all__ = (
     "ConfigChooser",
     "Entry",
     "Executor",
+    "FNAutotuner",
     "Measurement",
     "autotune",
     "autotune_recorded",

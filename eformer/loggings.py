@@ -88,9 +88,22 @@ class ColorFormatter(logging.Formatter):
 
 class LazyLogger:
     def __init__(self, name: str, level: int | None = None):
+        if level is None:
+            level = _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
+        if isinstance(level, str):
+            level = _LOGGING_LEVELS[level]
+
         self._name = name
-        self._level = level or _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
+        self._level = level
         self._logger: logging.Logger | None = None
+
+    @property
+    def level(self):
+        return self._level
+
+    @property
+    def name(self):
+        return self._name
 
     def _ensure_initialized(self) -> None:
         if self._logger is not None:

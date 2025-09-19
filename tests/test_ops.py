@@ -186,6 +186,6 @@ tooks = benchmark(
     v,
     score_mod=lambda s: s / s.shape[-1] ** 0.5,
     mask_mod=lambda shape: jnp.tril(jnp.ones(shape, dtype=bool)),
-    iters=50,
+    iters=500,
 )
 print(tooks)
