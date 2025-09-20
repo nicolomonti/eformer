@@ -15,26 +15,42 @@
 
 """Resource pool management for distributed Ray actors.
 
-This module provides abstractions for managing pools of Ray actors,
-particularly focused on TPU/GPU slice management for distributed computing.
-It includes health monitoring, automatic scaling, and resource lifecycle
-management.
+This module provides comprehensive abstractions for managing pools of Ray actors,
+with specialized focus on TPU/GPU slice management for distributed computing.
+It includes health monitoring, automatic scaling, resource lifecycle management,
+and placement group coordination for optimal resource allocation.
 
 Key Components:
     - **ActorPoolMember**: Wrapper for actor handles with metadata
     - **ResourcePoolManager**: Abstract base for managing actor pools
-    - **SlicePoolManager**: Specialized manager for TPU/GPU slices
+    - **SlicePoolManager**: Specialized manager for TPU/GPU slices with placement groups
     - **SliceActor**: Ray actor for managing individual compute slices
+    - **DeviceHostActor**: Ray actor for managing individual TPU hosts within slices
+
+Resource Management Features:
+    - Placement group coordination with STRICT_SPREAD strategy
+    - Automatic resource request handling through Ray autoscaler
+    - Health monitoring with graceful shutdown sequences
+    - Robust error handling with actor restart capabilities
+    - Slot-based actor allocation for deterministic placement
+
+Environment Variables:
+    - **EFORMER_SCALE_POLL_S**: Scaling operation polling interval (default: "30")
+    - **EFORMER_SCALE_ADD_TIMEOUT_S**: Timeout for adding new actors (default: "604800")
 
 Example:
-    Managing a multi-slice TPU configuration:
+    Managing a multi-slice TPU configuration with placement groups:
 
     >>> from eformer.executor.ray import SlicePoolManager
     >>>
+    >>> # Create manager with automatic placement group coordination
     >>> manager = SlicePoolManager(tpu_type="v4-8")
     >>> manager.scale_multislice(num_slices=4)
     >>> actors = manager.get_all_actors_in_pool()
-    >>> manager.drain_actor_pool()
+    >>>
+    >>> # Placement groups are automatically managed
+    >>> manager.prepare_all_slices()
+    >>> manager.drain_actor_pool()  # Cleans up placement groups
 """
 
 from __future__ import annotations
@@ -179,7 +195,7 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         done, _ = ray.wait(refs, num_returns=len(refs), timeout=HEALTH_CHECK_TIMEOUT_S)
 
         done_set = set(done)
-        healthy: list[ActorPoolMember[ActorInfoT]] = []
+        healthy: list[ActorPoolMember[HostInfo]] = []
 
         for member, ref in ref_map.items():
             name = self.get_actor_name_from_actor_info(member.actor_info)
@@ -190,19 +206,19 @@ class ResourcePoolManager(Generic[ActorInfoT]):
                     else:
                         logger.warning(f"Actor {name} reported unhealthy; killing")
                         try:
-                            ray.kill(member.actor)
+                            ray.kill(member.actor, no_restart=True)
                         except Exception:
                             pass
                 except Exception as e:
                     logger.warning(f"Actor {name} health check exception ({e}); killing")
                     try:
-                        ray.kill(member.actor)
+                        ray.kill(member.actor, no_restart=True)
                     except Exception:
                         pass
             else:
                 logger.warning(f"Actor {name} health timeout; killing")
                 try:
-                    ray.kill(member.actor)
+                    ray.kill(member.actor, no_restart=True)
                 except Exception:
                     pass
 
@@ -239,7 +255,7 @@ class ResourcePoolManager(Generic[ActorInfoT]):
             except Exception as e:
                 logger.warning(f"SliceActor failed to start in time: {e}; killing actor")
                 try:
-                    ray.kill(actor)
+                    ray.kill(actor, no_restart=True)
                 except Exception:
                     pass
 
@@ -259,7 +275,7 @@ class ResourcePoolManager(Generic[ActorInfoT]):
                     ray.get(member.actor.shutdown.remote(), timeout=5)
                 except Exception:
                     pass
-                ray.kill(member.actor)
+                ray.kill(member.actor, no_restart=True)
                 logger.info(f"Removed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
@@ -304,7 +320,7 @@ class ResourcePoolManager(Generic[ActorInfoT]):
         for member in self._actor_pool:
             name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
-                ray.kill(member.actor)
+                ray.kill(member.actor, no_restart=True)
                 logger.info(f"Killed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
@@ -547,6 +563,7 @@ class DeviceHostActor:
             num_gpus=0,
             memory=int(memory_bytes),
             runtime_env=merged_runtime_env,
+            max_retries=0,
         ).remote(py_fn, f_args, f_kwargs)
 
         return self._awaitable
@@ -814,7 +831,7 @@ class SliceActor:
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     self._host_placement_group,
                     placement_group_bundle_index=i,
-                    placement_group_capture_child_tasks=True,
+                    placement_group_capture_child_tasks=False,
                 )
             ).remote()
             for i in range(self._slice_info.num_hosts)
@@ -908,19 +925,19 @@ class SliceActor:
                     else:
                         logger.warning(f"Actor {name} reported unhealthy; killing")
                         try:
-                            ray.kill(member.actor)
+                            ray.kill(member.actor, no_restart=True)
                         except Exception:
                             pass
                 except Exception as e:
                     logger.warning(f"Actor {name} health check exception ({e}); killing")
                     try:
-                        ray.kill(member.actor)
+                        ray.kill(member.actor, no_restart=True)
                     except Exception:
                         pass
             else:
                 logger.warning(f"Actor {name} health timeout; killing")
                 try:
-                    ray.kill(member.actor)
+                    ray.kill(member.actor, no_restart=True)
                 except Exception:
                     pass
 
@@ -969,7 +986,7 @@ class SliceActor:
                 except Exception as e:
                     logger.error(f"Failed to start host actor: {e}")
                     try:
-                        ray.kill(actor)
+                        ray.kill(actor, no_restart=True)
                     except Exception:
                         pass
 
@@ -987,7 +1004,7 @@ class SliceActor:
                     ray.get(member.actor.shutdown.remote(), timeout=5)
                 except Exception:
                     pass
-                ray.kill(member.actor)
+                ray.kill(member.actor, no_restart=True)
                 logger.info(f"Removed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
@@ -1032,7 +1049,7 @@ class SliceActor:
         for member in self._actor_pool:
             name = self.get_actor_name_from_actor_info(member.actor_info)
             try:
-                ray.kill(member.actor)
+                ray.kill(member.actor, no_restart=True)
                 logger.info(f"Killed actor {name}")
             except Exception as e:
                 logger.error(f"Failed to kill actor {name}: {e}")
@@ -1169,6 +1186,8 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
         self._tpu_type = tpu_type
         self._last_scale_ts: float | None = None
         self._last_scale_check_ts: float | None = None
+        self._head_pg = None
+        self._head_pg_target = 0
 
     def get_actor_pool_name(self) -> str:
         """Get a human-readable name for this actor pool.
@@ -1250,6 +1269,7 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             if not feasible:
                 raise InsufficientSlicesError(f"Requested one of {valid}, but only {current} slices available")
             self._scale_actor_pool(feasible[-1])
+            self._destroy_head_pg()
 
     def prepare_all_slices(self) -> None:
         """Prepare all slices by ensuring host placement groups.
@@ -1268,9 +1288,26 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             Called automatically by execute_multislice before running tasks.
             Essential for proper multi-host coordination within each slice.
         """
-        slice_infos: list[SliceInfo] = ray.get([m.actor.get_info.remote() for m in self._actor_pool])
-        all_bundles = []
+        slice_infos = []
+        good_members = []
+        for m in self._actor_pool:
+            try:
+                si = ray.get(m.actor.get_info.remote(), timeout=30)
+                slice_infos.append(si)
+                good_members.append(m)
+            except Exception as e:
+                try:
+                    ray.kill(m.actor, no_restart=True)
+                except Exception:
+                    pass
+                logger.warning(f"Pruned dead SliceActor during prepare_all_slices: {e}")
 
+        if len(good_members) != len(self._actor_pool):
+            self._actor_pool = good_members
+            if not self._actor_pool:
+                raise RuntimeError("No SliceActors available after pruning.")
+
+        all_bundles = []
         for info in slice_infos:
             all_bundles.extend([{"CPU": 0, info.slice_name: 1}] * info.num_hosts)
         if all_bundles:
@@ -1415,57 +1452,163 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             - Progress is logged throughout the scaling process
         """
         current = len(self._actor_pool)
+
         if current >= desired_num_actors:
             return
-        num_to_add = desired_num_actors - current
+
+        if current != 0:
+            logger.info("Recreating head PG due to non-zero current pool (align bundles with slots)")
+            self.drain_actor_pool()
+            current = 0
+
         logger.info(f"Scaling up pool {self.get_actor_pool_name()} from {current} to {desired_num_actors}")
 
-        info_ref_to_actor: dict[ray.ObjectRef, ActorHandle] = {}
-        for _ in range(num_to_add):
-            actor = self.create_actor()
-            info_ref = actor.get_info.remote()
-            info_ref_to_actor[info_ref] = actor
+        self._ensure_head_pg(desired_num_actors)
 
-        pending = list(info_ref_to_actor.keys())
+        slot_to_actor: dict[int, ActorHandle] = {}
+        slot_to_info_ref: dict[int, ray.ObjectRef] = {}
+
+        def _start_for_slot(slot: int):
+            actor = SliceActor.options(
+                num_cpus=0,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    self._head_pg,
+                    placement_group_bundle_index=slot,
+                    placement_group_capture_child_tasks=False,
+                ),
+            ).remote()
+            slot_to_actor[slot] = actor
+            slot_to_info_ref[slot] = actor.get_info.remote()
+
+        for slot in range(current, desired_num_actors):
+            _start_for_slot(slot)
+
         deadline = time.time() + SCALE_ADD_TIMEOUT_S
         started = 0
 
-        while pending and time.time() < deadline:
-            remaining = len(pending)
+        while slot_to_info_ref and time.time() < deadline:
+            remaining = len(slot_to_info_ref)
             head_bundles = [{"CPU": 0, f"TPU-{self._tpu_type}-head": 1} for _ in range(remaining)]
             try:
                 request_resources(bundles=head_bundles)
             except Exception:
                 pass
 
-            done, pending = ray.wait(pending, num_returns=len(pending), timeout=SCALE_POLL_S)
+            pending_refs = list(slot_to_info_ref.values())
+            done, _ = ray.wait(pending_refs, num_returns=1, timeout=SCALE_POLL_S)
             if not done:
                 continue
 
-            for info_ref in done:
-                actor = info_ref_to_actor.pop(info_ref, None)
-                if actor is None:
+            for ref in done:
+                slot = next((s for s, r in slot_to_info_ref.items() if r == ref), None)
+                if slot is None:
                     continue
+                actor = slot_to_actor.get(slot)
+
+                slot_to_info_ref.pop(slot, None)
+
                 try:
-                    info = ray.get(info_ref, timeout=0)
+                    info = ray.get(ref, timeout=0)
+
                     self._actor_pool.append(ActorPoolMember(actor, info))
                     started += 1
-                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)}")
+                    logger.info(f"Added actor {self.get_actor_name_from_actor_info(info)} (slot {slot})")
                 except Exception as e:
-                    logger.warning(f"SliceActor failed to start: {e}; killing actor")
+                    logger.warning(f"SliceActor for slot {slot} failed to start: {e}; killing and re-queuing")
                     try:
-                        ray.kill(actor)
+                        ray.kill(actor, no_restart=True)
                     except Exception:
                         pass
+                    _start_for_slot(slot)
 
-            logger.info(f"Started {started}/{num_to_add} slice actors so far")
+            logger.info(f"Started {started}/{desired_num_actors - current} slice actors so far")
 
-        if pending:
-            for info_ref in pending:
-                actor = info_ref_to_actor.get(info_ref)
-                if actor is not None:
-                    try:
-                        ray.kill(actor)
-                    except Exception:
-                        pass
-            logger.info(f"Started {started}/{num_to_add} slice actors (timed out for the rest)")
+        if slot_to_info_ref:
+            for _, actor in slot_to_actor.items():
+                try:
+                    if not any(m.actor == actor for m in self._actor_pool):
+                        ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+            logger.info(f"Started {started}/{desired_num_actors - current} slice actors (timed out for the rest)")
+
+    def _ensure_head_pg(self, desired_num_actors: int) -> None:
+        """Ensure head placement group exists with the correct number of bundles.
+
+        Creates or recreates the head placement group to match the desired number of actors.
+        The placement group uses STRICT_SPREAD strategy to ensure SliceActors are distributed
+        across different nodes for optimal resource utilization and fault tolerance.
+
+        Each bundle in the placement group reserves one TPU head resource for a SliceActor.
+        If the current placement group doesn't match the target size, it's destroyed and
+        recreated with the correct number of bundles.
+
+        Args:
+            desired_num_actors: Target number of SliceActors (and placement group bundles)
+
+        Side Effects:
+            - Requests resources from Ray autoscaler for the new placement group
+            - Destroys existing placement group if size mismatch
+            - Updates _head_pg and _head_pg_target instance variables
+            - Blocks until placement group is ready
+
+        Note:
+            The placement group uses TPU-{tpu_type}-head resource labels for each bundle
+            to ensure proper resource allocation by the Ray autoscaler.
+        """
+        label = f"TPU-{self._tpu_type}-head"
+        if self._head_pg and self._head_pg_target == desired_num_actors:
+            return
+        if self._head_pg:
+            try:
+                remove_placement_group(self._head_pg)
+            except Exception:
+                pass
+            self._head_pg = None
+            self._head_pg_target = 0
+
+        bundles = [{"CPU": 0, label: 1} for _ in range(desired_num_actors)]
+        request_resources(bundles=bundles)
+        self._head_pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(self._head_pg.ready())
+        self._head_pg_target = desired_num_actors
+
+    def _destroy_head_pg(self) -> None:
+        """Destroy the current head placement group and reset tracking variables.
+
+        Removes the head placement group from Ray's cluster state and resets the
+        instance variables that track placement group state. This is typically
+        called during pool shutdown or when recreating placement groups with
+        different sizes.
+
+        The method uses best-effort cleanup - if the placement group removal fails
+        (e.g., due to Ray cluster issues), the error is logged but not propagated
+        to avoid disrupting the overall shutdown process.
+
+        Side Effects:
+            - Removes placement group from Ray cluster
+            - Sets _head_pg to None
+            - Resets _head_pg_target to 0
+            - Frees up cluster resources reserved by the placement group
+
+        Note:
+            This is a cleanup operation that should be called when the placement
+            group is no longer needed, such as during pool draining or before
+            recreating with a different size.
+        """
+        if self._head_pg:
+            try:
+                remove_placement_group(self._head_pg)
+            except Exception:
+                pass
+            self._head_pg = None
+            self._head_pg_target = 0
+
+    def drain_actor_pool(self) -> None:
+        """Shut down and remove all actors from the pool.
+
+        Attempts graceful shutdown first, then forcefully kills actors.
+        Clears the actor pool after draining.
+        """
+        super().drain_actor_pool()
+        self._destroy_head_pg()

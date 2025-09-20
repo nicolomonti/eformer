@@ -406,7 +406,7 @@ def _normalize_sharding(
     Raises:
         ValueError: If PartitionSpec is provided but no global mesh is defined
     """
-    if not isinstance(arg, (jax.Array, np.ndarray)):
+    if not isinstance(arg, jax.Array | np.ndarray):
         return None
     if isinstance(sharding_or_spec, Sharding):
         return sharding_or_spec
@@ -421,7 +421,7 @@ def _normalize_sharding(
 
 def _ensure_dtype(dt):
     try:
-        return dt.dtype if isinstance(dt, (jax.Array, np.ndarray)) else dt
+        return dt.dtype if isinstance(dt, jax.Array | np.ndarray) else dt
     except Exception:
         return dt
 
@@ -757,7 +757,7 @@ class FNAutotuner:
         hyperparams = hyperparams if hyperparams is not None else {}
         hyperparams_norm: dict[str, tuple[Any, ...]] = {}
         for k, v in hyperparams.items():
-            if isinstance(v, (tuple, list)):
+            if isinstance(v, tuple | list):
                 if len(v) == 0:
                     raise ValueError(f"Hyperparameter '{k}' has empty list of values")
                 hyperparams_norm[k] = tuple(v)
