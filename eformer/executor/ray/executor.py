@@ -385,7 +385,11 @@ class RayExecutor:
 
         except InsufficientSlicesError as e:
             raise e
-        except RayError as e:
+        except (
+            ray.exceptions.RayError,
+            ray.exceptions.RayTaskError,
+            ray.exceptions.TaskUnschedulableError,
+        ) as e:
             if per_slice_futures:
                 try:
                     for lst in per_slice_futures:

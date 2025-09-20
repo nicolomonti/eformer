@@ -409,6 +409,54 @@ class DeviceHostActor:
             node_id=self._node_id,
         )
 
+    def _kill_vfio_holders(self):
+        """Quietly kill processes holding /dev/vfio/*.
+
+        Controlled by:
+        - EFORMER_KILL_VFIO=1 to enable (default 0 = disabled)
+        - EFORMER_INSTALL_LSOF=1 to attempt quiet, noninteractive lsof install (optional)
+
+        All command outputs are suppressed; never prompts for sudo.
+        """
+        import os
+
+        if os.getenv("EFORMER_KILL_VFIO", "1") != "1":
+            return
+        try:
+            import shutil
+            import signal
+            import subprocess
+
+            def run_quiet(cmd: str, capture: bool = False) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", "-lc", cmd],
+                    check=False,
+                    stdout=(subprocess.PIPE if capture else subprocess.DEVNULL),
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"),
+                )
+
+            if shutil.which("lsof") is None and os.getenv("EFORMER_INSTALL_LSOF", "0") == "1":
+                run_quiet("sudo -n apt-get -qq update || true")
+                run_quiet("sudo -n apt-get -qq -y install lsof || true")
+
+            if shutil.which("lsof") is None:
+                return
+
+            p = run_quiet("lsof -t /dev/vfio/* 2>/dev/null | sort -u", capture=True)
+            pids = []
+            if p and p.stdout:
+                pids = [int(pid) for pid in p.stdout.split() if pid.isdigit() and int(pid) != os.getpid()]
+
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _merge_runtime_env(self, runtime_env: dict | None, env_vars: dict | None) -> dict:
         """Merge environment variables into a runtime environment dict.
 
@@ -482,7 +530,7 @@ class DeviceHostActor:
         f_kwargs: dict | None = None,
         runtime_env: dict | None = None,
         env: dict | None = None,
-        num_cpus: float = 8.0,
+        num_cpus: float = 0.0,
         memory_bytes: float = 20e9,
         extra_resources: dict | None = None,
     ) -> ray.ObjectRef:
@@ -522,6 +570,7 @@ class DeviceHostActor:
         if self._awaitable:
             self._cancel_tasks_and_wait([self._awaitable])
 
+        self._kill_vfio_holders()
         self._hacky_remove_tpu_lockfile()
 
         host_env = {"TPU_HOST_ID": str(self.host_id), "TPU_SLICE_NAME": self.slice_name}
@@ -531,14 +580,13 @@ class DeviceHostActor:
 
         resources = dict(extra_resources or {})
 
-        py_fn = None
+        if self.num_devices and "TPU" not in resources:
+            resources["TPU"] = self.num_devices
+
         try:
             from ray.remote_function import RemoteFunction as _RF
 
-            if isinstance(remote_fn, _RF):
-                py_fn = remote_fn._function
-            else:
-                py_fn = remote_fn
+            py_fn = remote_fn._function if isinstance(remote_fn, _RF) else remote_fn
         except Exception:
             py_fn = remote_fn
 
@@ -646,11 +694,24 @@ class SliceActor:
             num_devices = TPUAcceleratorManager.get_current_node_num_accelerators()
         except Exception:
             pass
+        num_hosts = int(ray_tpu.get_current_pod_worker_count())
+        if os.getenv("EFORMER_MODERATE", "1") == "1":
+            available_hosts = ray.cluster_resources().get(pod_name, None)
+            if available_hosts is not None and num_hosts > available_hosts:
+                num_devices = int(available_hosts)
+                real_num_devices = int(available_hosts * 4)
+                print(
+                    f"auto-discovered to set num_hosts from {num_hosts} to {available_hosts} and "
+                    f"num_devices from {num_devices} to {real_num_devices}"
+                )
+                num_hosts = available_hosts
+                num_devices = real_num_devices
         return {
             "ip": ray.util.get_node_ip_address(),
             "node_id": ray.get_runtime_context().get_node_id(),
             "pod_name": pod_name,
             "num_devices": num_devices,
+            "num_hosts": num_hosts,
         }
 
     def _create_actor_for_host_id(self, host_id: int) -> ActorHandle:
@@ -693,16 +754,6 @@ class SliceActor:
         try:
             from ray.util.accelerators import tpu as ray_tpu
 
-            slice_name = ray_tpu.get_current_pod_name()
-            num_hosts = int(ray_tpu.get_current_pod_worker_count())
-            if os.getenv("EFORMER_MODERATE", "1") == "1":
-                available_hosts = ray.cluster_resources().get(slice_name, None)
-                if available_hosts is not None and num_hosts > available_hosts:
-                    available_hosts = int(available_hosts)
-                    logger.info(f"setting {num_hosts=} to {available_hosts}")
-                    num_hosts = available_hosts
-            ip_address = ray.util.get_node_ip_address()
-
             num_accelerators_per_host = None
             try:
                 from ray._private.accelerators import TPUAcceleratorManager
@@ -710,6 +761,20 @@ class SliceActor:
                 num_accelerators_per_host = TPUAcceleratorManager.get_current_node_num_accelerators()
             except Exception:
                 pass
+            slice_name = ray_tpu.get_current_pod_name()
+            num_hosts = int(ray_tpu.get_current_pod_worker_count())
+            if os.getenv("EFORMER_MODERATE", "1") == "1":
+                available_hosts = ray.cluster_resources().get(slice_name, None)
+                if available_hosts is not None and num_hosts > available_hosts:
+                    available_hosts = int(available_hosts)
+                    real_accelerators_per_host = int(available_hosts * 4)
+                    print(
+                        f"setting {num_hosts=} to {available_hosts=} and "
+                        f"{num_accelerators_per_host=} to {real_accelerators_per_host=}"
+                    )
+                    num_hosts = available_hosts
+                    num_accelerators_per_host = real_accelerators_per_host
+            ip_address = ray.util.get_node_ip_address()
 
             self._slice_info = SliceInfo(
                 slice_name=slice_name,
