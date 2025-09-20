@@ -1269,7 +1269,6 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             if not feasible:
                 raise InsufficientSlicesError(f"Requested one of {valid}, but only {current} slices available")
             self._scale_actor_pool(feasible[-1])
-            self._destroy_head_pg()
 
     def prepare_all_slices(self) -> None:
         """Prepare all slices by ensuring host placement groups.
@@ -1288,32 +1287,44 @@ class SlicePoolManager(ResourcePoolManager[SliceInfo]):
             Called automatically by execute_multislice before running tasks.
             Essential for proper multi-host coordination within each slice.
         """
-        slice_infos = []
-        good_members = []
-        for m in self._actor_pool:
-            try:
-                si = ray.get(m.actor.get_info.remote(), timeout=30)
-                slice_infos.append(si)
-                good_members.append(m)
-            except Exception as e:
+
+        if os.getenv("EFORMER_SAFE_GATHER", "1") == "1":
+            slice_infos = []
+            good_members = []
+            for m in self._actor_pool:
                 try:
-                    ray.kill(m.actor, no_restart=True)
-                except Exception:
-                    pass
-                logger.warning(f"Pruned dead SliceActor during prepare_all_slices: {e}")
+                    si = ray.get(m.actor.get_info.remote(), timeout=30)
+                    slice_infos.append(si)
+                    good_members.append(m)
+                except Exception as e:
+                    try:
+                        ray.kill(m.actor, no_restart=True)
+                    except Exception:
+                        pass
+                    logger.warning(f"Pruned dead SliceActor during prepare_all_slices: {e}")
 
-        if len(good_members) != len(self._actor_pool):
-            self._actor_pool = good_members
-            if not self._actor_pool:
-                raise RuntimeError("No SliceActors available after pruning.")
+            if len(good_members) != len(self._actor_pool):
+                self._actor_pool = good_members
+                if not self._actor_pool:
+                    raise RuntimeError("No SliceActors available after pruning.")
 
-        all_bundles = []
-        for info in slice_infos:
-            all_bundles.extend([{"CPU": 0, info.slice_name: 1}] * info.num_hosts)
-        if all_bundles:
-            request_resources(bundles=all_bundles)
+            all_bundles = []
+            for info in slice_infos:
+                all_bundles.extend([{"CPU": 0, info.slice_name: 1}] * info.num_hosts)
+            if all_bundles:
+                request_resources(bundles=all_bundles)
 
-        ray.get([m.actor.prepare_hosts.remote() for m in self._actor_pool])
+            ray.get([m.actor.prepare_hosts.remote() for m in self._actor_pool])
+        else:
+            slice_infos: list[SliceInfo] = ray.get([m.actor.get_info.remote() for m in self._actor_pool])
+            all_bundles = []
+
+            for info in slice_infos:
+                all_bundles.extend([{"CPU": 0, info.slice_name: 1}] * info.num_hosts)
+            if all_bundles:
+                request_resources(bundles=all_bundles)
+
+            ray.get([m.actor.prepare_hosts.remote() for m in self._actor_pool])
 
     def should_scale_up_multislice(self, valid_sizes: Sequence[int]) -> bool:
         """Check if pool should scale up to a larger size.
