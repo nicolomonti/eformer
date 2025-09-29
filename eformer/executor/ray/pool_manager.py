@@ -699,7 +699,7 @@ class SliceActor:
             available_hosts = ray.cluster_resources().get(pod_name, None)
             if available_hosts is not None and num_hosts > available_hosts:
                 num_devices = int(available_hosts)
-                real_num_devices = int(available_hosts * 4)
+                real_num_devices = 4
                 print(
                     f"auto-discovered to set num_hosts from {num_hosts} to {available_hosts} and "
                     f"num_devices from {num_devices} to {real_num_devices}"
@@ -767,7 +767,7 @@ class SliceActor:
                 available_hosts = ray.cluster_resources().get(slice_name, None)
                 if available_hosts is not None and num_hosts > available_hosts:
                     available_hosts = int(available_hosts)
-                    real_accelerators_per_host = int(available_hosts * 4)
+                    real_accelerators_per_host = 4
                     print(
                         f"setting {num_hosts=} to {available_hosts=} and "
                         f"{num_accelerators_per_host=} to {real_accelerators_per_host=}"
