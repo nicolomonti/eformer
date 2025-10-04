@@ -22,7 +22,7 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax==0.6.9",
+	"jax==0.6.2",
 	"optax>=0.2.2",
 	"triton~=3.4.0",
 	"ml-collections==1.1.0",
